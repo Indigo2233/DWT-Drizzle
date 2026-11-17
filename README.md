@@ -3,6 +3,8 @@
 > 在 DWT（PWS 分区加权叠加）之上，补上**配准 + Drizzle 几何重采样**，让一堆未对齐的
 > 原始子帧直接变成一张更干净、更锐的线性成品；彩机（OSC / 拜耳阵列）也能直接读。
 
+当前版本 **v2.7.2** ｜ 作者 打野波比（GitHub [@bobiastro](https://github.com/bobiastro)）
+
 BUG 反馈 / 使用问题：**微信 15795179443**
 
 ![主界面](docs/images/ui-main.png)
@@ -40,6 +42,8 @@ BUG 反馈 / 使用问题：**微信 15795179443**
 | Windows x64 | `DWT-Drizzle-2.7.zip` |
 | macOS Apple Silicon | `DWT-Drizzle-2.7-macos-arm64.zip` |
 | macOS Intel | `DWT-Drizzle-2.7-macos-intel.zip` |
+| 已有 Python 的 Mac | `DWT-Drizzle-2.7-macos.zip` |
+| 三平台合集 | `DWT-Drizzle-2.7-all.zip` |
 
 Windows 解压后双击 **`启动-图形界面.bat`**。四个空填完就能跑：
 
