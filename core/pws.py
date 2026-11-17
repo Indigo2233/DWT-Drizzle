@@ -806,7 +806,7 @@ def prepare_frames(frames: List[Path], label: str, crop: int,
                     d = _cfa.plane(d, _CFA['pattern'], _CFA['ch'])
                 med = float(np.median(d))
                 fs.skies[i] = med
-                fs.sigma[i] = 1.4826 * float(np.median(np.abs(d - med)))
+                fs.sigma[i] = _noise_sigma(d)
                 if bgdeg:
                     bg_grids[i] = bggrad.block_medians(d, bggrad.BG_BLOCK)
                 if mm is not None:
@@ -1583,6 +1583,18 @@ def _worker_open_rw(path: str, n: int, h: int, w: int) -> None:
     _MEM['mmw'] = np.memmap(path, dtype=np.float32, mode='r+', shape=(n, h, w))
 
 
+def _noise_sigma(d: np.ndarray) -> float:
+    """逐像素噪声（对背景梯度免疫）。
+
+    用相邻行差分的稳健散布估计：大尺度渐变在 d[1:]-d[:-1] 里变成常数，
+    被 median 吸收，只剩真实噪声。数值上与整帧 MAD 同量纲（σ）。
+    """
+    g = np.diff(d, axis=0)
+    if g.size == 0:
+        return float(1.4826 * np.median(np.abs(d - np.median(d))))
+    return float(1.4826 * np.median(np.abs(g - np.median(g))) / np.sqrt(2.0))
+
+
 def _task_read_frame(job):
     """读一帧 → 裁剪 → float32 → 曝光归一 → 帧级天空中位与噪声尺度
 
@@ -1597,7 +1609,7 @@ def _task_read_frame(job):
     if cfa_ch and _cfa is not None:
         d = _cfa.plane(d, cfa_pat, cfa_ch)
     med = float(np.median(d))
-    sig = 1.4826 * float(np.median(np.abs(d - med)))
+    sig = _noise_sigma(d)
     bgm = bggrad.block_medians(d, bggrad.BG_BLOCK) if bg_deg else None
     _MEM['mmw'][i] = d
     del d
@@ -2032,6 +2044,18 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     # S_i = σ_中位 / σ_i（归一化后测 → 曝光差异已被吸收，可直接跨帧比）
     sig = fs.sigma
     S = np.median(sig) / np.maximum(sig, 1e-30)
+    # 帧间噪声离群保护：σ 极差大时（薄云、月光、不同增益），S² 会让 1~2 张
+    # 异常干净的帧独占全部权重——79 帧叠出来 N_eff 只有 2.2，成品几乎等于单帧。
+    # 这里把 S 限在 [1/K, K]：保留逆方差排序，但单帧最多 K² 倍权重。
+    _k_clip = float(getattr(p, 'snr_clip', 3.0) or 0.0)
+    if _k_clip > 1.0:
+        _n_clip = int(np.count_nonzero((S < 1.0 / _k_clip) | (S > _k_clip)))
+        S = np.clip(S, 1.0 / _k_clip, _k_clip)
+        if _n_clip:
+            _r = (float(np.max(sig)) / max(float(np.min(sig)), 1e-30))
+            log(f'[S] 帧间噪声极差 {_r:.1f}×，S 已限幅到 [{1.0 / _k_clip:.3f}, '
+                f'{_k_clip:g}]（{_n_clip} 帧被限；避免单帧独占权重，'
+                f'要关掉填 --snr-clip 0）')
     sig_out = sig * scale_out          # 展示与落盘量纲 = 成品量纲（内部仍用 sig 算比值）
     log(f'[S] 单帧信噪比权重（σ_中位/σ_i）{S.min():.3f}~{S.max():.3f}  中位 {np.median(S):.3f}')
     log(f'[σ] 逐帧噪声 {sig_out.min():.4e}~{sig_out.max():.4e}'
