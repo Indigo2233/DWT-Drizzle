@@ -613,15 +613,24 @@ def measure_shifts(fs, stars: Sequence[Tuple[int, int]], ref: int = 0,
                 fb = _trans_only(img, ref_img, stars, refc, half)
                 if fb is None:
                     bad[i] = True
+                    _vbad.append(int(i))
+                    dx[i], dy[i], theta[i] = np.nan, np.nan, np.nan
+                    scale[i], spin[i], coarse[i] = np.nan, np.nan, (np.nan, np.nan, np.nan)
+                    continue
+                _ok, _hit, _nt = _verify_all(s_ref, s_i, 0.0, 1.0, (-fb[0], -fb[1]))
+                if _ok:
+                    dx[i], dy[i], theta[i] = fb[0], fb[1], 0.0
+                    scale[i], spin[i], coarse[i] = 1.0, np.nan, (-fb[0], -fb[1], 0.0)
+                    if log:
+                        log(f'  [位移] 第 {i} 帧走纯平移兜底：dx={fb[0]:+.2f} '
+                            f'dy={fb[1]:+.2f}（全星命中 {_hit}/{_nt}）')
                 else:
-                    _ok, _hit, _nt = _verify_all(s_ref, s_i, 0.0, 1.0, (-fb[0], -fb[1]))
-                    if _ok:
-                        dx[i], dy[i], theta[i] = fb[0], fb[1], 0.0
-                        spin[i] = 0.0
-                    else:
-                        # 纯平移也验不过 ⇒ 这张帧和参考帧根本不是一个取景
-                        bad[i] = True
-                        _vbad.append(int(i))
+                    # 纯平移也验不过 ⇒ 这张帧和参考帧根本不是一个取景
+                    bad[i] = True
+                    _vbad.append(int(i))
+                    dx[i], dy[i], theta[i] = np.nan, np.nan, np.nan
+                    scale[i], spin[i], coarse[i] = np.nan, np.nan, (np.nan, np.nan, np.nan)
+                continue
             tree = cKDTree(s_ref)
             best = None
             for c0, _ in cands:
@@ -637,15 +646,27 @@ def measure_shifts(fs, stars: Sequence[Tuple[int, int]], ref: int = 0,
             fb = _trans_only(img, ref_img, stars, refc, half)
             if fb is None:
                 bad[i] = True
+                _vbad.append(int(i))
+                dx[i], dy[i], theta[i] = np.nan, np.nan, np.nan
+                scale[i], spin[i], coarse[i] = np.nan, np.nan, (np.nan, np.nan, np.nan)
+                continue
+            _ok, _hit, _nt = _verify_all(s_ref, s_i, 0.0, 1.0, (-fb[0], -fb[1]))
+            if _ok:
+                dx[i], dy[i], theta[i] = fb[0], fb[1], 0.0
+                scale[i], spin[i], coarse[i] = 1.0, np.nan, (-fb[0], -fb[1], 0.0)
+                if log:
+                    log(f'  [位移] 第 {i} 帧旋转候选不足，走纯平移兜底：'
+                        f'dx={fb[0]:+.2f} dy={fb[1]:+.2f}（全星命中 {_hit}/{_nt}）')
             else:
-                _ok, _hit, _nt = _verify_all(s_ref, s_i, 0.0, 1.0, (-fb[0], -fb[1]))
-                if _ok:
-                    dx[i], dy[i], theta[i] = fb[0], fb[1], 0.0
-                    spin[i] = 0.0
-                else:
-                    # 纯平移也验不过 ⇒ 这张帧和参考帧根本不是一个取景
-                    bad[i] = True
-                    _vbad.append(int(i))
+                # 纯平移也验不过 ⇒ 这张帧和参考帧根本不是一个取景
+                bad[i] = True
+                _vbad.append(int(i))
+                dx[i], dy[i], theta[i] = np.nan, np.nan, np.nan
+                scale[i], spin[i], coarse[i] = np.nan, np.nan, (np.nan, np.nan, np.nan)
+            continue
+        if best is None:
+            # 保险：任何还留着的 best=None 路径都不该再往下走
+            continue
         u = np.asarray(best[1], np.float64)
         # SVD 精修（两轮：先粗匹配再收紧半径）
         th_s, n_match = None, 0
