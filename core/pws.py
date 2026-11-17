@@ -2476,6 +2476,12 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                                 'W': int(_w), 'H': int(_h)}
                     log(f'[网格] 输出画布直接取参考 {Path(_frame_ref).name}'
                         f' {_w}×{_h}（放大 {_inv:.4f}× 旋转 {_thm:+.2f}°）')
+                    if drz_on and abs(float(drz_s) - 1.0) > 1e-9:
+                        _ignored = float(drz_s)
+                        log(f'[网格] 注意：勾了「输出网格」时画布由参考图决定，'
+                            f'drizzle 倍率 {_ignored:g}× 不生效'
+                            f'（成品就是参考图的分辨率）；'
+                            f'想要 {_ignored:g}× 请把「输出网格」清空')
                 else:
                     log(f'[网格] 参考图配准失败，退回包围盒画布：{_fi.get("error")}')
             except Exception as _e:
@@ -2529,6 +2535,17 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 log(f'[CFA] 通道 {_CFA["ch"]} 复用通道 {_geo["ch"]} 的几何：'
                     f'参考帧 #{seed}、画布 {drz_plan["W"]}×{drz_plan["H"]}、'
                     f'{int(np.count_nonzero(_kp))}/{n} 帧参与')
+
+        # ---- 画布定稿后，把「用户填的倍率」和「实际画布倍率」统一 ----
+        # 勾了输出网格时画布来自参考图（可能 1×），后面所有 σ_psf / 星点映射 /
+        # 边缘过渡宽都要按实际画布算，否则会按 2× 折算，R 场被过度平滑。
+        _drz_req = float(drz_s)
+        if drz_plan:
+            _s_real = float(drz_plan['s'])
+            if abs(_s_real - _drz_req) > 1e-9:
+                log(f'[网格] 实际画布倍率 {_s_real:g}×（你填的是 {_drz_req:g}×），'
+                    '内部按实际倍率折算 R 场与星点')
+            drz_s = _s_real
 
         # 星表是在 seed 帧（没有被变换的那一帧）上测的。喂到输出网格之前必须
         # 过一遍 seed 自己的变换：xdrz 模式下 dx/dy 是 PI 相对**它的**参考帧
@@ -2844,7 +2861,10 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         # ---- 原生尺寸副本：按 N×N 块平均缩回（不额外叠一遍）----
         try:
             _want1x = int(getattr(p, 'native_1x', 0) or 0) > 0
-            _fx = int(round(float(drz_s))) if drz_on else 1
+            # 按**实际画布倍率**缩，不能按用户勾的 drz_s：勾了输出网格时画布是
+            # 参考图定的（可能是 1×），此时再按 2 去块平均会把图缩成一半。
+            _s_eff = float(drz_plan['s']) if drz_plan else float(drz_s)
+            _fx = int(round(_s_eff)) if drz_on else 1
             if _want1x and _fx > 1:
                 _h1 = (Stk.shape[0] // _fx) * _fx
                 _w1 = (Stk.shape[1] // _fx) * _fx
