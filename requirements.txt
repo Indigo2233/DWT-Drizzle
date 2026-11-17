@@ -1,0 +1,12 @@
+# 运行时依赖（Python 3.10+，开发用 3.12）
+# 图形界面用 tkinter（Python 自带），不需要额外 pip 包。
+numpy>=2.0
+scipy>=1.11
+astropy>=6.0
+photutils>=1.11
+
+# 可选：只在这几种情况下才需要
+#   cupy / cupyx        用显卡跑 drizzle 与配准（--gpu gpu）
+#   psutil              自动判断可用内存，决定临时帧是否落盘
+# cupy-cuda12x>=13.0
+# psutil>=5.9

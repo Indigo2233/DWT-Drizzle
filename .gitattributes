@@ -1,0 +1,7 @@
+# 仓库里一律 LF；Windows 检出时也保持 LF（Python 与 .bat 都按此约定）
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.png binary
+*.jpg binary
+*.patch text eol=lf

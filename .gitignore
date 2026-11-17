@@ -1,0 +1,25 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyd
+.venv/
+venv/
+
+# --- 本工程的临时/派生文件 ---
+_DWT_frames/
+core/_DWT_frames
+*.dat
+*.npy
+*.xisf
+*.fit
+*.fits
+*.broken
+*.log
+
+# --- 打包产物：安装包走 GitHub Releases，不进仓库 ---
+pydeps/
+py/
+wheels/
+dist/
+*.zip
+*.exe
