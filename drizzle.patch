@@ -2434,7 +2434,7 @@
 +    return bool(detect_pattern(meta))
 --- /dev/null
 +++ b/core/drizzle.py
-@@ -0,0 +1,1543 @@
+@@ -0,0 +1,1554 @@
 +"""Drizzle 重采样层（PWS 的几何层）
 +
 +把 PWS 阶段 C 的"唯一一次加权平均（式 12）"换成**带权 drizzle 累积**，从而在
@@ -3849,28 +3849,39 @@
 +    if use_gpu:
 +        if log:
 +            log('[drizzle] 叠加走 GPU（CuPy）：%d 带' % len(ranges))
-+        else:
++        try:
++            for b, (Y0, Y1) in enumerate(ranges):
++                if cancel:
++                    cancel()
++                res = _gpu_band.band(ctx, Y0, Y1)
++                Stk[Y0:Y1] = res['stack']
++                neff[Y0:Y1] = res['neff']
++                cov_tot[Y0:Y1] = res['cov']
++                ncov_tot[Y0:Y1] = res['ncov']
++                tot_rn += res['rej_num']
++                tot_rd += res['rej_den']
++                wmax_all.extend(res['wmax'])
++                try:
++                    _gpu.cp.get_default_memory_pool().free_all_blocks()
++                except Exception:
++                    pass
++                if log:
++                    log(f'[drizzle] 带 {b + 1}/{n_band}  行 {Y0}-{Y1}')
++        except Exception as e:
++            # 显卡侧任何运行期问题（最常见：缺 NVRTC 的 nvrtc64_*.dll）都退回 CPU，
++            # 不把整组叠加判死；同样的数据在 CPU 上算完是逐位一致的。
 +            if log:
-+                log('[drizzle] 叠加走 CPU：%d 带（DWT_GPU=%s）'
-+                    % (len(ranges), os.environ.get('DWT_GPU', 'auto')))
-+        for b, (Y0, Y1) in enumerate(ranges):
-+            if cancel:
-+                cancel()
-+            res = _gpu_band.band(ctx, Y0, Y1)
-+            Stk[Y0:Y1] = res['stack']
-+            neff[Y0:Y1] = res['neff']
-+            cov_tot[Y0:Y1] = res['cov']
-+            ncov_tot[Y0:Y1] = res['ncov']
-+            tot_rn += res['rej_num']
-+            tot_rd += res['rej_den']
-+            wmax_all.extend(res['wmax'])
++                log(f'[drizzle] GPU 出错，退回 CPU 重算这一组：{type(e).__name__}: {e}')
 +            try:
 +                _gpu.cp.get_default_memory_pool().free_all_blocks()
 +            except Exception:
 +                pass
-+            if log:
-+                log(f'[drizzle] 带 {b + 1}/{n_band}  行 {Y0}-{Y1}')
-+    elif use_par:
++            use_gpu = False
++            # 已写进 Stk/neff 的带会被 CPU 分支整段重算覆盖；统计量必须先清零，
++            # 否则排异率、wmax 会把 GPU 跑过的那部分再算一遍。
++            tot_rn = tot_rd = 0.0
++            wmax_all = []
++    if not use_gpu and use_par:
 +        from concurrent.futures import ProcessPoolExecutor, as_completed
 +        ctx_par = dict(ctx)
 +        ctx_par['fs'] = None
@@ -3895,7 +3906,7 @@
 +                done += 1
 +                if log:
 +                    log(f'[drizzle] 带 {done}/{n_band}  行 {Y0}-{Y1}')
-+    else:
++    elif not use_gpu:
 +        for b, (Y0, Y1) in enumerate(ranges):
 +            if cancel:
 +                cancel()
@@ -5403,7 +5414,7 @@
 +    return {'rows': rows, 'best': best}
 --- /dev/null
 +++ b/core/gpu_dz.py
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,127 @@
 +# -*- coding: utf-8 -*-
 +"""GPU 叠加（CuPy）—— 与 CPU 版 `_drizzle_band` 逐位等价的替代实现。
 +
@@ -5435,14 +5446,23 @@
 +
 +
 +def available() -> bool:
-+    """这台机器能不能真的用 GPU：CuPy 能导入、有设备、能分配内存"""
++    """这台机器能不能真的用 GPU：CuPy 能导入、有设备、能跑一次真正的累加。
++
++    只查「有没有设备」不够：上一个版本用 cupyx.scatter_add，它在第一帧才 JIT，
++    于是探测通过、跑到一半才炸（缺 NVRTC）。这里把热路径的最小单元先跑一遍。
++    """
 +    if not _OK:
 +        return False
 +    try:
 +        if cp.cuda.runtime.getDeviceCount() < 1:
 +            return False
 +        a = cp.zeros(16, dtype=cp.float32)
-+        return float(a.sum()) == 0.0
++        if float(a.sum()) != 0.0:
++            return False
++        idx = cp.array([0, 1, 1, 3], dtype=cp.int64)
++        w = cp.array([1.0, 2.0, 3.0, 4.0], dtype=cp.float64)
++        r = cp.bincount(idx, weights=w, minlength=5).astype(cp.float32)
++        return [float(x) for x in r] == [1.0, 5.0, 0.0, 4.0, 0.0]
 +    except Exception:
 +        return False
 +
@@ -5494,11 +5514,15 @@
 +    if not idxs:
 +        z = cp.zeros((bh, W), cp.float32)
 +        return z, z
-+    idx = cp.concatenate(idxs)
-+    num = cp.zeros(size, cp.float32)
-+    cov = cp.zeros(size, cp.float32)
-+    cupyx.scatter_add(num, idx, cp.concatenate(wvts))
-+    cupyx.scatter_add(cov, idx, cp.concatenate(wgts))
++    idx = cp.concatenate(idxs).astype(cp.int64)
++    # 不用 cupyx.scatter_add：它内部走 cupy.RawKernel → 需要 CUDA Toolkit 的
++    # NVRTC（nvrtc64_*.dll）做 JIT。只装驱动的机器没有这个 DLL，会直接报
++    #   RuntimeError: CuPy failed to load nvrtc64_112_0.dll
++    # bincount(weights=) 语义相同（同下标按权重累加），但用预编译内核。
++    num = cp.bincount(idx, weights=cp.concatenate(wvts).astype(cp.float32),
++                      minlength=size).astype(cp.float32)
++    cov = cp.bincount(idx, weights=cp.concatenate(wgts).astype(cp.float32),
++                      minlength=size).astype(cp.float32)
 +    return num.reshape(bh, W), cov.reshape(bh, W)
 +
 +

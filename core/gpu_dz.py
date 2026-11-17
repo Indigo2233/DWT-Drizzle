@@ -29,14 +29,23 @@ ANCHOR_N = 48
 
 
 def available() -> bool:
-    """这台机器能不能真的用 GPU：CuPy 能导入、有设备、能分配内存"""
+    """这台机器能不能真的用 GPU：CuPy 能导入、有设备、能跑一次真正的累加。
+
+    只查「有没有设备」不够：上一个版本用 cupyx.scatter_add，它在第一帧才 JIT，
+    于是探测通过、跑到一半才炸（缺 NVRTC）。这里把热路径的最小单元先跑一遍。
+    """
     if not _OK:
         return False
     try:
         if cp.cuda.runtime.getDeviceCount() < 1:
             return False
         a = cp.zeros(16, dtype=cp.float32)
-        return float(a.sum()) == 0.0
+        if float(a.sum()) != 0.0:
+            return False
+        idx = cp.array([0, 1, 1, 3], dtype=cp.int64)
+        w = cp.array([1.0, 2.0, 3.0, 4.0], dtype=cp.float64)
+        r = cp.bincount(idx, weights=w, minlength=5).astype(cp.float32)
+        return [float(x) for x in r] == [1.0, 5.0, 0.0, 4.0, 0.0]
     except Exception:
         return False
 
@@ -88,11 +97,15 @@ def _scatter_gpu(vals, X, Y, P, W, Y0, Y1):
     if not idxs:
         z = cp.zeros((bh, W), cp.float32)
         return z, z
-    idx = cp.concatenate(idxs)
-    num = cp.zeros(size, cp.float32)
-    cov = cp.zeros(size, cp.float32)
-    cupyx.scatter_add(num, idx, cp.concatenate(wvts))
-    cupyx.scatter_add(cov, idx, cp.concatenate(wgts))
+    idx = cp.concatenate(idxs).astype(cp.int64)
+    # 不用 cupyx.scatter_add：它内部走 cupy.RawKernel → 需要 CUDA Toolkit 的
+    # NVRTC（nvrtc64_*.dll）做 JIT。只装驱动的机器没有这个 DLL，会直接报
+    #   RuntimeError: CuPy failed to load nvrtc64_112_0.dll
+    # bincount(weights=) 语义相同（同下标按权重累加），但用预编译内核。
+    num = cp.bincount(idx, weights=cp.concatenate(wvts).astype(cp.float32),
+                      minlength=size).astype(cp.float32)
+    cov = cp.bincount(idx, weights=cp.concatenate(wgts).astype(cp.float32),
+                      minlength=size).astype(cp.float32)
     return num.reshape(bh, W), cov.reshape(bh, W)
 
 

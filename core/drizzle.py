@@ -1412,28 +1412,39 @@ def stack_drizzle(fs, R_out: np.ndarray, C: np.ndarray, S: np.ndarray,
     if use_gpu:
         if log:
             log('[drizzle] 叠加走 GPU（CuPy）：%d 带' % len(ranges))
-        else:
+        try:
+            for b, (Y0, Y1) in enumerate(ranges):
+                if cancel:
+                    cancel()
+                res = _gpu_band.band(ctx, Y0, Y1)
+                Stk[Y0:Y1] = res['stack']
+                neff[Y0:Y1] = res['neff']
+                cov_tot[Y0:Y1] = res['cov']
+                ncov_tot[Y0:Y1] = res['ncov']
+                tot_rn += res['rej_num']
+                tot_rd += res['rej_den']
+                wmax_all.extend(res['wmax'])
+                try:
+                    _gpu.cp.get_default_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+                if log:
+                    log(f'[drizzle] 带 {b + 1}/{n_band}  行 {Y0}-{Y1}')
+        except Exception as e:
+            # 显卡侧任何运行期问题（最常见：缺 NVRTC 的 nvrtc64_*.dll）都退回 CPU，
+            # 不把整组叠加判死；同样的数据在 CPU 上算完是逐位一致的。
             if log:
-                log('[drizzle] 叠加走 CPU：%d 带（DWT_GPU=%s）'
-                    % (len(ranges), os.environ.get('DWT_GPU', 'auto')))
-        for b, (Y0, Y1) in enumerate(ranges):
-            if cancel:
-                cancel()
-            res = _gpu_band.band(ctx, Y0, Y1)
-            Stk[Y0:Y1] = res['stack']
-            neff[Y0:Y1] = res['neff']
-            cov_tot[Y0:Y1] = res['cov']
-            ncov_tot[Y0:Y1] = res['ncov']
-            tot_rn += res['rej_num']
-            tot_rd += res['rej_den']
-            wmax_all.extend(res['wmax'])
+                log(f'[drizzle] GPU 出错，退回 CPU 重算这一组：{type(e).__name__}: {e}')
             try:
                 _gpu.cp.get_default_memory_pool().free_all_blocks()
             except Exception:
                 pass
-            if log:
-                log(f'[drizzle] 带 {b + 1}/{n_band}  行 {Y0}-{Y1}')
-    elif use_par:
+            use_gpu = False
+            # 已写进 Stk/neff 的带会被 CPU 分支整段重算覆盖；统计量必须先清零，
+            # 否则排异率、wmax 会把 GPU 跑过的那部分再算一遍。
+            tot_rn = tot_rd = 0.0
+            wmax_all = []
+    if not use_gpu and use_par:
         from concurrent.futures import ProcessPoolExecutor, as_completed
         ctx_par = dict(ctx)
         ctx_par['fs'] = None
@@ -1458,7 +1469,7 @@ def stack_drizzle(fs, R_out: np.ndarray, C: np.ndarray, S: np.ndarray,
                 done += 1
                 if log:
                     log(f'[drizzle] 带 {done}/{n_band}  行 {Y0}-{Y1}')
-    else:
+    elif not use_gpu:
         for b, (Y0, Y1) in enumerate(ranges):
             if cancel:
                 cancel()
