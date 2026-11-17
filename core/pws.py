@@ -1729,7 +1729,15 @@ def save_linear_xisf(path: Path, arr: np.ndarray, metas: List[Dict], mode_text: 
     img.geometry = (a.shape[1], a.shape[0], 1)      # XISF geometry = 宽:高:通道
     img.sample_format = 'Float32'
     img.color_space = 'Gray'
-    img.bounds = (0.0, 1.0)
+    # bounds 写真实数据范围：写死 0:1 会让 PixInsight 把 ADU 量级的成品
+    # （天空几百、星点几万）当成「已归一化」的图像，超出 1 的全按饱和显示，
+    # 一打开就是一片白。
+    _bv = a[np.isfinite(a)]
+    if _bv.size:
+        _b0, _b1 = float(_bv.min()), float(_bv.max())
+    else:
+        _b0, _b1 = 0.0, 1.0
+    img.bounds = (_b0, _b1) if _b1 > _b0 else (0.0, 1.0)
     img.pixel_storage = 'Planar'
     img.fits_keywords = [
         {'name': 'TOTALEXP', 'value': round(sum(m['exptime'] for m in metas), 1),
@@ -1795,7 +1803,15 @@ def _merge_cfa_rgb(out_dir, stem: str, log) -> None:
     img.geometry = (w, h, 3)                 # XISF geometry = 宽:高:通道
     img.sample_format = 'Float32'
     img.color_space = 'RGB'
-    img.bounds = (0.0, 1.0)
+    # bounds 写真实数据范围：写死 0:1 会让 PixInsight 把 ADU 量级的成品
+    # （天空几百、星点几万）当成「已归一化」的图像，超出 1 的全按饱和显示，
+    # 一打开就是一片白。
+    _bv = a[np.isfinite(a)]
+    if _bv.size:
+        _b0, _b1 = float(_bv.min()), float(_bv.max())
+    else:
+        _b0, _b1 = 0.0, 1.0
+    img.bounds = (_b0, _b1) if _b1 > _b0 else (0.0, 1.0)
     # write_xisf 直接写 data.tobytes()（行主序 HWC 交错）。这里若标 Planar，
     # 读方会把交错字节当三段连续平面解析，三通道全错位——PI 打开就是"坏图"。
     img.pixel_storage = 'Normal'
