@@ -162,6 +162,24 @@ def _set_group(gi: int, gn: int, label: str = '') -> None:
     _GROUP[2] = f'[{label}] ' if label else ''
 
 
+def _emit_console(msg: str) -> None:
+    """往控制台写一行；遇到控制台编码不支持的字符（²、σ、·、→）只替换不崩。
+
+    中文 Windows 默认 cp936，`print('…%d² 窗…')` 会抛 UnicodeEncodeError，
+    而这条日志出现在「自动定位裁剪中心」分支，等于整个命令行跑不起来。
+    """
+    try:
+        print(msg, flush=True)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, 'encoding', None) or 'utf-8'
+        try:
+            sys.stdout.write(str(msg).encode(enc, 'replace').decode(enc, 'replace') + '\n')
+            sys.stdout.flush()
+        except Exception:
+            sys.stdout.write(str(msg).encode('ascii', 'replace').decode('ascii') + '\n')
+            sys.stdout.flush()
+
+
 def log(msg: str = '') -> None:
     """引擎唯一输出口：界面接管后写成日志行，未接管则打 stdout（回调异常也退回）。
     多滤镜分组时自动带组前缀（空行不加）——否则几十上百行日志分不清是哪组滤镜的。"""
@@ -170,12 +188,12 @@ def log(msg: str = '') -> None:
         msg = f'{pre}{msg}'
     sink = _LOG_SINK[0]
     if sink is None:
-        print(msg, flush=True)
+        _emit_console(msg)
         return
     try:
         sink(msg)
     except Exception:
-        print(msg, flush=True)
+        _emit_console(msg)
 
 
 def _emit(phase: str, frac: float, text: str = '') -> None:
@@ -483,7 +501,7 @@ def resolve_center(frames: List[Path], crop: int,
     if spread > 0.1 * float(crop):
         log('[裁剪] 警告：各帧定位中心相差 %.0fpx（>裁窗的 10%%，可能有翻转帧或取景差异）；'
             '已取中位 (%d,%d)，必要时用 --center 手动指定' % (spread, cy, cx))
-    log('[裁剪] 自动定位延展源中心 (y,x)=(%d,%d) → %d² 窗（抽样 %d 帧取中位）'
+    log('[裁剪] 自动定位延展源中心 (y,x)=(%d,%d) → %d^2 窗（抽样 %d 帧取中位）'
         % (cy, cx, crop, len(idx)))
     return (int(cy), int(cx))
 
@@ -2696,7 +2714,18 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         except Exception:
             _gpu_ok = False
         if _gpu_ok:
-            _budget = 3072 * 2**20          # 显存里 num/cov 两个 (n,bh,w) 共约 3 GB
+            # 显存预算按实际可用量缩放：num/cov 两个 (n,bh,w) float32 缓冲。
+            # 写死 3 GB 会让 4 GB 显存的小卡（GTX 1650 Ti 这类）直接 OOM。
+            _free = 0
+            try:
+                _free = int(_g.free_mem())
+            except Exception:
+                _free = 0
+            _budget = 3072 * 2**20
+            if _free > 0:
+                _budget = int(min(_budget, max(256 * 2**20, _free * 0.55)))
+                log(f'[drizzle] 显存可用 {_free // 2**20} MB，本带预算 '
+                    f'{_budget // 2**20} MB')
             _rows = _budget / max(1.0, 2.0 * n * w * 4)
             band = int(max(64, min(256, _rows)))
         else:

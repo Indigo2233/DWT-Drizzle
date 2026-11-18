@@ -50,6 +50,20 @@ def available() -> bool:
         return False
 
 
+def free_mem() -> int:
+    """当前可用显存字节数；CuPy 不可用或查询失败返回 0。
+
+    带高预算是按显存算的（num/cov 两个 (n,bh,w) float32），写死一个值会
+    在大卡上浪费、在小卡上 OOM，所以运行时问一次设备。
+    """
+    if not _OK:
+        return 0
+    try:
+        _free, _total = cp.cuda.Device().mem_info
+        return int(_free)
+    except Exception:
+        return 0
+
 def _scatter_gpu(vals, X, Y, P, W, Y0, Y1):
     """把 (X,Y) 处的方框落点铺到输出行 [Y0,Y1)，返回 (num, cov) 两张 GPU 图"""
     bh = Y1 - Y0
