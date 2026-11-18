@@ -1381,6 +1381,14 @@ def stack_drizzle(fs, R_out: np.ndarray, C: np.ndarray, S: np.ndarray,
         raise ValueError(f'R 场尺寸 {R_out.shape} 与输出画布 {(H, W)} 不一致：'
                          'R 必须在其上被使用的网格上构建（见 build_r_field）')
     n_all = len(fs)
+    # 位移表与帧数必须一一对应；历史上出现过 dx 比帧数少一个的情况
+    # （某帧在配准里被丢掉、但帧存储还在）→ 这里按较短的来，缺的帧不参与。
+    _nx, _ny = len(np.asarray(dx)), len(np.asarray(dy))
+    if _nx != n_all or _ny != n_all:
+        if log:
+            log(f'[配准] 位移表长度与帧数不一致（帧 {n_all} / dx {_nx} / dy {_ny}）：'
+                f'按较短的 {min(n_all, _nx, _ny)} 帧参与叠加，多出的帧忽略')
+        n_all = min(n_all, _nx, _ny)
     idx = [i for i in range(n_all)
            if np.isfinite(dx[i]) and np.isfinite(dy[i])]
     if not idx:

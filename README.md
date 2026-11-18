@@ -3,7 +3,7 @@
 > 在 DWT（PWS 分区加权叠加）之上，补上**配准 + Drizzle 几何重采样**，让一堆未对齐的
 > 原始子帧直接变成一张更干净、更锐的线性成品；彩机（OSC / 拜耳阵列）也能直接读。
 
-当前版本 **v2.7.2** ｜ 作者 打野波比（GitHub [@bobiastro](https://github.com/bobiastro)）
+当前版本 **v2.7.3** ｜ 作者 打野波比（GitHub [@bobiastro](https://github.com/bobiastro)）
 
 BUG 反馈 / 使用问题：**微信 15795179443**
 

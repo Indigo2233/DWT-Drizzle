@@ -2705,6 +2705,30 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         # 带宽按"单带 num/cov 各约 750MB"取；带太窄时旋转帧的斜条带
         # （横跨宽度 w 时行偏移约 w·sinθ）占比过高：34 行时斜条带被放大
         # 13×，96 行降到 2.7×
+        # ---- 位移表补齐到帧数：某些素材里配准阶段会少回一帧，长度不一致
+        #      会让 stack_drizzle 按帧索引时越界。补成 NaN 的帧等于不参与。
+        try:
+            _nd = len(np.asarray(dx))
+            if _nd != n:
+                log(f'[配准] 位移表 {_nd} 个 / 帧 {n} 帧，已补齐（缺的帧不参与）')
+                _dw = np.full(n, np.nan)
+                _dw[:_nd] = np.asarray(dx, np.float64)[:_nd]
+                dx = _dw
+                _dw = np.full(n, np.nan)
+                _dw[:_nd] = np.asarray(dy, np.float64)[:_nd]
+                dy = _dw
+                _tw = np.zeros(n)
+                _tw[:_nd] = np.asarray(th, np.float64)[:_nd]
+                th = _tw
+                _kw = np.ones(n)
+                _kw[:_nd] = np.asarray(kk, np.float64)[:_nd]
+                kk = _kw
+                if _dist is not None and len(np.asarray(_dist)) != n:
+                    _dw = np.zeros(n)
+                    _dw[:_nd] = np.asarray(_dist, np.float64)[:_nd]
+                    _dist = _dw
+        except Exception as _e_len:
+            log(f'[配准] 位移表补齐失败（{type(_e_len).__name__}: {_e_len}），继续')
         t2 = time.perf_counter()
         try:            r_d = stack_drizzle(fs, R, C, S, dx, dy, drz_plan, A, B, rej_k,
                                 rej_gate, float(fs.sky0), drz_p, band,
