@@ -75,28 +75,56 @@ def band(ctx, Y0, Y1):
         if bool(goodcol.any()):
             an = cp.nanmedian(cp.where(goodcol[None], vs, cp.nan), axis=0)
             anchor = cp.where(goodcol, cp.where(cp.isfinite(an), an, 0.0), 0.0).astype(cp.float32)
+        _mode = str(ctx.get('rej_mode', 'winsor'))
+        _s_pix = (cp.nanstd(v, axis=0).astype(cp.float32)
+                  if _mode == 'winsor' else None)
         dev = cp.abs(v - anchor[None])
         mad = cp.zeros((bh, W), cp.float32)
         if bool(goodcol.any()):
             dv = dev if sel is None else dev[sel]
             md = cp.nanmedian(cp.where(goodcol[None], dv, cp.nan), axis=0)
             mad = cp.where(goodcol, 1.4826 * cp.where(cp.isfinite(md), md, 0.0), 0.0).astype(cp.float32)
-        # 分块 MAD（与 CPU 版同口径）：整幅统一会啃星云、放过拖线
-        try:
+        if _mode == 'winsor':
+            # 与 CPU 版同口径：按值标准差截尾，再求 |偏差| 分块均值 ×1.15
             _bk = int(ctx.get('rej_block', 64))
-            _ds = dev[_sel] if n > ANCHOR_N else dev
-            _m2 = cp.zeros((bh, W), cp.float32)
+            _lim = cp.zeros((bh, W), cp.float32)
+            _sp = cp.where(goodcol, _s_pix, 0.0)
             for _y0 in range(0, bh, _bk):
                 _y1 = min(bh, _y0 + _bk)
                 for _x0 in range(0, W, _bk):
                     _x1 = min(W, _x0 + _bk)
-                    _blk = _ds[:, _y0:_y1, _x0:_x1]
-                    _a = cp.nanmedian(_blk, axis=0)
-                    _s2 = float(cp.nanmedian(_a)) if _a.size else 0.0
-                    _m2[_y0:_y1, _x0:_x1] = 1.4826 * _s2
-            mad = cp.where(goodcol, _m2, 0.0).astype(cp.float32)
-        except Exception:
-            pass
+                    _blk = _sp[_y0:_y1, _x0:_x1]
+                    _f = _blk[_blk > 0]
+                    _v0 = float(_f.mean()) if _f.size else 0.0
+                    _lim[_y0:_y1, _x0:_x1] = _v0 * cp.float32(max(2.0, float(rej_k)))
+            _devc = cp.minimum(dev, _lim[None])
+            _col = cp.where(goodcol, cp.nanmean(_devc, axis=0), 0.0)
+            _m3 = cp.zeros((bh, W), cp.float32)
+            for _y0 in range(0, bh, _bk):
+                _y1 = min(bh, _y0 + _bk)
+                for _x0 in range(0, W, _bk):
+                    _x1 = min(W, _x0 + _bk)
+                    _blk = _col[_y0:_y1, _x0:_x1]
+                    _f = _blk[_blk > 0]
+                    _v0 = float(_f.mean()) if _f.size else 0.0
+                    _m3[_y0:_y1, _x0:_x1] = cp.float32(1.15) * _v0
+            mad = _m3
+        if _mode == 'mad':
+            try:
+                _bk = int(ctx.get('rej_block', 64))
+                _ds = dev[_sel] if n > ANCHOR_N else dev
+                _m2 = cp.zeros((bh, W), cp.float32)
+                for _y0 in range(0, bh, _bk):
+                    _y1 = min(bh, _y0 + _bk)
+                    for _x0 in range(0, W, _bk):
+                        _x1 = min(W, _x0 + _bk)
+                        _blk = _ds[:, _y0:_y1, _x0:_x1]
+                        _a = cp.nanmedian(_blk, axis=0)
+                        _s2 = float(cp.nanmedian(_a)) if _a.size else 0.0
+                        _m2[_y0:_y1, _x0:_x1] = 1.4826 * _s2
+                mad = cp.where(goodcol, _m2, 0.0).astype(cp.float32)
+            except Exception:
+                pass
         sig = cp.maximum(anchor - cp.float32(sky), 0.0)
         core = (R > 0.5) & (sig > 0)
         m = 0.0

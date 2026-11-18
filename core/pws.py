@@ -2788,7 +2788,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         try:            r_d = stack_drizzle(fs, R, C, S, dx, dy, drz_plan, A, B, rej_k,
                                 rej_gate, float(fs.sky0), drz_p, band,
                                 theta=th, scale=kk, dist=_dist, workers=_drizzle_workers(),
-                                T=T, fp=fp,
+                                T=T, fp=fp, rej_mode=str(getattr(p, 'rej_mode', 'winsor')),
                                 native_shape=fs.shape, log=log, emit=_emit,
                                 cancel=_check_cancel,
                                 sharp_w=float(getattr(p, 'sharp_w', 0.0) or 0.0))

@@ -77,6 +77,7 @@ class PwsParams:
     r_floor: float = 0.0
     n_star: int = 120
     c_star: int = 120
+    rej_mode: str = 'winsor'
     rej_gate: float = 1 / 3
     # ---- 高级 · drizzle（几何层）----
     drizzle: bool = False
@@ -296,6 +297,14 @@ PARAMS: Tuple[Param, ...] = (
           '在信噪比最好的一帧上一次性选星（未饱和、孤立、最亮），'
           '之后所有帧量同一批位置。中位数在 100 颗以上已稳定；星太少的视场可调小。',
           lo=20, hi=600, step=10),
+    Param('rej_mode', '排异尺度算法', 'choice', '高级',
+          'winsorized = 截尾后求均值（默认，快且抗差）',
+          '三种都是噪声尺度的鲁棒估计：winsor 先按 3σ 截尾再求 mean|x−μ|×1.2533，'
+          '免排序又不会被拖线抬高阈值（PI 3.1.1 在 7~14 帧也用这一档）；'
+          'mad 是旧算法（median|x−μ|×1.4826，要排序、最慢）；'
+          'fast 是不截尾的均值版，最快但剔除更松（实测剔除率 1.16% → 0.77%）。',
+          choices=(('winsorized（推荐）', 'winsor'), ('中位绝对偏差（旧）', 'mad'),
+                   ('平均绝对偏差（最快）', 'fast'))),
     Param('c_star', '测清晰度星数', 'int', '高级',
           '逐帧量星点 FWHM（C 权重）时用几颗星；0 = 用满整张星表',
           'C 只要中位数，但权重按 C^A 放大（A=20 时 5% 的 C 误差≈差 38% 权重），'

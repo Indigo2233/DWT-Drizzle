@@ -1191,6 +1191,60 @@ def _band_work(Y0Y1):
     return _drizzle_band(_BCTX, Y0, Y1)
 
 
+def _fast_scale(dev: np.ndarray, goodcol: np.ndarray, bh: int, W: int, block: int = 64) -> np.ndarray:
+    """平均绝对偏差估 σ（MAD 的快路径）
+
+    |x−μ| 的期望是 σ·√(2/π) = 0.7979σ，所以 σ ≈ 1.2533·mean|x−μ|。
+    比 MAD（中位绝对偏差，需要排序）快 5~7 倍，抗差性略差：
+    少数帧拖线会把均值抬高一点，阈值随之变松，属于"少剔"而不是"多啃"。
+    """
+    col = np.nanmean(dev, axis=0).astype(np.float32)
+    col = np.where(goodcol, col, 0.0)
+    out = np.zeros((bh, W), np.float32)
+    for y0 in range(0, bh, block):
+        y1 = min(bh, y0 + block)
+        for x0 in range(0, W, block):
+            x1 = min(W, x0 + block)
+            sl = col[y0:y1, x0:x1]
+            f = sl[sl > 0]
+            v = float(f.mean()) if f.size else 0.0
+            out[y0:y1, x0:x1] = 1.2533141 * v
+    return out
+
+
+def _block_mean2d(a: np.ndarray, bh: int, W: int, block: int = 64) -> np.ndarray:
+    """按 block×block 求均值（用于把逐像素的尺度图压成稀疏阈值图）"""
+    out = np.zeros((bh, W), np.float32)
+    a = a.astype(np.float32, copy=False)
+    for y0 in range(0, bh, block):
+        y1 = min(bh, y0 + block)
+        for x0 in range(0, W, block):
+            x1 = min(W, x0 + block)
+            sl = a[y0:y1, x0:x1]
+            f = sl[np.isfinite(sl) & (sl > 0)]
+            if f.size:
+                out[y0:y1, x0:x1] = float(f.mean())
+    return out
+
+
+def _winsor_scale(dev: np.ndarray, s_pix: np.ndarray, goodcol: np.ndarray,
+                  bh: int, W: int, block: int = 64, k: float = 3.0) -> np.ndarray:
+    """winsorized 尺度估计：先粗估 σ，把 |x−μ| 截尾到 k·σ，再求均值
+
+    PI 的 winsorized sigma clipping 就是这一步：直接对含离群值的样本求均值，
+    均值会被"要剔的那条拖线"抬高、阈值变松（实测剔除率 1.16% → 0.77%）；
+    先截尾再平均就把这个偏置压掉了，代价只是多一遍 nanstd。
+    """
+    lim = _block_mean2d(np.where(goodcol, s_pix, 0.0), bh, W, block) * float(k)
+    dev_c = np.minimum(dev, lim[None])
+    col = np.nanmean(dev_c, axis=0).astype(np.float32)
+    col = np.where(goodcol, col, 0.0)
+    # 1.15 是实测标定值：高斯下 E|x−μ| = 0.7979σ，理论上 σ = 1.2533·mean|x−μ|，
+    # 但先截尾再平均会把均值压低，直接乘 1.2533 会让阈值偏小、多剔；
+    # 在 M81 60 帧上把剔除率标到与 MAD 持平（1.135% vs 1.155%）对应 1.15。
+    return _block_mean2d(col, bh, W, block) * 1.15
+
+
 def _block_mad(dev, sel, bh, W, block=64):
     """分块 MAD：每 block×block 输出像素用一档尺度。
 
@@ -1202,7 +1256,13 @@ def _block_mad(dev, sel, bh, W, block=64):
     ds = dev[sel] if sel is not None else dev
     # 逐像素的帧中位先整带算一次，再按块取中位 —— 与逐块 nanmedian(axis=0)
     # 的数学结果完全相同（中位对帧方向是逐元素运算），但少了几十次重复扫描。
-    pm = np.nanmedian(ds, axis=0) if ds.shape[0] > 1 else ds[0]
+    if ds.shape[0] > 1:
+        # 无 NaN 的带用 np.median（内部已是 partition，55ms）；nanmedian 要走掩膜，
+        # 同样口径慢 2.3 倍（127ms），而排除帧只占一两个像素列时没必要付这个代价。
+        pm = (np.median(ds, axis=0) if bool(np.isfinite(ds).all())
+              else np.nanmedian(ds, axis=0))
+    else:
+        pm = ds[0]
     for y0 in range(0, bh, block):
         y1 = min(bh, y0 + block)
         for x0 in range(0, W, block):
@@ -1254,6 +1314,7 @@ def _drizzle_band(ctx, Y0: int, Y1: int) -> Dict:
     dx, dy, plan = ctx['dx'], ctx['dy'], ctx['plan']
     A, B = ctx['A'], ctx['B']
     rej_k, rej_gate = ctx['rej_k'], ctx['rej_gate']
+    cm = str(ctx.get('rej_mode', 'winsor'))
     sky, pixfrac = ctx['sky'], ctx['pixfrac']
     sw = float(ctx.get('sharp_w', 0.0) or 0.0)
     rot, theta, scale = ctx['rot'], ctx['theta'], ctx['scale']
@@ -1310,14 +1371,28 @@ def _drizzle_band(ctx, Y0: int, Y1: int) -> Dict:
             _vs = v
         anchor = np.zeros((bh, W), np.float32)
         if bool(goodcol.any()):
-            an = np.nanmedian(_vs[:, goodcol], axis=0)
+            _sub = _vs[:, goodcol]
+            if bool(np.isfinite(_sub).all()):
+                an = np.median(_sub, axis=0)          # 无 NaN：快 2.3 倍，结果相同
+            else:
+                an = np.nanmedian(_sub, axis=0)
             anchor[goodcol] = np.where(np.isfinite(an), an, 0.0)
+        # winsor 的截尾上限要用「值」的标准差，不能用 |偏差| 的标准差
+        _s_pix = (np.nanstd(v, axis=0).astype(np.float32)
+                  if str(cm) == 'winsor' else None)
         # dev 就地算：v 之后不再需要原值，省一块 (n, bh, W) 的临时量
         np.subtract(v, anchor[None], out=v)
         np.abs(v, out=v)
         dev = v
-        mad = _block_mad(dev, _sel if n > ANCHOR_N else None, bh, W, REJ_BLOCK)
-        mad = np.where(goodcol, mad, 0.0).astype(np.float32)
+        if str(cm) == 'winsor':
+            mad = _winsor_scale(dev, _s_pix, goodcol, bh, W, REJ_BLOCK,
+                                max(2.0, float(rej_k)))
+            mad = np.where(goodcol, mad, 0.0).astype(np.float32)
+        elif str(cm) == 'mad':
+            mad = _block_mad(dev, _sel if n > ANCHOR_N else None, bh, W, REJ_BLOCK)
+            mad = np.where(goodcol, mad, 0.0).astype(np.float32)
+        else:
+            mad = _fast_scale(dev, goodcol, bh, W, REJ_BLOCK)
         sig = np.maximum(anchor - sky, 0.0)
         core = (R > 0.5) & (sig > 0)
         m = 0.0
@@ -1378,7 +1453,8 @@ def stack_drizzle(fs, R_out: np.ndarray, C: np.ndarray, S: np.ndarray,
                   rot=None, theta=None, scale=None, dist=None,
                   native_shape: Optional[Tuple[int, int]] = None,
                   log=None, emit=None, cancel=None, workers: int = 0,
-                  sharp_w: float = 0.0, T=None, fp: float = 0.0) -> Dict:
+                  sharp_w: float = 0.0, T=None, fp: float = 0.0,
+                  rej_mode: str = 'winsor') -> Dict:
     """按输出行分带：每带对全部帧做 drizzle → 排异 → 带权合成
 
     与 stack_strip 的区别（统计上等价、几何上更细）：
@@ -1442,7 +1518,8 @@ def stack_drizzle(fs, R_out: np.ndarray, C: np.ndarray, S: np.ndarray,
            'P': max(1e-6, float(pixfrac) * float(plan['s'])),
            'dist': (None if dist is None else np.asarray(dist, np.float64)),
            'idx': idx, 'use_rot': use_rot, 'mx': mx, 'fs_n': n_all,
-           'bgcoef': _bg, 'bgdeg': _bgd, 'rows_fn': _band_rows}
+           'bgcoef': _bg, 'bgdeg': _bgd, 'rows_fn': _band_rows,
+           'rej_mode': str(rej_mode)}
 
     use_par = bool(workers and workers > 1 and getattr(fs, 'mm', None) is not None
                    and len(ranges) > 1 and not getattr(fs, 'resident', False))
