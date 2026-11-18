@@ -76,13 +76,22 @@ def _conv(a: np.ndarray, k: np.ndarray) -> np.ndarray:
     return out
 
 
-def plane(img: np.ndarray, pattern: str, ch: str) -> np.ndarray:
+def mask2(pattern: str, ch: str) -> np.ndarray:
+    """返回该颜色在 2×2 里的掩膜（行,列）"""
+    return _mask(pattern, ch)
+
+
+def plane(img: np.ndarray, pattern: str, ch: str,
+          y0: int = 0, x0: int = 0) -> np.ndarray:
     """从 CFA 图里取出一个通道的整幅图层（双线性思路）。
 
     该通道的真实像素原样保留；其余位置用 3×3 邻域内同色像素的加权均值补齐。
     """
     h, w = img.shape[:2]
-    sel = _tile(_mask(pattern, ch), h, w)
+    _m2 = _mask(pattern, ch)
+    _ys = (np.arange(h) + int(y0)) % 2
+    _xs = (np.arange(w) + int(x0)) % 2
+    sel = _m2[np.ix_(_ys, _xs)]
     if sel.all():
         return img.astype(np.float32, copy=True)
     fill, _ = _dilate_mean(img, sel)

@@ -1016,6 +1016,142 @@ def _band_rows(plan: Dict, theta: float, uy: float, Y0: int, Y1: int,
     return max(0, j0), min(h, j1)
 
 
+# ---------------------------------------------------------------- 旋转四边形核
+_DZ_QUAD = os.environ.get('DWT_DZ_QUAD', '') == '1'
+_QUAD_CACHE: Dict = {}
+_QUAD_NBIN = 96
+_QUAD_MAXV = 12
+
+
+def _quad_edges(verts, cnt):
+    M = verts.shape[1]
+    j = (np.arange(M)[None, :] + 1) % np.maximum(cnt, 1)[:, None]
+    return np.take_along_axis(verts, j[:, :, None], axis=1)
+
+
+def _quad_clip(verts, cnt, axis, val, keep_ge):
+    vj = _quad_edges(verts, cnt)
+    di = verts[:, :, axis] - val
+    dj = vj[:, :, axis] - val
+    if not keep_ge:
+        di, dj = -di, -dj
+    valid = np.arange(verts.shape[1])[None, :] < cnt[:, None]
+    in_i = di >= 0
+    in_j = dj >= 0
+    cross = valid & (in_i != in_j)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        t = np.where(np.abs(di - dj) > 1e-15, di / (di - dj), 0.0)
+    inter = verts + t[:, :, None] * (vj - verts)
+    out = np.zeros((verts.shape[0], _QUAD_MAXV, 2), np.float64)
+    ocnt = np.zeros(verts.shape[0], np.int64)
+    for i in range(verts.shape[1]):
+        m1 = valid[:, i] & in_i[:, i]
+        pos = ocnt.copy()
+        out[np.nonzero(m1)[0], pos[m1]] = verts[m1, i]
+        ocnt[m1] += 1
+        m2 = cross[:, i]
+        pos = ocnt.copy()
+        out[np.nonzero(m2)[0], pos[m2]] = inter[m2, i]
+        ocnt[m2] += 1
+    return out, ocnt
+
+
+def _quad_area(verts, cnt):
+    vj = _quad_edges(verts, cnt)
+    s = verts[:, :, 0] * vj[:, :, 1] - vj[:, :, 0] * verts[:, :, 1]
+    valid = np.arange(verts.shape[1])[None, :] < cnt[:, None]
+    return np.abs(np.where(valid, s, 0.0).sum(axis=1)) * 0.5
+
+
+def _quad_overlap(cx, cy, P, theta, kx, ky):
+    h = 0.5 * P
+    c, s = np.cos(theta), np.sin(theta)
+    rx = np.array([h, -h, -h, h]) * c - np.array([h, h, -h, -h]) * s
+    ry = np.array([h, -h, -h, h]) * s + np.array([h, h, -h, -h]) * c
+    verts = np.zeros((cx.size, _QUAD_MAXV, 2), np.float64)
+    verts[:, :4, 0] = (cx - kx)[:, None] + rx[None, :]
+    verts[:, :4, 1] = (cy - ky)[:, None] + ry[None, :]
+    cnt = np.full(cx.size, 4, np.int64)
+    verts, cnt = _quad_clip(verts, cnt, 0, 0.0, True)
+    verts, cnt = _quad_clip(verts, cnt, 0, 1.0, False)
+    verts, cnt = _quad_clip(verts, cnt, 1, 0.0, True)
+    verts, cnt = _quad_clip(verts, cnt, 1, 1.0, False)
+    return _quad_area(verts, cnt)
+
+
+def _quad_table(P: float, theta: float):
+    """(fx,fy) -> 5x5 权重表；权重已按 1/P^2 归一（每样本总和 1）。"""
+    key = (round(float(P), 6), round(float(theta), 6))
+    tab = _QUAD_CACHE.get(key)
+    if tab is not None:
+        return tab
+    nb = _QUAD_NBIN
+    k = int(math.ceil(0.5 * P * (abs(math.cos(theta)) + abs(math.sin(theta))))) + 1
+    off = np.arange(-k, k + 1)
+    gx = (np.arange(nb) + 0.5) / nb
+    fx, fy = np.meshgrid(gx, gx, indexing='xy')
+    fx = fx.ravel()
+    fy = fy.ravel()
+    w = np.zeros((fx.size, off.size, off.size), np.float32)
+    for a, ox in enumerate(off):
+        for b, oy in enumerate(off):
+            w[:, a, b] = _quad_overlap(fx, fy, P, theta, ox, oy)
+    w /= np.float32(P * P)
+    tab = (off, w)
+    _QUAD_CACHE[key] = tab
+    return tab
+
+
+def _scatter_quad(vals, X, Y, P, W, Y0, Y1, theta, with_cov=False):
+    bh = Y1 - Y0
+    size = bh * W
+    off, tab = _quad_table(P, theta)
+    m = (Y > Y0 - P) & (Y < Y1 + P) & (X > -P) & (X < W + P)
+    if not m.any():
+        z = np.zeros((bh, W), np.float32)
+        return (z, z.copy()) if with_cov else z
+    xs = X[m]
+    ys = Y[m]
+    v = vals[m].astype(np.float64)
+    k0 = np.floor(xs).astype(np.int64)
+    l0 = np.floor(ys).astype(np.int64)
+    fx = xs - k0
+    fy = ys - l0
+    ix = np.clip((fx * _QUAD_NBIN).astype(np.int64), 0, _QUAD_NBIN - 1)
+    iy = np.clip((fy * _QUAD_NBIN).astype(np.int64), 0, _QUAD_NBIN - 1)
+    base = iy * _QUAD_NBIN + ix
+    idxs = []
+    wgts = []
+    wvts = []
+    for a in range(off.size):
+        kx = k0 + off[a]
+        vx = (kx >= 0) & (kx < W)
+        for b in range(off.size):
+            ky = l0 + off[b]
+            mm = vx & (ky >= Y0) & (ky < Y1)
+            if not mm.any():
+                continue
+            sel = np.nonzero(mm)[0]
+            w = tab[base[sel], a, b].astype(np.float64)
+            keep = w > 0
+            if not keep.all():
+                sel = sel[keep]
+                w = w[keep]
+            idxs.append((ky[sel] - Y0) * W + kx[sel])
+            wgts.append(w)
+            wvts.append(w * v[sel])
+    if not idxs:
+        z = np.zeros((bh, W), np.float32)
+        return (z, z.copy()) if with_cov else z
+    idx = np.concatenate(idxs)
+    wgt = np.concatenate(wgts)
+    acc = np.bincount(idx, weights=np.concatenate(wvts), minlength=size).reshape(bh, W)
+    if not with_cov:
+        return acc.astype(np.float32)
+    cov = np.bincount(idx, weights=wgt, minlength=size).reshape(bh, W)
+    return acc.astype(np.float32), cov.astype(np.float32)
+
+
 def _scatter_band(vals: np.ndarray, X: np.ndarray, Y: np.ndarray, P: float,
                   W: int, Y0: int, Y1: int, with_cov: bool = False):
     """把 (X,Y) 处的方框 drop（边长 P，输出网格轴对齐）铺到输出行 [Y0,Y1)
@@ -1376,7 +1512,18 @@ def _drizzle_band(ctx, Y0: int, Y1: int) -> Dict:
                 continue
             strip = np.asarray(fs.strip(i, j0, j1), np.float32)
             X, Y = _xy_rows(j0, j1, w, plan, th, ux, uy, kk, dd, h)
-            num[k], cov[k] = _scatter_band(strip, X, Y, Pi, W, Y0, Y1, with_cov=True)
+            _cs = ctx.get('cfa_sel')
+            if _cs is not None:
+                _m2, _oy, _ox = _cs
+                _ry = (np.arange(j0, j1) + _oy) % 2
+                _cx = (np.arange(w) + _ox) % 2
+                _mk = _m2[np.ix_(_ry, _cx)]
+                strip = strip[_mk]
+                X = X[_mk]
+                Y = Y[_mk]
+            num[k], cov[k] = (_scatter_quad(strip, X, Y, Pi, W, Y0, Y1, th, with_cov=True)
+                               if _DZ_QUAD else
+                               _scatter_band(strip, X, Y, Pi, W, Y0, Y1, with_cov=True))
             continue
         j0, j1 = crop_window(plan, i, dx, dy, Y0, Y1, h, pixfrac)
         if j1 <= j0:
@@ -1484,7 +1631,7 @@ def stack_drizzle(fs, R_out: np.ndarray, C: np.ndarray, S: np.ndarray,
                   native_shape: Optional[Tuple[int, int]] = None,
                   log=None, emit=None, cancel=None, workers: int = 0,
                   sharp_w: float = 0.0, T=None, fp: float = 0.0,
-                  rej_mode: str = 'winsor') -> Dict:
+                  rej_mode: str = 'winsor', cfa_sel=None) -> Dict:
     """按输出行分带：每带对全部帧做 drizzle → 排异 → 带权合成
 
     与 stack_strip 的区别（统计上等价、几何上更细）：
@@ -1517,7 +1664,10 @@ def stack_drizzle(fs, R_out: np.ndarray, C: np.ndarray, S: np.ndarray,
         raise ValueError('没有一帧的位移可用（全部匹配失败）')
     n = len(idx)
     s = float(plan['s'])
-    use_rot = ((theta is not None and bool(np.any(np.abs(np.nan_to_num(theta[idx])) > 1e-9)))
+    if cfa_sel is not None:
+        use_rot = True
+    else:
+        use_rot = ((theta is not None and bool(np.any(np.abs(np.nan_to_num(theta[idx])) > 1e-9)))
                or (scale is not None and bool(np.any(np.abs(np.nan_to_num(scale[idx]) - 1.0) > 1e-9))))
     P = max(1e-6, float(pixfrac) * s)
     mx = {} if use_rot else {i: _axis_matrix(w, W, s, dx[i], pixfrac, plan['ox']) for i in idx}
@@ -1547,7 +1697,7 @@ def stack_drizzle(fs, R_out: np.ndarray, C: np.ndarray, S: np.ndarray,
            's': float(plan['s']),
            'P': max(1e-6, float(pixfrac) * float(plan['s'])),
            'dist': (None if dist is None else np.asarray(dist, np.float64)),
-           'idx': idx, 'use_rot': use_rot, 'mx': mx, 'fs_n': n_all,
+           'idx': idx, 'use_rot': use_rot, 'mx': mx, 'cfa_sel': cfa_sel, 'fs_n': n_all,
            'bgcoef': _bg, 'bgdeg': _bgd, 'rows_fn': _band_rows,
            'rej_mode': str(rej_mode)}
 
@@ -1694,7 +1844,9 @@ def stack_sharp_reference(fs, idx: Sequence[int], dx: np.ndarray, dy: np.ndarray
                     continue
                 strip = np.asarray(fs.strip(i, j0, j1), np.float32)
                 X, Y = _xy_rows(j0, j1, w, plan, th, ux, uy, kk, dd, h)
-                buf[q] = _scatter_band(strip, X, Y, Pi, W, Y0, Y1)
+                buf[q] = (_scatter_quad(strip, X, Y, Pi, W, Y0, Y1, th)
+                          if _DZ_QUAD else
+                          _scatter_band(strip, X, Y, Pi, W, Y0, Y1))
                 continue
             j0, j1 = crop_window(plan, i, dx, dy, Y0, Y1, h, pixfrac)
             if j1 <= j0:

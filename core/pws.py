@@ -36,7 +36,8 @@ except Exception:
 
 # CFA 上下文：值由 _run 设置，prepare_frames 读帧时消费。
 #   ch=None 表示按普通单色帧读（不解马赛克）。
-_CFA = {'ch': None, 'pattern': None, 'method': 'bilinear'}
+_CFA = {'ch': None, 'pattern': None, 'method': 'bilinear',
+        'raw': False, 'origin': (0, 0)}
 _MISC = {'crop_origin': (0, 0)}     # 当前组的裁剪起点 (x0,y0)，--frame 折算用
 import contextlib
 import io
@@ -127,6 +128,9 @@ CAP_FWHM = 12
 #   叠加（drizzle 分带）：内存带宽受限，实测 4/6/8/10 进程为 25.7/23.8/24.8/24.4s
 #   （M81 40 帧 1600² ×2，6 核以上机器），6 最划算；仍受"核数−2"约束
 CAP_DRIZZLE = 6
+
+# 逐帧行固定纹去除（row FPN）：默认开，DWT_NO_ROWFPN=1 关掉做 A/B
+_ROWFPN = bool(os.environ.get('DWT_ROWFPN'))   # 实验开关：默认关，实测未改善成品行纹
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +626,8 @@ class FrameSet:
         self.bgrcoef = None        # (n,2) 径向系数
         self.bg_stats: Dict = {}
         self.bgshape = (int(shape[0]), int(shape[1]))
+        # 读帧时顺手量的逐帧星点 FWHM（C 权重）；NaN = 这帧没量出来
+        self.fwhms: Optional[np.ndarray] = None
 
     def __len__(self) -> int:
         return self.n
@@ -720,11 +726,40 @@ class FrameSet:
                 log(f'[memmap] 删除失败（可手动删）：{self.path}  {e}')
 
 
+class _PlaneFS:
+    """给注册/测星用的“拆色视图”代理：帧存储里是原始马赛克，这里按需拆色。
+
+    真 CFA drizzle 需要原始样本进散射；但配准与 PSF 估计必须看插值后的图层，
+    否则星点被 2×2 马赛克切碎。用代理把两种视角分开，互不污染。
+    """
+
+    def __init__(self, fs, pattern: str, ch: str):
+        self._fs = fs
+        self._pat = pattern
+        self._ch = ch
+        self.shape = fs.shape
+        self.n = fs.n
+
+    def __len__(self):
+        return len(self._fs)
+
+    def __getattr__(self, name):
+        return getattr(self._fs, name)
+
+    def frame(self, i: int):
+        return _cfa.plane(self._fs.frame(int(i)), self._pat, self._ch)
+
+    def strip(self, i: int, y0: int, y1: int):
+        return _cfa.plane(self._fs.strip(int(i), int(y0), int(y1)),
+                           self._pat, self._ch, y0=int(y0))
+
+
+
 def prepare_frames(frames: List[Path], label: str, crop: int,
                    center: Optional[Tuple[int, int]],
                    limit: Optional[int] = None, frames_dir: str = '',
                    mem_frac: float = 0.55, keep_frames: bool = False,
-                   bgdeg: int = 0, bg_r: int = 0) -> FrameSet:
+                   bgdeg: int = 0, bg_r: int = 0, star_n: int = 0) -> FrameSet:
     """读帧 → 裁剪 → float32 → **曝光归一**（×EXPTIME_REF/t_i），
     同时逐帧量天空中位与噪声尺度；按内存预算自动决定驻留还是落 memmap。
 
@@ -790,6 +825,31 @@ def prepare_frames(frames: List[Path], label: str, crop: int,
         f'{"父进程内存（串行）" if mm is None else "memmap 流式（并行）"}')
 
     fs = FrameSet(n, (h, w), (mm is None), arrays=arrays, mm=mm, path=mmpath)
+    if _CFA.get('raw') and _CFA['ch']:
+        _CFA['origin'] = tuple(int(v) for v in _MISC.get('crop_origin', (0, 0)))
+        log('[CFA] 真 CFA drizzle：帧存储保留原始马赛克（不插值）')
+    # C 权重用的星表：在探针帧（第 0 帧）上建一次，交给读帧进程顺手量 FWHM。
+    #   探针帧在裁剪之后重新读一次（只 1 帧，0.2s），换来省掉读帧后那一整遍。
+    fw_stars: List[Tuple[int, int]] = []
+    fw_guess = 6.0
+    _fw_ser = np.full(n, np.nan, np.float64)   # 串行分支顺手量的逐帧 FWHM
+    if star_n and int(star_n) > 0:
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                _p, _ = read_frame(files[0])
+            _p = np.ascontiguousarray(_p[y0:y0 + h, x0:x0 + w]).astype(np.float32)
+            if _CFA['ch'] and _cfa is not None:
+                _p = _cfa.plane(_p, _CFA['pattern'], _CFA['ch'])
+            fw_stars = build_star_table(_p, n_star=int(star_n))
+            _sig = _noise_sigma(_p)
+            if _sig > 0:
+                fw_guess = float(np.clip(2.355 * 1.6 * _sig / max(float(np.median(_p)), 1e-9),
+                                         2.0, 12.0))
+            del _p
+            log(f'[C] 读帧时并行量星点 FWHM：探针帧上选出 {len(fw_stars)} 颗')
+        except Exception as _e:
+            fw_stars, fw_guess = [], 6.0
+            log(f'[C] 探针帧建星表失败（{_e}），C 权重改回读帧后单独量')
     bg_grids: List[object] = [None] * n      # 逐帧块中位（仅 bgdeg>0 时填）
     t0 = time.perf_counter()
     # 逐帧独立（各读各的源文件、各写各的槽位）→ 可分给多进程。
@@ -809,18 +869,26 @@ def prepare_frames(frames: List[Path], label: str, crop: int,
                                      initargs=ini_rw_args)
             try:
                 jobs = ((i, str(files[i]), EXPTIME_REF, y0, x0, h, w,
-                         int(bgdeg), _CFA['ch'], _CFA['pattern']) for i in range(n))
-                for i, med, sig, bgm, meta in ex.map(_task_read_frame, jobs, chunksize=1):
+                         int(bgdeg),
+                         ('' if _CFA.get('raw') else _CFA['ch']),
+                         _CFA['pattern'], fw_stars, fw_guess)
+                        for i in range(n))
+                _fwhm_buf = np.full(n, np.nan, np.float64)
+                for i, med, sig, bgm, meta, fwk in ex.map(_task_read_frame, jobs,
+                                                          chunksize=1):
                     _check_cancel()
                     fs.skies[i] = med
                     fs.sigma[i] = sig
                     bg_grids[i] = bgm
                     fs.metas[i] = meta
+                    _fwhm_buf[i] = fwk
                     if (i + 1) % 20 == 0:
                         log(f'  读帧 {i + 1}/{n}  {time.perf_counter() - t0:.0f}s')
                     _emit('读帧', (i + 1) / max(n, 1), f'{i + 1}/{n} 帧')
             finally:
                 ex.shutdown(wait=True, cancel_futures=True)
+            if fw_stars:
+                fs.fwhms = _fwhm_buf
         else:
             for i, f in enumerate(files):
                 _check_cancel()                     # 读帧阶段也要能终止
@@ -829,9 +897,19 @@ def prepare_frames(frames: List[Path], label: str, crop: int,
                 d = np.ascontiguousarray(data[y0:y0 + h, x0:x0 + w]).astype(np.float32)
                 del data
                 d *= np.float32(EXPTIME_REF / float(meta['exptime']))
-                if _CFA['ch'] and _cfa is not None:
+                if _CFA['ch'] and _cfa is not None and not _CFA.get('raw'):
                     d = _cfa.plane(d, _CFA['pattern'], _CFA['ch'])
+                if _ROWFPN:
+                    _strip_rowfpn(d)
                 med = float(np.median(d))
+                if fw_stars:
+                    try:
+                        _v = measure_fwhm_each(d, fw_stars, fwhm_guess=fw_guess)
+                        _ok = np.isfinite(_v)
+                        if _ok.sum() >= 5:
+                            _fw_ser[i] = float(np.median(_v[_ok]))
+                    except Exception:
+                        pass
                 fs.skies[i] = med
                 fs.sigma[i] = _noise_sigma(d)
                 if bgdeg:
@@ -846,6 +924,8 @@ def prepare_frames(frames: List[Path], label: str, crop: int,
                 if (i + 1) % 20 == 0:
                     log(f'  读帧 {i + 1}/{n}  {time.perf_counter() - t0:.0f}s')
                 _emit('读帧', (i + 1) / max(n, 1), f'{i + 1}/{n} 帧')
+        if fw_stars:
+            fs.fwhms = _fw_ser
     except BaseException:
         # 读帧半途失败（终止 / 工作进程异常 / 盘满）都要把半成品临时帧文件清掉，
         #   否则一块几十 GiB 的文件会一直占着盘；清完再把异常往上抛
@@ -1610,6 +1690,24 @@ def _worker_open_rw(path: str, n: int, h: int, w: int) -> None:
     _MEM['mmw'] = np.memmap(path, dtype=np.float32, mode='r+', shape=(n, h, w))
 
 
+def _strip_rowfpn(d: np.ndarray, win: int = 101) -> np.ndarray:
+    """去掉逐帧的行方向固定纹（原地）。
+
+    行中位的高频部分（减去 ~win 行的中值趋势）≈ 传感器行固定纹：
+      · 去趋势窗口要足够长，才不会把天光梯度/渐晕一起当缺陷减掉；
+      · 列方向隔 4 取样，纯为省时间（行内像素够多，抽样不影响中位）。
+    没装 scipy 时原样返回（不影响其它流程）。
+    """
+    try:
+        from scipy.ndimage import median_filter as _mf
+    except Exception:
+        return d
+    prof = np.median(d[:, ::4], axis=1).astype(np.float64)
+    hp = prof - _mf(prof, size=int(win))
+    d -= hp.astype(np.float32)[:, None]
+    return d
+
+
 def _noise_sigma(d: np.ndarray) -> float:
     """逐像素噪声（对背景梯度免疫）。
 
@@ -1627,7 +1725,7 @@ def _task_read_frame(job):
 
     与串行循环里那一段逐字同式；结果写进自己那一格，标量与元数据字典回传由父进程按下标落位。
     """
-    i, fname, exptime_ref, y0, x0, h, w, bg_deg, cfa_ch, cfa_pat = job
+    i, fname, exptime_ref, y0, x0, h, w, bg_deg, cfa_ch, cfa_pat, fw_stars, fw_guess = job
     with contextlib.redirect_stdout(io.StringIO()):
         data, meta = read_frame(Path(fname))
     d = np.ascontiguousarray(data[y0:y0 + h, x0:x0 + w]).astype(np.float32)
@@ -1635,12 +1733,25 @@ def _task_read_frame(job):
     d *= np.float32(exptime_ref / float(meta['exptime']))
     if cfa_ch and _cfa is not None:
         d = _cfa.plane(d, cfa_pat, cfa_ch)
+    if _ROWFPN:
+        _strip_rowfpn(d)
     med = float(np.median(d))
     sig = _noise_sigma(d)
     bgm = bggrad.block_medians(d, bggrad.BG_BLOCK) if bg_deg else None
+    # 顺手量本帧星点 FWHM（C 权重）：帧已经解压在内存里，比之后从 memmap
+    #   一帧帧捞小窗再拟合便宜；每进程多 ~0.2s，与读盘等待重叠。
+    fw = float('nan')
+    if fw_stars:
+        try:
+            _v = measure_fwhm_each(d, fw_stars, fwhm_guess=fw_guess)
+            _ok = np.isfinite(_v)
+            if _ok.sum() >= 5:
+                fw = float(np.median(_v[_ok]))
+        except Exception:
+            fw = float('nan')
     _MEM['mmw'][i] = d
     del d
-    return int(i), med, sig, bgm, meta
+    return int(i), med, sig, bgm, meta, fw
 
 
 # ---------------------------------------------------------------------------
@@ -1959,7 +2070,25 @@ def _run(p: PwsParams) -> Dict:
         log(f'—— 组 {gi + 1}/{len(groups)}：{fname or "无滤镜信息"}，'
             f'{len(gframes)} 帧 ——')
         for ch in chans:
+            if cfa_pat and bool(getattr(p, 'cfa_drizzle', False)) and ch == chans[0]:
+                # CFA Drizzle：不解马赛克，三平面一次叠完（不再走逐通道循环）
+                _CFA['ch'], _CFA['pattern'] = None, None
+                from cfadz import run_group as _cfa_dz_run
+                res = _cfa_dz_run(gframes, sources, p, out_dir, stem, cfa_pat, log,
+                                  emit=_emit)
+                res['stem'] = stem
+                res['out_dir'] = str(out_dir)
+                summaries.append({
+                    'filter': (fname if not cfa_pat else 'RGB'),
+                    'n': int(res['n']), 'shape': res['shape'],
+                    'fwhm_med': float(res['fwhm_med']),
+                    'fwhm_out': float(res['fwhm_out']),
+                    'rej_rate': float(res['rej_rate']),
+                    'stem': stem, 'file': str(out_dir / f'{stem}_RGB.xisf'),
+                })
+                break
             _CFA['ch'], _CFA['pattern'] = ch, cfa_pat
+            _CFA['raw'] = os.environ.get('DWT_CFA_RAW', '') == '1'
             if cfa_pat:
                 log(f'—— CFA 通道 {ch} ——')
             stem_ch = stem if ch is None else f'{stem}_{ch}'
@@ -2043,7 +2172,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     env_win_mult, env_eps, env_p = float(p.env_win_mult), float(p.env_eps), float(p.env_p)
     star_grow_pct = float(p.star_grow_pct)
     rej_k, n_star = float(p.rej_k), int(p.n_star)
-    _c_star = int(getattr(p, 'c_star', 120) or 0)
+    _c_star = int(getattr(p, 'c_star', 64) or 0)
     rej_gate = float(p.rej_gate)                  # 剔除比例上限（默认 1/3）
     limit = int(p.limit) or None
     crop, keep_frames, frames_dir = int(p.crop), bool(p.keep_frames), p.frames_dir
@@ -2134,7 +2263,9 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         _ln_normalize(fs, seed, block=32, log=log)
     t1 = time.perf_counter()
     _emit('星表', 0.1, '检测星点')
-    stars = build_star_table(fs.frame(seed), n_star=n_star)
+    _reg = (_PlaneFS(fs, _CFA['pattern'], _CFA['ch'])
+            if (_CFA.get('raw') and _CFA['ch']) else fs)
+    stars = build_star_table(_reg.frame(seed), n_star=n_star)
     log(f'[星表] 帧 #{seed}（S 最高）上 DAOStarFinder 选出 {len(stars)} 颗'
         f'（未饱和、孤立、最亮）  {time.perf_counter() - t1:.1f}s')
     if len(stars) < 5:
@@ -2143,7 +2274,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
 
     # 留一份参考帧副本：后面 fs 会 close，SNR 对比还要用它
     try:
-        _snr_seed_img = np.array(fs.frame(seed), np.float32, copy=True)
+        _snr_seed_img = np.array(_reg.frame(seed), np.float32, copy=True)
     except Exception:
         _snr_seed_img = None
         log('[SNR] 单张基准量不出：%s' % _e0)
@@ -2306,7 +2437,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 log(f'[drizzle] 几何初值来自 WBPP .xdrz（逐帧用本帧星点精修）：'
                     f'θ {np.min(_gt):+.2f}°~{np.max(_gt):+.2f}°  '
                     f'k {np.min(_gk):.4f}~{np.max(_gk):.4f}')
-        sh = measure_shifts(fs, stars, ref=int(seed), log=log, guess=_gg)
+        sh = measure_shifts(_reg, stars, ref=int(seed), log=log, guess=_gg)
         _drop = [int(i) for i in np.nonzero(~np.asarray(sh['keep'], bool))[0]]
         if _drop:
             log(f'  [叠加] 未参与的帧索引：{_drop[:40]}'
@@ -2327,7 +2458,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             _new = int(min(_ok, key=lambda i: (fwhms[i] if np.isfinite(fwhms[i]) else np.inf)))
             log(f'[位移] 参考帧 #{int(seed)} 未能配准，改用 #{_new} 当参考帧并重建星表')
             seed = _new
-            stars = build_star_table(fs.frame(seed), n_star=n_star)
+            stars = build_star_table(_reg.frame(seed), n_star=n_star)
             log(f'[星表] 帧 #{seed} 上重新选出 {len(stars)} 颗')
         _reg_ok = np.isfinite(dx) & np.isfinite(dy)   # 记下筛选前的配准结果
         _fm = float(getattr(p, 'fwhm_max', 0.0) or 0.0)
@@ -2458,7 +2589,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                     # 直接喂进去会抛异常，被外层兜住，「输出网格」就静默失效。
                     _refv = _refv.mean(axis=2)
                     log('[网格] 参考图是 RGB，按三通道平均折成亮度当网格参考')
-                _seed_img = np.asarray(fs.frame(int(seed)), np.float64)
+                _seed_img = np.asarray(_reg.frame(int(seed)), np.float64)
                 _c0 = tuple(int(v) for v in _MISC.get('crop_origin', (0, 0)))
                 _seed_align = _seed_img
                 if _c0 != (0, 0):
@@ -2571,7 +2702,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                     log(f'[CFA] 几何记录失败：{_eg}')
             else:
                 seed = int(_geo['seed'])
-                stars = build_star_table(fs.frame(seed), n_star=n_star)
+                stars = build_star_table(_reg.frame(seed), n_star=n_star)
                 dx = np.array(_geo['dx'], np.float64)
                 dy = np.array(_geo['dy'], np.float64)
                 th = np.array(_geo['theta'], np.float64)
@@ -2637,7 +2768,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             if len(_dzn):
                 log(f'[drizzle] 径向畸变 d2 {np.min(_dzn):+.4f}~{np.max(_dzn):+.4f}')
         _emit('R 场', 0.35, '重建参考像')
-        sref = stack_sharp_reference(fs, idx, dx, dy, drz_plan, drz_p,
+        sref = stack_sharp_reference(_reg, idx, dx, dy, drz_plan, drz_p,
                                      theta=th, scale=kk, dist=_dist)
         # R 场的 σ_psf 必须用"参考像自己"的 FWHM：参考像取的是最锐 k 帧，
         # 比全帧中位锐得多（实测 4.23px vs 2.6px）。用中位值会把窗和包络放大
@@ -2670,7 +2801,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             f'σ_psf {float(sigma_psf):.2f}→{sigma_rf:.2f}px  '
             f'R 的 2σ 过渡宽 {2 * sigma_rf:.1f}px')
     else:
-        sref = np.median(np.stack([fs.frame(int(i)) for i in idx], axis=0),
+        sref = np.median(np.stack([_reg.frame(int(i)) for i in idx], axis=0),
                          axis=0).astype(np.float32)
         R, rinfo = build_r_field(sref, sigma_psf, r_floor=r_floor,
                                  env_win_mult=env_win_mult,
@@ -2785,13 +2916,32 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         except Exception as _e_len:
             log(f'[配准] 位移表补齐失败（{type(_e_len).__name__}: {_e_len}），继续')
         t2 = time.perf_counter()
-        try:            r_d = stack_drizzle(fs, R, C, S, dx, dy, drz_plan, A, B, rej_k,
+        _cfa_sel = None
+        if _CFA.get('raw') and _CFA['ch']:
+            _cfa_sel = (_cfa.mask2(_CFA['pattern'], _CFA['ch']),
+                        int(_CFA.get('origin', (0, 0))[1]) % 2,
+                        int(_CFA.get('origin', (0, 0))[0]) % 2)
+            log('[CFA] 真 CFA drizzle：只投 %s 的原始样本（不插值）' % _CFA['ch'])
+        _use_wgpu = (os.environ.get('DWT_GPU_WGPU', '') == '1')
+        def _do_stack():
+            if _use_wgpu:
+                from gpu_wgpu import stack_pws as _sg
+                _H2, _W2 = int(drz_plan['H']), int(drz_plan['W'])
+                _yy = np.clip(((np.arange(_H2) - float(drz_plan['oy'])) / float(drz_plan['s'])).astype(int), 0, h - 1)
+                _xx = np.clip(((np.arange(_W2) - float(drz_plan['ox'])) / float(drz_plan['s'])).astype(int), 0, w - 1)
+                _R2 = R[np.ix_(_yy, _xx)] if R is not None else None
+                return _sg(fs, C, S, dx, dy, th, kk, drz_plan, A, B,
+                           sky=float(fs.sky0), R=_R2, log=log, n=n)
+            return stack_drizzle(fs, R, C, S, dx, dy, drz_plan, A, B, rej_k,
                                 rej_gate, float(fs.sky0), drz_p, band,
                                 theta=th, scale=kk, dist=_dist, workers=_drizzle_workers(),
                                 T=T, fp=fp, rej_mode=str(getattr(p, 'rej_mode', 'winsor')),
                                 native_shape=fs.shape, log=log, emit=_emit,
                                 cancel=_check_cancel,
-                                sharp_w=float(getattr(p, 'sharp_w', 0.0) or 0.0))
+                                sharp_w=float(getattr(p, 'sharp_w', 0.0) or 0.0),
+                                cfa_sel=_cfa_sel)
+        try:
+            r_d = _do_stack()
         finally:
             fs.close(keep=keep_frames)
         Stk = r_d['stack']
