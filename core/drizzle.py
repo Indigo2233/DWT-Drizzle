@@ -1228,21 +1228,51 @@ def _block_mean2d(a: np.ndarray, bh: int, W: int, block: int = 64) -> np.ndarray
 
 
 def _winsor_scale(dev: np.ndarray, s_pix: np.ndarray, goodcol: np.ndarray,
-                  bh: int, W: int, block: int = 64, k: float = 3.0) -> np.ndarray:
+                  bh: int, W: int, block: int = 64, k: float = 3.0,
+                  st: int = 3) -> np.ndarray:
     """winsorized 尺度估计：先粗估 σ，把 |x−μ| 截尾到 k·σ，再求均值
 
     PI 的 winsorized sigma clipping 就是这一步：直接对含离群值的样本求均值，
     均值会被"要剔的那条拖线"抬高、阈值变松（实测剔除率 1.16% → 0.77%）；
-    先截尾再平均就把这个偏置压掉了，代价只是多一遍 nanstd。
+    先截尾再平均就把这个偏置压掉了。
+
+    尺度图在空间上是光滑的：一个 64×64 块里本来就要上万次平均，没必要用全像素，
+    隔 st 行/st 列抽样（默认 3，即 1/9 像素）足够，省掉 9 倍的遍历。
     """
-    lim = _block_mean2d(np.where(goodcol, s_pix, 0.0), bh, W, block) * float(k)
-    dev_c = np.minimum(dev, lim[None])
-    col = np.nanmean(dev_c, axis=0).astype(np.float32)
-    col = np.where(goodcol, col, 0.0)
-    # 1.15 是实测标定值：高斯下 E|x−μ| = 0.7979σ，理论上 σ = 1.2533·mean|x−μ|，
-    # 但先截尾再平均会把均值压低，直接乘 1.2533 会让阈值偏小、多剔；
-    # 在 M81 60 帧上把剔除率标到与 MAD 持平（1.135% vs 1.155%）对应 1.15。
-    return _block_mean2d(col, bh, W, block) * 1.15
+    if st < 1:
+        st = 1
+    sub = dev[:, ::st, ::st]
+    sp = np.asarray(s_pix[::st, ::st], np.float32)
+    gc = np.asarray(goodcol[::st, ::st], bool)
+    hs, ws = sub.shape[1], sub.shape[2]
+    ny = (bh + block - 1) // block
+    nx = (W + block - 1) // block
+    vals = np.zeros((ny, nx), np.float32)
+    lim_all = np.zeros((ny, nx), np.float32)
+    for iy in range(ny):
+        y0, y1 = iy * block, min(bh, (iy + 1) * block)
+        sy0 = (y0 + st - 1) // st
+        sy1 = min(hs, (y1 + st - 1) // st)
+        if sy1 <= sy0:
+            continue
+        for ix in range(nx):
+            x0, x1 = ix * block, min(W, (ix + 1) * block)
+            sx0 = (x0 + st - 1) // st
+            sx1 = min(ws, (x1 + st - 1) // st)
+            if sx1 <= sx0:
+                continue
+            sv = sp[sy0:sy1, sx0:sx1]
+            sv = sv[sv > 0]
+            lim = float(k) * float(sv.mean()) if sv.size else 0.0
+            lim_all[iy, ix] = lim
+            blk = sub[:, sy0:sy1, sx0:sx1]
+            if lim > 0:
+                blk = np.minimum(blk, lim)
+            dv = blk[:, gc[sy0:sy1, sx0:sx1]]
+            if dv.size:
+                vals[iy, ix] = 1.15 * float(np.nanmean(dv))
+    full = np.kron(vals, np.ones((block, block), np.float32))[:bh, :W]
+    return np.where(goodcol, full, 0.0).astype(np.float32)
 
 
 def _block_mad(dev, sel, bh, W, block=64):

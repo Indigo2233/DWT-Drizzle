@@ -85,30 +85,42 @@ def band(ctx, Y0, Y1):
             md = cp.nanmedian(cp.where(goodcol[None], dv, cp.nan), axis=0)
             mad = cp.where(goodcol, 1.4826 * cp.where(cp.isfinite(md), md, 0.0), 0.0).astype(cp.float32)
         if _mode == 'winsor':
-            # 与 CPU 版同口径：按值标准差截尾，再求 |偏差| 分块均值 ×1.15
+            # 与 CPU 版同口径（含 1/9 抽样）：按值标准差截尾，再求 |偏差| 分块均值 ×1.15
             _bk = int(ctx.get('rej_block', 64))
-            _lim = cp.zeros((bh, W), cp.float32)
-            _sp = cp.where(goodcol, _s_pix, 0.0)
-            for _y0 in range(0, bh, _bk):
-                _y1 = min(bh, _y0 + _bk)
-                for _x0 in range(0, W, _bk):
-                    _x1 = min(W, _x0 + _bk)
-                    _blk = _sp[_y0:_y1, _x0:_x1]
-                    _f = _blk[_blk > 0]
-                    _v0 = float(_f.mean()) if _f.size else 0.0
-                    _lim[_y0:_y1, _x0:_x1] = _v0 * cp.float32(max(2.0, float(rej_k)))
-            _devc = cp.minimum(dev, _lim[None])
-            _col = cp.where(goodcol, cp.nanmean(_devc, axis=0), 0.0)
-            _m3 = cp.zeros((bh, W), cp.float32)
-            for _y0 in range(0, bh, _bk):
-                _y1 = min(bh, _y0 + _bk)
-                for _x0 in range(0, W, _bk):
-                    _x1 = min(W, _x0 + _bk)
-                    _blk = _col[_y0:_y1, _x0:_x1]
-                    _f = _blk[_blk > 0]
-                    _v0 = float(_f.mean()) if _f.size else 0.0
-                    _m3[_y0:_y1, _x0:_x1] = cp.float32(1.15) * _v0
-            mad = _m3
+            _st = 3
+            _sub = dev[:, ::_st, ::_st]
+            _sp = cp.asarray(_s_pix[::_st, ::_st], cp.float32)
+            _gc = cp.asarray(goodcol[::_st, ::_st])
+            _hs, _ws = _sub.shape[1], _sub.shape[2]
+            _ny = (bh + _bk - 1) // _bk
+            _nx = (W + _bk - 1) // _bk
+            _vals = cp.zeros((_ny, _nx), cp.float32)
+            for _iy in range(_ny):
+                _y0 = _iy * _bk
+                _y1 = min(bh, (_iy + 1) * _bk)
+                _sy0 = (_y0 + _st - 1) // _st
+                _sy1 = min(_hs, (_y1 + _st - 1) // _st)
+                if _sy1 <= _sy0:
+                    continue
+                for _ix in range(_nx):
+                    _x0 = _ix * _bk
+                    _x1 = min(W, (_ix + 1) * _bk)
+                    _sx0 = (_x0 + _st - 1) // _st
+                    _sx1 = min(_ws, (_x1 + _st - 1) // _st)
+                    if _sx1 <= _sx0:
+                        continue
+                    _sv = _sp[_sy0:_sy1, _sx0:_sx1]
+                    _sv = _sv[_sv > 0]
+                    _lim = float(cp.asnumpy(_sv.mean())) if _sv.size else 0.0
+                    _lim *= max(2.0, float(rej_k))
+                    _blk = _sub[:, _sy0:_sy1, _sx0:_sx1]
+                    if _lim > 0:
+                        _blk = cp.minimum(_blk, cp.float32(_lim))
+                    _dv = _blk[:, _gc[_sy0:_sy1, _sx0:_sx1]]
+                    if _dv.size:
+                        _vals[_iy, _ix] = cp.float32(1.15) * cp.nanmean(_dv)
+            mad = cp.kron(_vals, cp.ones((_bk, _bk), cp.float32))[:bh, :W]
+            mad = cp.where(goodcol, mad, cp.float32(0.0)).astype(cp.float32)
         if _mode == 'mad':
             try:
                 _bk = int(ctx.get('rej_block', 64))
