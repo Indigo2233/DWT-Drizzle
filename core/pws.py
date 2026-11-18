@@ -124,8 +124,9 @@ REF_SHARP_N = 8      # 参考像 = 最锐的这么多帧的等权中位（默认
 #   测星点：每帧仅取星点小窗（约 0.5 MiB），几乎不占内存 → 上限可放宽到核数量级
 CAP_WORKERS = 8
 CAP_FWHM = 12
-#   叠加（drizzle 分带）：内存带宽受限，实测 4/8/10 进程差异只在噪声级，故保守取 4
-CAP_DRIZZLE = 4
+#   叠加（drizzle 分带）：内存带宽受限，实测 4/6/8/10 进程为 25.7/23.8/24.8/24.4s
+#   （M81 40 帧 1600² ×2，6 核以上机器），6 最划算；仍受"核数−2"约束
+CAP_DRIZZLE = 6
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +507,9 @@ def resolve_center(frames: List[Path], crop: int,
     return (int(cy), int(cx))
 
 
+_PICK_CACHE: Dict[str, str] = {}
+
+
 def pick_frames_dir(need_bytes: int, want: Optional[str] = None) -> Path:
     """给 memmap 帧文件挑盘：需要 1.25× 余量
 
@@ -515,6 +519,10 @@ def pick_frames_dir(need_bytes: int, want: Optional[str] = None) -> Path:
         ① 用户 --frames-dir  ② 软件所在盘  ③ 系统 TEMP  ④ 其余固定盘按余量降序
     """
     import shutil
+    _key = str(want or '')
+    _hit = _PICK_CACHE.get(_key)
+    if _hit is not None and Path(_hit).parent.exists():
+        return Path(_hit)
     need = int(need_bytes * 1.25)
     head: List[Path] = []
     if want:
@@ -566,6 +574,7 @@ def pick_frames_dir(need_bytes: int, want: Optional[str] = None) -> Path:
                 continue
             log(f'[memmap] 帧文件目录 {p}（该盘余量 {free / 2 ** 30:.1f} GiB，'
                 f'需 {need / 2 ** 30:.1f} GiB）')
+            _PICK_CACHE[_key] = str(p)
             return p
     raise SystemExit(f'没有任何盘能放下 {need / 2 ** 30:.1f} GiB 的 memmap 帧文件'
                      f'（需要 1.25× 余量）。请用 --frames-dir 指到大盘。')
@@ -2034,6 +2043,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     env_win_mult, env_eps, env_p = float(p.env_win_mult), float(p.env_eps), float(p.env_p)
     star_grow_pct = float(p.star_grow_pct)
     rej_k, n_star = float(p.rej_k), int(p.n_star)
+    _c_star = int(getattr(p, 'c_star', 120) or 0)
     rej_gate = float(p.rej_gate)                  # 剔除比例上限（默认 1/3）
     limit = int(p.limit) or None
     crop, keep_frames, frames_dir = int(p.crop), bool(p.keep_frames), p.frames_dir
@@ -2141,13 +2151,18 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     # 逐帧独立、互不引用 → 可分给多进程；结果按下标落位，与串行逐位一致。
     #   只取星点小窗 → 每进程几乎不占内存，进程数可以放开（CAP_FWHM）
     fwhms = np.empty(n, dtype=np.float64)
+    # C 只要中位：星表按亮度排序，等间隔抽样即可覆盖亮暗
+    _cs = stars
+    if _c_star and len(stars) > _c_star:
+        _step = max(1, len(stars) // _c_star)
+        _cs = stars[::_step][:_c_star]
     ini, ini_args = fs.reader
     nw = 0 if (not fs.parallelable or _no_parallel()) \
         else min(plan_workers(32 * 2 ** 20, '测星点', cap=CAP_FWHM), n)
     if nw > 1:
         ex = ProcessPoolExecutor(max_workers=nw, initializer=ini, initargs=ini_args)
         try:
-            for i, v, fx, dn, dc in ex.map(_task_fwhm, ((i, stars) for i in range(n)),
+            for i, v, fx, dn, dc in ex.map(_task_fwhm, ((i, _cs) for i in range(n)),
                                            chunksize=1):
                 _check_cancel()
                 fwhms[i] = v
@@ -2159,12 +2174,12 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     else:
         for i in range(n):
             _check_cancel()
-            fwhms[i] = measure_fwhm_frame(fs.mm, i, fs.off, stars)
+            fwhms[i] = measure_fwhm_frame(fs.mm, i, fs.off, _cs)
             _emit('测星点', (i + 1) / max(n, 1), f'{i + 1}/{n} 帧')
     ok = np.isfinite(fwhms)
     fmed = float(np.median(fwhms[ok]))
     C = np.where(ok, fmed / np.maximum(fwhms, 1e-9), 1.0)
-    log(f'[C] 逐帧星点 FWHM（开源 fit_fwhm，{len(stars)} 颗中位）'
+    log(f'[C] 逐帧星点 FWHM（开源 fit_fwhm，{len(_cs)} 颗中位）'
         f' {np.nanmin(fwhms):.2f}~{np.nanmax(fwhms):.2f}px  中位 {fmed:.2f}px  '
         f'{time.perf_counter() - t1:.1f}s')
     log(f'[C] 清晰度权重（FWHM_中位/FWHM_i）{C.min():.3f}~{C.max():.3f}')
@@ -2245,7 +2260,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         # 分带多进程：帧在磁盘 memmap 上，子进程按路径重建视图（不复制数据）
         try:
             import multiprocessing as _mp
-            _n = max(1, min(CAP_DRIZZLE, int(_mp.cpu_count()) - 1))
+            _n = max(1, min(CAP_DRIZZLE, int(_mp.cpu_count()) - 2))
         except Exception:
             _n = 1
         _env = os.environ.get('DWT_DRIZZLE_WORKERS', '')
@@ -2729,8 +2744,19 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             _rows = _budget / max(1.0, 2.0 * n * w * 4)
             band = int(max(64, min(256, _rows)))
         else:
+            # CPU 侧实测：带高 32/48/64/160 行（6 进程、M81 60 帧 1600²×2）=
+            # 35.7/38.1/39.5/58.8 s —— 带越宽，每带要来回扫的 (n,bh,w) 缓冲越大，
+            # 反而更慢；260 帧全幅时又不允许太宽（每带 2*n*bh*w*4 字节）。
+            # 于是按内存公式算上界，再夹到 32~40 行。
             _rows = (2048 * 2**20) / max(1.0, 2.0 * n * w * 4 * _nw)
-            band = int(max(48, min(160, _rows)))
+            band = int(max(32, min(40, _rows)))
+            _env_band = str(os.environ.get('DWT_BAND', '') or '').strip()
+            if _env_band:
+                try:
+                    band = max(8, int(_env_band))
+                    log(f'[drizzle] 带高由 DWT_BAND 指定：{band} 行（实验用）')
+                except Exception:
+                    pass
         # 带宽按"单带 num/cov 各约 750MB"取；带太窄时旋转帧的斜条带
         # （横跨宽度 w 时行偏移约 w·sinθ）占比过高：34 行时斜条带被放大
         # 13×，96 行降到 2.7×

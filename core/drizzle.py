@@ -1200,22 +1200,38 @@ def _block_mad(dev, sel, bh, W, block=64):
     """
     mad = np.zeros((bh, W), np.float32)
     ds = dev[sel] if sel is not None else dev
+    # 逐像素的帧中位先整带算一次，再按块取中位 —— 与逐块 nanmedian(axis=0)
+    # 的数学结果完全相同（中位对帧方向是逐元素运算），但少了几十次重复扫描。
+    pm = np.nanmedian(ds, axis=0) if ds.shape[0] > 1 else ds[0]
     for y0 in range(0, bh, block):
         y1 = min(bh, y0 + block)
         for x0 in range(0, W, block):
             x1 = min(W, x0 + block)
-            sl = ds[:, y0:y1, x0:x1]
-            fl = np.isfinite(sl).sum()
+            sl = pm[y0:y1, x0:x1]
+            fl = int(np.isfinite(sl).sum())
             if fl < 64:
                 md = np.nanmedian(sl) if fl else np.nan
             else:
-                md = np.nanmedian(sl, axis=0)
-                if np.ndim(md) > 0:
-                    md = np.nanmedian(md)
+                md = np.nanmedian(sl)
             if not np.isfinite(md) or md <= 0:
                 md = np.nanmedian(ds[:, y0:y1, x0:x1]) if fl else 0.0
             mad[y0:y1, x0:x1] = 1.4826 * float(md if np.isfinite(md) else 0.0)
     return mad
+
+
+_BUF: Dict[str, np.ndarray] = {}
+
+
+def _zeros(name: str, shape) -> np.ndarray:
+    """跨带复用的零缓冲：同一进程里 (n, bh, W) 大块反复申请会把帧文件挤出页缓存，
+    反而让后面的带从磁盘重读（实测 6 进程时最明显）。"""
+    b = _BUF.get(name)
+    if b is None or b.shape != tuple(shape) or b.dtype != np.float32:
+        b = np.zeros(tuple(shape), np.float32)
+        _BUF[name] = b
+    else:
+        b.fill(0.0)
+    return b
 
 
 def _drizzle_band(ctx, Y0: int, Y1: int) -> Dict:
@@ -1251,8 +1267,8 @@ def _drizzle_band(ctx, Y0: int, Y1: int) -> Dict:
     d2 = np.zeros((bh, W), np.float32)
     mxw = np.zeros((bh, W), np.float32)
     rej_num = rej_den = 0.0
-    num = np.zeros((n, bh, W), np.float32)     # 每帧 drizzle 后的"像元值×覆盖"
-    cov = np.zeros((n, bh, W), np.float32)
+    num = _zeros('num', (n, bh, W))     # 每帧 drizzle 后的"像元值×覆盖"
+    cov = _zeros('cov', (n, bh, W))
     for k, i in enumerate(idx):
         if use_rot:
             th = _rot_deg(theta[i])
