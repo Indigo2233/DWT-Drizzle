@@ -3386,8 +3386,15 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         #   注意：wgpu 后端目前没有逐像素排异，也不支持真 CFA 的颜色掩膜
         _gpu_sel = str(getattr(p, 'gpu', 'auto') or 'auto').strip().lower()
         _env_wgpu = os.environ.get('DWT_GPU_WGPU', '').strip()
+        _cuda_ok = False
+        if _gpu_sel in ('auto', 'gpu'):
+            try:
+                from gpu_dz import available as _cuda_avail
+                _cuda_ok = bool(_cuda_avail())
+            except Exception:
+                _cuda_ok = False
         _want_wgpu = (_env_wgpu == '1') or (_gpu_sel == 'wgpu') or (
-            _gpu_sel == 'auto' and _env_wgpu != '0')
+            _gpu_sel == 'auto' and _env_wgpu != '0' and not _cuda_ok)
         _wgpu_ok = False
         if _want_wgpu and _env_wgpu != '0':
             try:
