@@ -196,6 +196,8 @@ def _argv_common(c) -> list:
         argv += ["--cfa", c["cfa"]]
     if c.get("cfa_debayer") and c["cfa_debayer"] != "bilinear":
         argv += ["--cfa-debayer", c["cfa_debayer"]]
+    if str(c.get("jobs", "0")).strip() not in ("", "0"):
+        argv += ["--jobs", str(c.get("jobs")).strip()]
     if c.get("cfa_weights") and c["cfa_weights"] != "shared":
         argv += ["--cfa-weights", c["cfa_weights"]]
     if str(c.get("native_1x", "0")) == "1":
@@ -223,6 +225,7 @@ class App(tk.Tk):
         self._load_values()
         self.after(100, self._pump)
         self.after(500, self._tick)
+        self._bind_wheel_all()
         if not (selftest or smoke):
             self.after(350, self.show_license)   # 启动即弹许可说明
         if selftest:
@@ -509,6 +512,10 @@ class App(tk.Tk):
             adv, state="readonly", width=12, textvariable=self.v_cfaw,
             values=["共用", "逐通道"]),
              "共用＝三通道用同一套 C/S/T（与 PI 一致、更快）；逐通道＝各算各的")
+        self.v_jobs = tk.StringVar()
+        arow(17, "并行进程", ttk.Spinbox(adv, from_=0, to=32, increment=1, width=6,
+                                    textvariable=self.v_jobs),
+             "0 = 自动（核数一半、最多 8）；内存带宽紧张时调小更稳（实测 6 最好，11 反而慢）")
 
         # 操作
         bar = tk.Frame(body, bg=BG)
@@ -647,6 +654,7 @@ class App(tk.Tk):
                                                        c.get("cfa", "off") or "关"))
         self.v_cfad.set({"bilinear": "双线性", "superpixel": "2×2 合并"}.get(
             c.get("cfa_debayer", "bilinear"), "双线性"))
+        self.v_jobs.set(str(c.get("jobs", "0")))
         self.v_cfaw.set({"shared": "共用", "own": "逐通道"}.get(
             c.get("cfa_weights", "shared"), "共用"))
         self.v_xdrz.set(c.get("xdrz", ""))
@@ -690,6 +698,7 @@ class App(tk.Tk):
                                                         self.v_cfa.get().strip() or "off"),
             "cfa_debayer": {"双线性": "bilinear", "2×2 合并": "superpixel"}.get(
                 self.v_cfad.get().strip(), "bilinear"),
+            "jobs": self.v_jobs.get().strip(),
             "cfa_weights": {"共用": "shared", "逐通道": "own"}.get(
                 self.v_cfaw.get().strip(), "shared"),
             "xdrz": self.v_xdrz.get().strip(),
@@ -708,6 +717,7 @@ class App(tk.Tk):
                                     initialdir=self.v_photos.get() or str(HERE))
         if d:
             self.v_photos.set(d)
+            self._autofill_related()
 
     def _pick_out(self):
         d = filedialog.askdirectory(title="选择输出目录",
@@ -817,6 +827,71 @@ class App(tk.Tk):
         if d:
             self.v_xdrz.set(d)
 
+
+    def _bind_wheel_all(self):
+        """数值框 / 滑块支持滚轮微调。不绑定整页，避免误滚动。"""
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            try:
+                self.bind_all(seq, self._on_wheel, add="+")
+            except Exception:
+                pass
+
+    def _on_wheel(self, ev):
+        w = ev.widget
+        up = (getattr(ev, "delta", 0) or 0) > 0 or getattr(ev, "num", 0) == 4
+        d = 1 if up else -1
+        if isinstance(w, (ttk.Spinbox, tk.Spinbox)):
+            try:
+                inc = float(w.cget("increment") or 1)
+            except Exception:
+                inc = 1.0
+            try:
+                cur = float(w.get())
+            except Exception:
+                return None
+            val = cur + d * inc
+            try:
+                val = max(float(w.cget("from")), min(float(w.cget("to")), val))
+            except Exception:
+                pass
+            txt = ("%d" % int(round(val))) if inc >= 1 else ("%g" % val)
+            try:
+                w.delete(0, "end")
+                w.insert(0, txt)
+            except Exception:
+                return None
+            return "break"
+        if isinstance(w, (ttk.Scale, tk.Scale)):
+            try:
+                lo, hi = float(w.cget("from")), float(w.cget("to"))
+                cur = float(w.get())
+            except Exception:
+                return None
+            step = max((hi - lo) / 100.0, 1e-6)
+            w.set(max(lo, min(hi, cur + d * step)))
+            return "break"
+        return None
+
+    def _autofill_related(self):
+        """选好 calibrated 后，自动找同一 WBPP 输出目录下的 registered（放 .xdrz）。"""
+        src = self.v_photos.get().strip()
+        if not src:
+            return
+        p = Path(src)
+        cands = []
+        if p.name.lower().startswith("calibrat"):
+            cands.append(p.parent / "registered")
+        cands.extend([p.parent / "registered", p / "registered"])
+        for c in cands:
+            try:
+                if c.is_dir() and next(c.rglob("*.xdrz"), None) is not None:
+                    if not self.v_xdrz.get().strip():
+                        self.v_xdrz.set(str(c))
+                        self._log_line("[界面] 已自动识别并填入几何目录：%s" % c)
+                    return
+            except Exception:
+                continue
+
     def _open_out(self):
         p = self.v_out.get().strip()
         if p and Path(p).exists():
@@ -894,7 +969,7 @@ class App(tk.Tk):
         """关于：方法与原文出处（PWS，D.Cikey）"""
         messagebox.showinfo(
             "关于 DWT · Drizzle",
-            "DWT · Drizzle 2.7.7\n\n" + LICENSE_TEXT)
+            "DWT · Drizzle 2.7.8\n\n" + LICENSE_TEXT)
 
     def show_help(self):
         """打开内置使用说明（不依赖浏览器 / 外部程序）"""

@@ -74,9 +74,14 @@ class PwsParams:
     cfa: str = 'off'          # off / auto / RGGB / BGGR / GRBG / GBRG
     cfa_debayer: str = 'bilinear'   # 解马赛克算法
     cfa_weights: str = 'shared'     # shared（三通道共用，对齐 PI）/ own
+
+    # ---- CFA Drizzle（Bayer drizzle）：不解马赛克，按颜色分平面叠加 ----
+    cfa_drizzle: bool = False
+    cfa_drizzle_scale: int = 2
     r_floor: float = 0.0
     n_star: int = 120
-    c_star: int = 120
+    c_star: int = 64
+    jobs: int = 0
     rej_mode: str = 'winsor'
     rej_gate: float = 1 / 3
     # ---- 高级 · drizzle（几何层）----
@@ -279,6 +284,16 @@ PARAMS: Tuple[Param, ...] = (
           '共用与 PI 一致，省掉两遍星点测量与配准；实测只差 R +1.0%、B +2.0% 的 FWHM'
           '（≈0.05px）。逐通道在红蓝焦距明显不同时才值得开。',
           choices=(('共用（推荐）', 'shared'), ('逐通道', 'own'))),
+    Param('cfa_drizzle', 'CFA Drizzle（不解马赛克）', 'bool', '高级',
+          '彩机专用：不解马赛克，直接把原始 CFAPattern 像素按颜色分平面叠加',
+          '与 PI 的 Bayer Drizzle 同思路：不 debayer、每个像素只进自己颜色的平面，'
+          '配准只在 G 平面量一次几何。分辨率与色度都优于双线性拆色 + 叠加；'
+          '需要抖动（建议 ≥40 帧、2× 倍率），帧太少或 1× 会出现棋盘格。'),
+    Param('cfa_drizzle_scale', 'CFA Drizzle 倍率', 'int', '高级',
+          'CFA Drizzle 的输出倍率（1× 需要极充分的抖动）',
+          '2 是推荐值：2×2 相位格刚好被抖动填满，一个输入像素铺满 2×2 输出格；'
+          '4× 在实测数据上只有 88% 占用，会留空洞，不建议。',
+          lo=1, hi=4, step=1),
     Param('star_grow_pct', '星点锐帧扩展', 'float', '高级',
           '按实测拖线长度自动外扩星点锐帧区',
           '100% = 用实测值（默认）：逐帧量星点长轴方差，相减得到拖线长度，'
@@ -305,11 +320,16 @@ PARAMS: Tuple[Param, ...] = (
           'fast 是不截尾的均值版，最快但剔除更松（实测剔除率 1.16% → 0.77%）。',
           choices=(('winsorized（推荐）', 'winsor'), ('中位绝对偏差（旧）', 'mad'),
                    ('平均绝对偏差（最快）', 'fast'))),
+    Param('jobs', '并行进程', 'int', '高级',
+          '叠加分带时同时跑几个进程；0 = 自动（按 CPU 核数的一半，最多 8，当前机器 12 核取 6）',
+          '内存带宽是瓶颈：实测 12 核机器上 6 进程 38.5s、11 进程 43.9s，多加反而更慢。'
+          '核多或内存带宽富余的机器可调大（上限 32），想复现旧行为填 4。',
+          lo=0, hi=32, step=1),
     Param('c_star', '测清晰度星数', 'int', '高级',
           '逐帧量星点 FWHM（C 权重）时用几颗星；0 = 用满整张星表',
-          'C 只要中位数，但权重按 C^A 放大（A=20 时 5% 的 C 误差≈差 38% 权重），'
-          '所以星数越少成品差异越明显：120→64 可省 40% 测星时间，但叠出来峰值差约 1.5%。'
-          '想更快可调小，想与旧版逐位一致填 0（用满整张星表）。',
+          'C 只取中位数，权重按 C^A 放大（A=20 时 5% 的 C 误差≈差 38% 权重）。'
+          '实测 120→64：C 测量省约 6s/60 帧，成品逐像素 p99 差 6e-6、星核亮度差 0.04%，'
+          '肉眼与统计都看不出差别，故默认 64。想更快可再调小，想用满整张星表填 0。',
           lo=0, hi=600, step=8),
     Param('rej_gate', '剔除比例上限', 'float', '高级',
           '同一像素被剔帧数（扣除噪声期望误排数）超过该比例 × 总帧数，即判为共有结构，该像素不排异',

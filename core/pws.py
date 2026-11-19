@@ -127,7 +127,7 @@ CAP_WORKERS = 8
 CAP_FWHM = 12
 #   叠加（drizzle 分带）：内存带宽受限，实测 4/6/8/10 进程为 25.7/23.8/24.8/24.4s
 #   （M81 40 帧 1600² ×2，6 核以上机器），6 最划算；仍受"核数−2"约束
-CAP_DRIZZLE = 6
+CAP_DRIZZLE = 16
 
 # 逐帧行固定纹去除（row FPN）：默认开，DWT_NO_ROWFPN=1 关掉做 A/B
 _ROWFPN = bool(os.environ.get('DWT_ROWFPN'))   # 实验开关：默认关，实测未改善成品行纹
@@ -2391,7 +2391,19 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         # 分带多进程：帧在磁盘 memmap 上，子进程按路径重建视图（不复制数据）
         try:
             import multiprocessing as _mp
-            _n = max(1, min(CAP_DRIZZLE, int(_mp.cpu_count()) - 2))
+            _n = max(2, min(CAP_DRIZZLE, max(2, int(_mp.cpu_count()) // 2), 8))
+            try:
+                _pj = int(getattr(p, 'jobs', 0) or 0)
+                if _pj > 0:
+                    _n = max(1, min(32, _pj))
+            except Exception:
+                pass
+            _jenv = os.environ.get("DWT_JOBS", "").strip()
+            if _jenv:
+                try:
+                    _n = max(1, min(CAP_DRIZZLE, int(_jenv)))
+                except Exception:
+                    pass
         except Exception:
             _n = 1
         _env = os.environ.get('DWT_DRIZZLE_WORKERS', '')
@@ -2867,9 +2879,9 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 _free = int(_g.free_mem())
             except Exception:
                 _free = 0
-            _budget = 3072 * 2**20
+            _budget = 8192 * 2**20
             if _free > 0:
-                _budget = int(min(_budget, max(256 * 2**20, _free * 0.55)))
+                _budget = int(min(_budget, max(256 * 2**20, _free * 0.70)))
                 log(f'[drizzle] 显存可用 {_free // 2**20} MB，本带预算 '
                     f'{_budget // 2**20} MB')
             _rows = _budget / max(1.0, 2.0 * n * w * 4)
@@ -2922,7 +2934,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                         int(_CFA.get('origin', (0, 0))[1]) % 2,
                         int(_CFA.get('origin', (0, 0))[0]) % 2)
             log('[CFA] 真 CFA drizzle：只投 %s 的原始样本（不插值）' % _CFA['ch'])
-        _use_wgpu = (os.environ.get('DWT_GPU_WGPU', '') == '1')
+        _use_wgpu = False   # wgpu 通用后端只在分支 B（DWT-Drizzle-B）里存在
         def _do_stack():
             if _use_wgpu:
                 from gpu_wgpu import stack_pws as _sg
@@ -2931,7 +2943,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 _xx = np.clip(((np.arange(_W2) - float(drz_plan['ox'])) / float(drz_plan['s'])).astype(int), 0, w - 1)
                 _R2 = R[np.ix_(_yy, _xx)] if R is not None else None
                 return _sg(fs, C, S, dx, dy, th, kk, drz_plan, A, B,
-                           sky=float(fs.sky0), R=_R2, log=log, n=n)
+                           sky=0.0, R=_R2, log=log, n=n)
             return stack_drizzle(fs, R, C, S, dx, dy, drz_plan, A, B, rej_k,
                                 rej_gate, float(fs.sky0), drz_p, band,
                                 theta=th, scale=kk, dist=_dist, workers=_drizzle_workers(),
