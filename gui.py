@@ -519,10 +519,12 @@ class App(tk.Tk):
                    command=self._pick_frame).pack(side="left", padx=(8, 0))
         arow(9, "输出网格", fr_fr,
              "填 master：成品宽高/朝向与它一致（不用再事后裁切）")
-        cb_gpu = ttk.Combobox(adv, values=["自动", "只用 CPU", "只用 GPU"],
-                              state="readonly", width=9, textvariable=self.v_gpu)
+        cb_gpu = ttk.Combobox(adv, values=["自动", "只用 CPU", "只用 GPU（CUDA）",
+                                          "wgpu（跨平台）"],
+                              state="readonly", width=14, textvariable=self.v_gpu)
         arow(10, "计算设备", cb_gpu,
-             "自动：有 NVIDIA 显卡就走 GPU；结果与 CPU 版逐项一致")
+             "自动：有 wgpu 设备（Vulkan/Metal/D3D12）优先用它，否则 NVIDIA 走 CUDA；"
+             "wgpu 目前不支持真 CFA（会自动回退 CPU）")
         self.v_tunea = tk.StringVar()
         arow(11, "调参 A 候选", ttk.Entry(adv, textvariable=self.v_tunea, width=18),
              "逗号分隔，默认 10,14,20；按暗部优先可写 6,10,14,20")
@@ -721,7 +723,9 @@ class App(tk.Tk):
         self.v_fwhm.set(c.get("fwhm_max", ""))
         self.v_flux.set(c.get("flux_pow", "2.0"))
         self.v_ccrop.set(c.get("crop_cover", "0.9"))
-        self.v_gpu.set({"auto": "自动", "cpu": "只用 CPU", "gpu": "只用 GPU"}.get(c.get("gpu", "auto"), "自动"))
+        self.v_gpu.set({"auto": "自动", "cpu": "只用 CPU",
+                        "gpu": "只用 GPU（CUDA）", "wgpu": "wgpu（跨平台）"}.get(
+            c.get("gpu", "auto"), "自动"))
         self.v_frame.set(c.get("frame", ""))
         self.v_tunea.set(c.get("tune_a", "10,14,20"))
         self.v_1x.set(str(c.get("native_1x", "0")) == "1")
@@ -775,7 +779,8 @@ class App(tk.Tk):
             "fwhm_max": self.v_fwhm.get().strip(),
             "flux_pow": self.v_flux.get().strip(),
             "crop_cover": self.v_ccrop.get().strip(),
-            "gpu": {"自动": "auto", "只用 CPU": "cpu", "只用 GPU": "gpu"}.get(self.v_gpu.get().strip(), "auto"),
+            "gpu": {"自动": "auto", "只用 CPU": "cpu", "只用 GPU（CUDA）": "gpu",
+                    "wgpu（跨平台）": "wgpu"}.get(self.v_gpu.get().strip(), "auto"),
             "frame": self.v_frame.get().strip(),
             "tune_a": self.v_tunea.get().strip() or "10,14,20",
             "native_1x": "1" if bool(self.v_1x.get()) else "0",
@@ -1065,7 +1070,7 @@ class App(tk.Tk):
         """关于：方法与原文出处（PWS，D.Cikey）"""
         messagebox.showinfo(
             "关于 DWT · Drizzle",
-            "DWT · Drizzle 2.7.15\n\n" + LICENSE_TEXT)
+            "DWT · Drizzle 2.7.15-C\n\n" + LICENSE_TEXT)
 
     def show_help(self):
         """打开内置使用说明（不依赖浏览器 / 外部程序）"""

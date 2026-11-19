@@ -23,3 +23,6 @@ wheels/
 dist/
 *.zip
 *.exe
+
+# 分支 C：wgpu 运行时依赖（pip install wgpu 即可，tgz 里是离线包）
+gpudeps/

@@ -3379,7 +3379,35 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                         int(_CFA.get('origin', (0, 0))[1]) % 2,
                         int(_CFA.get('origin', (0, 0))[0]) % 2)
             log('[CFA] 真 CFA drizzle：只投 %s 的原始样本（不插值）' % _CFA['ch'])
-        _use_wgpu = False   # wgpu 通用后端只在分支 B（DWT-Drizzle-B）里存在
+        # ---- 后端选择（分支 C）----
+        #   gpu=auto  → 有 wgpu 设备就用它（跨平台：Vulkan / Metal / D3D12）
+        #   gpu=wgpu  → 强制 wgpu；gpu=cpu/gpu 语义不变（CUDA 走原来的 CuPy 路径）
+        #   环境变量 DWT_GPU_WGPU=1/0 可强制开/关（调试用）
+        #   注意：wgpu 后端目前没有逐像素排异，也不支持真 CFA 的颜色掩膜
+        _gpu_sel = str(getattr(p, 'gpu', 'auto') or 'auto').strip().lower()
+        _env_wgpu = os.environ.get('DWT_GPU_WGPU', '').strip()
+        _want_wgpu = (_env_wgpu == '1') or (_gpu_sel == 'wgpu') or (
+            _gpu_sel == 'auto' and _env_wgpu != '0')
+        _wgpu_ok = False
+        if _want_wgpu and _env_wgpu != '0':
+            try:
+                from gpu_wgpu import available as _wg_avail, info as _wg_info
+                _wgpu_ok = bool(_wg_avail())
+                if _wgpu_ok:
+                    log('[wgpu] 通用 GPU 后端：%s' % _wg_info())
+                elif _gpu_sel == 'wgpu':
+                    log('[wgpu] 没有可用的 Vulkan / Metal / D3D12 设备，本组改用 CPU')
+            except Exception as _e_wg:
+                _wgpu_ok = False
+                if _gpu_sel == 'wgpu':
+                    log('[wgpu] 后端加载失败（%s: %s），本组改用 CPU'
+                        % (type(_e_wg).__name__, _e_wg))
+        if _wgpu_ok and _cfa_sel is not None:
+            log('[wgpu] 真 CFA 采样目前只有 CPU 版（颜色掩膜未在收集式后端实现），本组走 CPU')
+            _wgpu_ok = False
+        if _wgpu_ok and rej_k > 0:
+            log('[wgpu] 收集式后端暂不做逐像素排异（rej_k 生效不了），介意请改 --gpu cpu')
+        _use_wgpu = _wgpu_ok
         _wmap = None
         def _do_stack():
             if _use_wgpu:
@@ -3402,7 +3430,15 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                                 sharp_w=float(getattr(p, 'sharp_w', 0.0) or 0.0),
                                 cfa_sel=_cfa_sel, wmap=_wmap)
         try:
-            r_d = _do_stack()
+            try:
+                r_d = _do_stack()
+            except Exception as _e_wgpu:
+                if not _use_wgpu:
+                    raise
+                log('[wgpu] 出错，改用 CPU 重算本组：%s: %s'
+                    % (type(_e_wgpu).__name__, _e_wgpu))
+                _use_wgpu = False
+                r_d = _do_stack()
             if bool(int(getattr(p, 'two_pass', 0) or 0)):
                 _wmap = _local_sharp_maps(fs, np.arange(n), drz_plan, 64, log)
                 if _wmap is not None:
