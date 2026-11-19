@@ -74,6 +74,12 @@ _FONT_FAMILY = ("PingFang SC" if _sys.platform == "darwin"
                 else "Noto Sans CJK SC")
 FONT = (_FONT_FAMILY, 10)
 FONT_S = (_FONT_FAMILY, 9)
+
+# 界面布局清单：把分组名从一张表挪到另一张，就换到另一个标签页（改这一处即可）
+TAB_LAYOUT = {
+    "  常用  ": ["素材与输出", "叠加参数", "Drizzle", "日志"],
+    "  高级  ": ["高级"],
+}
 FONT_B = (_FONT_FAMILY, 11, "bold")
 
 STAGE_RE = re.compile(r"\[(分组|帧|归一|S|σ|星表|C|位移|R 场|叠加|输出|读数|时|drizzle)\]")
@@ -200,8 +206,18 @@ def _argv_common(c) -> list:
         argv += ["--jobs", str(c.get("jobs")).strip()]
     if c.get("cfa_weights") and c["cfa_weights"] != "shared":
         argv += ["--cfa-weights", c["cfa_weights"]]
+    if c.get("cfa_ref"):
+        argv += ["--cfa-ref", c["cfa_ref"]]
+    if c.get("cfa_raw", "auto") != "auto":
+        argv += ["--cfa-raw", c["cfa_raw"]]
     if str(c.get("native_1x", "0")) == "1":
         argv += ["--native-1x", "1"]
+    if c.get("rej_mode") and c["rej_mode"] != "winsor":
+        argv += ["--rej-mode", c["rej_mode"]]
+    if c.get("kernel") and c["kernel"] != "box":
+        argv += ["--kernel", c["kernel"], "--psf-target", str(c.get("psf_target") or "50")]
+    if str(c.get("two_pass", "0")) == "1":
+        argv += ["--two-pass", "1"]
     return argv
 
 
@@ -282,33 +298,53 @@ class App(tk.Tk):
         self.lab_state = tk.Label(top, text="空闲", bg="#171e29", fg="#94a3b8", font=FONT)
         self.lab_state.pack(side="right", padx=20)
 
+        # 操作栏先占住底部，再让 Notebook 去抢剩余空间（否则会被挤掉）
+        self.bar = tk.Frame(self, bg=BG)
+        self.bar.pack(side="bottom", fill="x", padx=10, pady=(0, 8))
+
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill="both", expand=True, padx=10, pady=(8, 10))
-        page1 = tk.Frame(self.nb, bg=BG)
-        self.nb.add(page1, text="   叠加   ")
 
         # 小屏幕/高 DPI 下内容放不下 → 整页可滚动（滚轮 + 右侧滚动条）
-        shell = tk.Frame(page1, bg=BG)
-        shell.pack(fill="both", expand=True)
-        self.cv_body = tk.Canvas(shell, bg=BG, highlightthickness=0)
-        sb_body = ttk.Scrollbar(shell, orient="vertical", command=self.cv_body.yview)
-        self.cv_body.configure(yscrollcommand=sb_body.set)
-        self.cv_body.pack(side="left", fill="both", expand=True)
-        sb_body.pack(side="right", fill="y")
+        def _make_page(title):
+            page = tk.Frame(self.nb, bg=BG)
+            self.nb.add(page, text=title)
+            shell = tk.Frame(page, bg=BG)
+            shell.pack(fill="both", expand=True)
+            cv = tk.Canvas(shell, bg=BG, highlightthickness=0)
+            sb = ttk.Scrollbar(shell, orient="vertical", command=cv.yview)
+            cv.configure(yscrollcommand=sb.set)
+            cv.pack(side="left", fill="both", expand=True)
+            sb.pack(side="right", fill="y")
+            bd = tk.Frame(cv, bg=BG)
+            win = cv.create_window((0, 0), window=bd, anchor="nw")
+            bd.bind("<Configure>", lambda e, c=cv: c.configure(
+                scrollregion=c.bbox("all")))
+            cv.bind("<Configure>", lambda e, c=cv, w=win: c.itemconfigure(
+                w, width=e.width))
+            for wdg in (cv, bd):
+                wdg.bind("<MouseWheel>", self._wheel)
+            bd.columnconfigure(0, weight=1)
+            return cv, bd
 
-        body = tk.Frame(self.cv_body, bg=BG)
-        self._body_win = self.cv_body.create_window((0, 0), window=body, anchor="nw")
-        body.bind("<Configure>", lambda e: self.cv_body.configure(
-            scrollregion=self.cv_body.bbox("all")))
-        self.cv_body.bind("<Configure>", lambda e: self.cv_body.itemconfigure(
-            self._body_win, width=e.width))
-        for w in (self.cv_body, body):
-            w.bind("<MouseWheel>", self._wheel)
-        body.columnconfigure(0, weight=1)
+        _pages = {name: _make_page(name) for name in TAB_LAYOUT}
+
+        def _body_of(grp):
+            for _tab, _names in TAB_LAYOUT.items():
+                if grp in _names:
+                    return _pages[_tab][1]
+            return _pages[list(TAB_LAYOUT)[0]][1]
+
+        self.cv_body = _pages[list(TAB_LAYOUT)[0]][0]
+        self.cv_adv = _pages[list(TAB_LAYOUT)[1]][0] if len(TAB_LAYOUT) > 1 else None
+        body = _body_of("素材与输出")
+        body_dz = _body_of("Drizzle")
+        body_adv = _body_of("高级")
+        body_log = _body_of("日志")
 
         # 路径
         p = ttk.Labelframe(body, text=" 素材与输出 ", padding=10)
-        p.grid(row=0, column=0, sticky="ew")
+        p.pack(fill="x")
         p.columnconfigure(1, weight=1)
 
         ttk.Label(p, text="素材目录").grid(row=0, column=0, sticky="w", padx=(0, 8))
@@ -370,7 +406,7 @@ class App(tk.Tk):
 
         # 参数
         g = ttk.Labelframe(body, text=" 叠加参数 ", padding=10)
-        g.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        g.pack(fill="x", pady=(10, 0))
         self.v_A = tk.StringVar()
         self.v_rejk = tk.StringVar()
         self.v_nstar = tk.StringVar()
@@ -384,14 +420,15 @@ class App(tk.Tk):
             ttk.Label(parent, text=tip, foreground="#9ca3af", font=FONT_S).grid(
                 row=1, column=col * 2, columnspan=2, sticky="w")
 
-        cell(g, 0, "清晰度 A", self.v_A, 8, "推荐 20（更锐）；14 更干净、有效帧更多")
+        cell(g, 0, "清晰度 A", self.v_A, 8,
+             "彩机建议 10（等效帧数更高、噪声低）；黑白建议 20（更锐）；14 折中")
         cell(g, 1, "排异 κ", self.v_rejk, 8, "3.5σ，越大越保守")
         cell(g, 2, "星点数", self.v_nstar, 8, "120，视场大可以加")
         cell(g, 3, "限帧", self.v_limit, 8, "只用前 N 帧；0 = 全部")
 
         # Drizzle
-        d = ttk.Labelframe(body, text=" Drizzle ", padding=10)
-        d.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        d = ttk.Labelframe(body_dz, text=" Drizzle ", padding=10)
+        d.pack(fill="x", pady=(10, 0))
         self.v_drz = tk.BooleanVar()
         self.v_scale = tk.StringVar()
         self.v_pix = tk.StringVar()
@@ -426,8 +463,8 @@ class App(tk.Tk):
 
 
         # 高级
-        adv = ttk.Labelframe(body, text=" 高级 ", padding=10)
-        adv.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        adv = ttk.Labelframe(body_adv, text=" 高级 ", padding=10)
+        adv.pack(fill="x", pady=(10, 0))
         adv.columnconfigure(1, weight=1)
         self.v_bgdeg = tk.StringVar()
         self.v_rmode = tk.StringVar()
@@ -498,10 +535,12 @@ class App(tk.Tk):
             adv, text="输入已对齐（跳过配准与插值）", variable=self.v_aligned),
              "素材是 WBPP registered 目录时打开：不配准不插值，更快更锐（实测 2.47 vs 2.72）")
         self.v_cfa = tk.StringVar()
-        arow(14, "彩机拜耳阵列", ttk.Combobox(
+        _cb_cfa = ttk.Combobox(
             adv, state="readonly", width=12, textvariable=self.v_cfa,
-            values=["关", "自动识别", "RGGB", "BGGR", "GRBG", "GBRG"]),
+            values=["关", "自动识别", "RGGB", "BGGR", "GRBG", "GBRG"])
+        arow(14, "彩机拜耳阵列", _cb_cfa,
              "彩机（OSC）原始帧：选「自动识别」读帧头；认不出会报错让你手动选")
+        _cb_cfa.bind("<<ComboboxSelected>>", lambda _e: self._cfa_autotune_a())
         self.v_cfad = tk.StringVar()
         arow(15, "拆色算法", ttk.Combobox(
             adv, state="readonly", width=12, textvariable=self.v_cfad,
@@ -510,16 +549,51 @@ class App(tk.Tk):
         self.v_cfaw = tk.StringVar()
         arow(16, "彩色权重", ttk.Combobox(
             adv, state="readonly", width=12, textvariable=self.v_cfaw,
-            values=["共用", "逐通道"]),
+            values=["自动", "共用", "逐通道"]),
              "共用＝三通道用同一套 C/S/T（与 PI 一致、更快）；逐通道＝各算各的")
         self.v_jobs = tk.StringVar()
         arow(17, "并行进程", ttk.Spinbox(adv, from_=0, to=32, increment=1, width=6,
                                     textvariable=self.v_jobs),
              "0 = 自动（核数一半、最多 8）；内存带宽紧张时调小更稳（实测 6 最好，11 反而慢）")
+        self.v_cfa_ref = tk.StringVar()
+        _rf = tk.Frame(adv, bg=BG)
+        ttk.Entry(_rf, textvariable=self.v_cfa_ref).pack(side="left", fill="x", expand=True)
+        ttk.Button(_rf, text="浏览...", width=8,
+                   command=self._pick_cfa_ref).pack(side="left", padx=(6, 0))
+        arow(18, "彩机参考目录", _rf,
+             "WBPP 的 debayered 目录，留空自动扫描；只用来估通道色差，叠加仍用原始 CFA 帧")
+        self.v_cfaraw = tk.StringVar()
+        arow(19, "真 CFA 采样", ttk.Combobox(
+            adv, state="readonly", width=12, textvariable=self.v_cfaraw,
+            values=["自动", "强制开", "强制关（走插值）", "混合（G 真 CFA + R/B 插值）"]),
+             "自动＝彩机+drizzle 时按颜色直投；强制关＝先解拜耳再叠（更平滑）；"
+             "混合＝亮度通道按颜色直投保锐度、色度通道走插值保干净")
 
-        # 操作
-        bar = tk.Frame(body, bg=BG)
-        bar.grid(row=4, column=0, sticky="ew", pady=(12, 0))
+        self.v_rejmode = tk.StringVar()
+        arow(20, "排异尺度", ttk.Combobox(
+            adv, state="readonly", width=16, textvariable=self.v_rejmode,
+            values=["winsorized（推荐）", "中位绝对偏差（旧）",
+                    "平均绝对偏差（最快）", "广义 ESD（少帧/拖线）"]),
+             "winsorized＝先截尾再算尺度（推荐）；ESD＝Rosner 迭代剔除，"
+             "干净数据上与 winsor 打平，拖线/热像素多时可试")
+        self.v_kernel = tk.StringVar()
+        arow(21, "液滴核", ttk.Combobox(
+            adv, state="readonly", width=16, textvariable=self.v_kernel,
+            values=["方框（快）", "PSF 匹配（更干净）"]),
+             "方框＝经典 drizzle；PSF 匹配＝先把锐帧糊到同一 PSF 再加权，"
+             "用一点分辨率换信噪比")
+        self.v_psf = tk.StringVar()
+        arow(22, "PSF 目标", ttk.Spinbox(adv, from_=1, to=99, increment=5, width=6,
+                                     textvariable=self.v_psf),
+             "PSF 匹配时的目标锐度百分位：50＝中位（噪声降约 50%），35＝折中，80＝更糊更干净")
+        self.v_twopass = tk.StringVar()
+        arow(23, "两遍加权", ttk.Combobox(
+            adv, state="readonly", width=16, textvariable=self.v_twopass,
+            values=["关（推荐）", "开"]),
+             "第一遍出图后按 64px 块估局部锐度再叠一遍；实测收益 <1%、耗时 +40%")
+
+        # 操作（固定在窗口底部，两个标签页都能点到）
+        bar = self.bar
         self.btn_run = ttk.Button(bar, text="▶  开始叠加", style="Run.TButton",
                                   command=self.start)
         self.btn_run.pack(side="left")
@@ -545,9 +619,8 @@ class App(tk.Tk):
         self.lab_stage.pack(side="right", padx=16)
 
         # 日志
-        lg = ttk.Labelframe(body, text=" 日志 ", padding=6)
-        lg.grid(row=5, column=0, sticky="nsew", pady=(10, 0))
-        body.rowconfigure(5, weight=1)
+        lg = ttk.Labelframe(body_log, text=" 日志 ", padding=6)
+        lg.pack(fill="both", expand=True, pady=(10, 0))
         self.txt = tk.Text(lg, height=16, bg="#0f172a", fg="#cbd5e1", insertbackground="#cbd5e1",
                            font=("Consolas", 9), relief="flat", wrap="none", padx=8, pady=6)
         vs = ttk.Scrollbar(lg, orient="vertical", command=self.txt.yview)
@@ -611,8 +684,11 @@ class App(tk.Tk):
         self.minsize(min(int(720 * sc), avail_w), min(int(520 * sc), avail_h))
 
     def _wheel(self, ev):
+        cv = self._wheel_canvas(ev.widget)
+        if cv is None:
+            return
         try:
-            self.cv_body.yview_scroll(int(-1 * (ev.delta / 120.0)), "units")
+            cv.yview_scroll(int(-1 * (ev.delta / 120.0)), "units")
         except Exception:
             pass
 
@@ -657,6 +733,16 @@ class App(tk.Tk):
         self.v_jobs.set(str(c.get("jobs", "0")))
         self.v_cfaw.set({"shared": "共用", "own": "逐通道"}.get(
             c.get("cfa_weights", "shared"), "共用"))
+        self.v_cfaraw.set({"auto": "自动", "on": "强制开",
+                           "off": "强制关（走插值）"}.get(
+            c.get("cfa_raw", "auto"), "自动"))
+        self.v_rejmode.set({"winsor": "winsorized（推荐）", "mad": "中位绝对偏差（旧）",
+                            "fast": "平均绝对偏差（最快）", "esd": "广义 ESD（少帧/拖线）"}.get(
+            c.get("rej_mode", "winsor"), "winsorized（推荐）"))
+        self.v_kernel.set({"box": "方框（快）", "psfmatch": "PSF 匹配（更干净）"}.get(
+            c.get("kernel", "box"), "方框（快）"))
+        self.v_psf.set(str(c.get("psf_target", "50")))
+        self.v_twopass.set("开" if int(c.get("two_pass", "0") or 0) else "关（推荐）")
         self.v_xdrz.set(c.get("xdrz", ""))
         self.v_match.set(c.get("match", ""))
         self._pick_saved = (c.get("pick") or "")
@@ -694,16 +780,29 @@ class App(tk.Tk):
             "tune_a": self.v_tunea.get().strip() or "10,14,20",
             "native_1x": "1" if bool(self.v_1x.get()) else "0",
             "aligned": "1" if bool(self.v_aligned.get()) else "0",
+            "cfa_ref": self.v_cfa_ref.get().strip(),
+            "cfa_raw": {"自动": "auto", "强制开": "on",
+                        "强制关（走插值）": "off",
+                        "混合（G 真 CFA + R/B 插值）": "hybrid"}.get(
+                            self.v_cfaraw.get(), "auto"),
             "cfa": {"关": "off", "自动识别": "auto"}.get(self.v_cfa.get().strip(),
                                                         self.v_cfa.get().strip() or "off"),
             "cfa_debayer": {"双线性": "bilinear", "2×2 合并": "superpixel"}.get(
                 self.v_cfad.get().strip(), "bilinear"),
             "jobs": self.v_jobs.get().strip(),
-            "cfa_weights": {"共用": "shared", "逐通道": "own"}.get(
-                self.v_cfaw.get().strip(), "shared"),
+            "cfa_weights": {"自动": "auto", "共用": "shared", "逐通道": "own"}.get(
+                self.v_cfaw.get().strip(), "auto"),
             "xdrz": self.v_xdrz.get().strip(),
             "match": self.v_match.get().strip(),
             "pick": self._pick_value(),
+            "rej_mode": {"winsorized（推荐）": "winsor", "中位绝对偏差（旧）": "mad",
+                         "平均绝对偏差（最快）": "fast",
+                         "广义 ESD（少帧/拖线）": "esd"}.get(
+                             self.v_rejmode.get().strip(), "winsor"),
+            "kernel": {"方框（快）": "box", "PSF 匹配（更干净）": "psfmatch"}.get(
+                self.v_kernel.get().strip(), "box"),
+            "psf_target": self.v_psf.get().strip() or "50",
+            "two_pass": "1" if self.v_twopass.get().strip() == "开" else "0",
         }
 
     def _sync_drz(self):
@@ -807,6 +906,11 @@ class App(tk.Tk):
             return ""
         return ";".join(x if x else "无滤镜信息" for x in sel)
 
+    def _pick_cfa_ref(self):
+        d = filedialog.askdirectory(title="选 WBPP 的 debayered 目录")
+        if d:
+            self.v_cfa_ref.set(d)
+
     def _pick_frame(self):
         p = filedialog.askopenfilename(
             title="选一张参考图（master）", filetypes=[("XISF", "*.xisf"), ("全部", "*.*")])
@@ -829,48 +933,40 @@ class App(tk.Tk):
 
 
     def _bind_wheel_all(self):
-        """数值框 / 滑块支持滚轮微调。不绑定整页，避免误滚动。"""
+        """整页滚轮：滚轮在页面上任意位置都滚动当前页，数值框**不改变数值**。"""
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
             try:
                 self.bind_all(seq, self._on_wheel, add="+")
             except Exception:
                 pass
 
+    def _wheel_canvas(self, w):
+        """从当前控件往上找最近的可竖直滚动 Canvas。"""
+        try:
+            cur = w
+            for _ in range(24):
+                if isinstance(cur, tk.Canvas) and cur.cget("yscrollcommand"):
+                    return cur
+                cur = cur.master
+                if cur is None:
+                    break
+        except Exception:
+            pass
+        return getattr(self, "cv_body", None)
+
     def _on_wheel(self, ev):
-        w = ev.widget
+        # 日志框、通道列表这类自己有滚动条的控件，让它们自己滚
+        if isinstance(ev.widget, (tk.Text, ttk.Treeview)):
+            return None
         up = (getattr(ev, "delta", 0) or 0) > 0 or getattr(ev, "num", 0) == 4
-        d = 1 if up else -1
-        if isinstance(w, (ttk.Spinbox, tk.Spinbox)):
-            try:
-                inc = float(w.cget("increment") or 1)
-            except Exception:
-                inc = 1.0
-            try:
-                cur = float(w.get())
-            except Exception:
-                return None
-            val = cur + d * inc
-            try:
-                val = max(float(w.cget("from")), min(float(w.cget("to")), val))
-            except Exception:
-                pass
-            txt = ("%d" % int(round(val))) if inc >= 1 else ("%g" % val)
-            try:
-                w.delete(0, "end")
-                w.insert(0, txt)
-            except Exception:
-                return None
-            return "break"
-        if isinstance(w, (ttk.Scale, tk.Scale)):
-            try:
-                lo, hi = float(w.cget("from")), float(w.cget("to"))
-                cur = float(w.get())
-            except Exception:
-                return None
-            step = max((hi - lo) / 100.0, 1e-6)
-            w.set(max(lo, min(hi, cur + d * step)))
-            return "break"
-        return None
+        cv = self._wheel_canvas(ev.widget)
+        if cv is None:
+            return None
+        try:
+            cv.yview_scroll(-3 if up else 3, "units")
+        except Exception:
+            return None
+        return "break"
 
     def _autofill_related(self):
         """选好 calibrated 后，自动找同一 WBPP 输出目录下的 registered（放 .xdrz）。"""
@@ -969,7 +1065,7 @@ class App(tk.Tk):
         """关于：方法与原文出处（PWS，D.Cikey）"""
         messagebox.showinfo(
             "关于 DWT · Drizzle",
-            "DWT · Drizzle 2.7.8\n\n" + LICENSE_TEXT)
+            "DWT · Drizzle 2.7.15\n\n" + LICENSE_TEXT)
 
     def show_help(self):
         """打开内置使用说明（不依赖浏览器 / 外部程序）"""
@@ -1065,6 +1161,16 @@ class App(tk.Tk):
         msg += '\n' + ('成品 FWHM %.2fpx，改善 %+.1f%%，N_eff %.1f' % (d['fwhm'], d['gain'], d.get('neff', 0)))
         msg += '\n\n已填回界面，直接点「开始叠加」即可。'
         messagebox.showinfo('自动调参结论', msg)
+
+    def _cfa_autotune_a(self):
+        """不再自动改 A（用户要求「填多少就是多少」），只在选彩机时提示建议值。"""
+        try:
+            if self.v_cfa.get().strip() in ("", "关"):
+                return
+            self._log("[界面] 提示：彩机建议清晰度 A=10（等效帧数更高、噪声更低）；"
+                      "黑白建议 A=20。当前值不会被自动修改。")
+        except Exception:
+            pass
 
     def start(self):
         if self.proc and self.proc.poll() is None:

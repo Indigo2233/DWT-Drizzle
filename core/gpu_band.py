@@ -56,6 +56,13 @@ def band(ctx, Y0, Y1):
             continue
         strip = cp.asarray(np.asarray(fs.strip(i, j0, j1), np.float32))
         X, Y = G._xy_gpu(j0, j1, w, s, plan['ox'], plan['oy'], th, ux, uy, kk, dd, h)
+        _cs = ctx.get('cfa_sel')
+        if _cs is not None:            # 真 CFA：只累加本帧本通道的那 1/4（或 1/2）样本
+            _m2, _oy, _ox = _cs
+            _ry = (np.arange(j0, j1) + _oy) % 2
+            _cx = (np.arange(w) + _ox) % 2
+            _mk = cp.asarray(_m2[np.ix_(_ry, _cx)])
+            strip, X, Y = strip[_mk], X[_mk], Y[_mk]
         num[k], cov[k] = G._scatter_gpu(strip, X, Y, Pi, W, Y0, Y1)
         del strip, X, Y
 

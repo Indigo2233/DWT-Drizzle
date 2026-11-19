@@ -19,7 +19,8 @@
 from __future__ import annotations
 
 ANCHOR_N = 48
-REJ_BLOCK = 64     # 排异阈值分块边长（输出像素）
+REJ_BLOCK = 64
+_WM_BLK = 64     # 排异阈值分块边长（输出像素）
 
 import math
 import os
@@ -1152,6 +1153,124 @@ def _scatter_quad(vals, X, Y, P, W, Y0, Y1, theta, with_cov=False):
     return acc.astype(np.float32), cov.astype(np.float32)
 
 
+def _esd_lambda(cnt: np.ndarray, alpha: float = 0.05) -> np.ndarray:
+    """Rosner GESD 的临界值 λ_i（只在少数不同 cnt 上算 t 分位数）。"""
+    from scipy import stats
+    out = np.zeros(cnt.shape, np.float64)
+    uniq = np.unique(cnt)
+    m = {}
+    for c in uniq:
+        c = int(c)
+        if c < 3:
+            m[c] = np.inf
+            continue
+        p = 1.0 - alpha / (2.0 * c)
+        t = stats.t.ppf(p, c - 2)
+        m[c] = (c - 1) * t / math.sqrt((c - 2 + t * t) * c)
+    for c in uniq:
+        out[cnt == c] = m[int(c)]
+    return out
+
+
+def _esd_bad(v: np.ndarray, good: np.ndarray, n_iter: int = 3,
+             alpha: float = 0.05) -> np.ndarray:
+    """广义 ESD 排异（Rosner），向量化到逐像素，最多 n_iter 轮。
+
+    v    : (n, bh, W) 逐帧值（未减锚点）
+    good : (n, bh, W) 该帧在该像素上是否有有效样本
+    返回 bad: bool，同样形状，True 表示被判定为离群。
+    """
+    bad = np.zeros_like(good, dtype=bool)
+    alive = good.copy()
+    for _ in range(int(max(1, n_iter))):
+        cnt = alive.sum(axis=0)
+        use = cnt >= 5
+        if not bool(use.any()):
+            break
+        vv = np.where(alive, v, np.nan)
+        with np.errstate(invalid='ignore'):
+            mu = np.nanmean(vv, axis=0)
+            sd = np.nanstd(vv, axis=0, ddof=1)
+        sd = np.maximum(sd, 1e-30)
+        dev = np.where(alive, np.abs(v - mu[None]), -1.0)
+        k = np.argmax(dev, axis=0)
+        rmax = np.take_along_axis(dev, k[None], axis=0)[0]
+        lam = _esd_lambda(np.where(use, cnt, 0).astype(np.int64), alpha)
+        hit = use & (rmax > lam)
+        if not bool(hit.any()):
+            break
+        idx = np.nonzero(hit)
+        kk = k[idx]
+        alive[kk, idx[0], idx[1]] = False
+        bad[kk, idx[0], idx[1]] = True
+    return bad
+
+
+def _psfmatch_blur(strip: np.ndarray, extra_src: float) -> np.ndarray:
+    """把一帧按需糊到目标 PSF：extra_src 是**源像素**单位的附加高斯 σ。"""
+    if extra_src <= 0.05:
+        return strip
+    a = ndimage.gaussian_filter1d(strip.astype(np.float32), extra_src,
+                                  axis=1, mode='nearest')
+    return ndimage.gaussian_filter1d(a, extra_src, axis=0, mode='nearest')
+
+
+def _lanczos2(t):
+    """Lanczos-2 核：|t|>=2 时为 0，否则 sinc(t)·sinc(t/2)。"""
+    t = np.asarray(t, np.float64)
+    w = np.zeros_like(t)
+    m = np.abs(t) < 2.0
+    tt = t[m]
+    s1 = np.sin(np.pi * tt) / (np.pi * tt)
+    s2 = np.sin(np.pi * tt / 2.0) / (np.pi * tt / 2.0)
+    w[m] = s1 * s2
+    return w
+
+
+def _scatter_lanczos(vals, X, Y, P, W, Y0, Y1, with_cov=False):
+    """Lanczos-2 液滴：把每个样本按核权重铺到 4x4 输出像素（核宽 2）。"""
+    bh = Y1 - Y0
+    size = bh * W
+    half = max(1.0, 0.5 * P)
+    m = (Y > Y0 - 2 * half - 1) & (Y < Y1 + 2 * half + 1) & (X > -3) & (X < W + 3)
+    z = np.zeros((bh, W), np.float32)
+    if not m.any():
+        return (z, z.copy()) if with_cov else z
+    xs = X[m]
+    ys = Y[m]
+    v = vals[m].astype(np.float64)
+    # 样本在输出网格上的连续坐标（像素中心在 i+0.5）
+    cx = np.floor(xs - 0.5).astype(np.int64)
+    cy = np.floor(ys - 0.5).astype(np.int64)
+    idxs, wgts, wvts = [], [], []
+    for a in range(4):
+        kx = cx + a
+        tx = (xs - (kx + 0.5)) / half
+        wx = _lanczos2(tx)
+        vx = (kx >= 0) & (kx < W) & (np.abs(wx) > 1e-6)
+        if not vx.any():
+            continue
+        for b in range(4):
+            ky = cy + b
+            ty = (ys - (ky + 0.5)) / half
+            wy = _lanczos2(ty)
+            mm = vx & (ky >= Y0) & (ky < Y1) & (np.abs(wy) > 1e-6)
+            if not mm.any():
+                continue
+            w = wx[mm] * wy[mm]
+            idxs.append((ky[mm] - Y0) * W + kx[mm])
+            wgts.append(w)
+            wvts.append(w * v[mm])
+    if not idxs:
+        return (z, z.copy()) if with_cov else z
+    idx = np.concatenate(idxs)
+    wgt = np.concatenate(wgts)
+    acc = np.bincount(idx, weights=np.concatenate(wvts), minlength=size).reshape(bh, W)
+    cov = np.bincount(idx, weights=wgt, minlength=size).reshape(bh, W)
+    # 逐样本归一化：核权重之和（正值部分之和应为 1，负瓣会略偏离），这里按覆盖回除
+    return (acc.astype(np.float32), cov.astype(np.float32)) if with_cov else acc.astype(np.float32)
+
+
 def _scatter_band(vals: np.ndarray, X: np.ndarray, Y: np.ndarray, P: float,
                   W: int, Y0: int, Y1: int, with_cov: bool = False):
     """把 (X,Y) 处的方框 drop（边长 P，输出网格轴对齐）铺到输出行 [Y0,Y1)
@@ -1164,6 +1283,8 @@ def _scatter_band(vals: np.ndarray, X: np.ndarray, Y: np.ndarray, P: float,
         清零 1.2M 个浮点，逐格调用 18 次光清零就是几百 MB 的无用内存流量；
       · 值和质量共用同一份索引与权重（with_cov=True 时）。
     """
+    if os.environ.get('DWT_DZ_KERNEL', '') == 'lanczos':
+        return _scatter_lanczos(vals, X, Y, P, W, Y0, Y1, with_cov)
     bh = Y1 - Y0
     size = bh * W
     m = (Y > Y0 - P) & (Y < Y1 + P) & (X > -P) & (X < W + P)
@@ -1511,8 +1632,12 @@ def _drizzle_band(ctx, Y0: int, Y1: int) -> Dict:
             if j1 <= j0:
                 continue
             strip = np.asarray(fs.strip(i, j0, j1), np.float32)
+            _pm = ctx.get('psf_extra')
+            if _pm is not None and float(_pm[k]) > 0.05:
+                strip = _psfmatch_blur(strip, float(_pm[k]) / max(float(s), 1e-6))
             X, Y = _xy_rows(j0, j1, w, plan, th, ux, uy, kk, dd, h)
             _cs = ctx.get('cfa_sel')
+            strip0 = strip
             if _cs is not None:
                 _m2, _oy, _ox = _cs
                 _ry = (np.arange(j0, j1) + _oy) % 2
@@ -1538,7 +1663,14 @@ def _drizzle_band(ctx, Y0: int, Y1: int) -> Dict:
     v = np.where(good, num / np.maximum(cov, 1e-30), np.nan).astype(np.float32)
     # ---- 排异（输出网格）----
     R = R_out[Y0:Y1]
-    if rej_k > 0:
+    _esd_bad_mask = None
+    if rej_k > 0 and str(cm) == 'esd':
+        _esd_bad_mask = _esd_bad(np.where(good, num / np.maximum(cov, 1e-30), np.nan).astype(np.float32),
+                                 good, n_iter=3, alpha=0.05)
+        rej_num += float(_esd_bad_mask.sum())
+        rej_den += float(good.sum())
+        cov = np.where(_esd_bad_mask, np.float32(0.0), cov).astype(np.float32)
+    if rej_k > 0 and _esd_bad_mask is None:
         # 锚点与 MAD 只用最多 ANCHOR_N 帧估计：中位数的标准误按 1/sqrt(n) 收缩，
         # 267 帧与 48 帧的差在 1e-3 量级，但 nanmedian 的代价差五倍以上。
         if n > ANCHOR_N:
@@ -1604,6 +1736,11 @@ def _drizzle_band(ctx, Y0: int, Y1: int) -> Dict:
         if lt_all is not None:
             e = e + fp * float(lt_all[i])
         wgt = np.exp(e).astype(np.float32)
+        _wm = ctx.get('wmap')
+        if _wm is not None:
+            _by = ((np.arange(Y0, Y1) // _WM_BLK).clip(0, _wm.shape[1] - 1))
+            _bx = ((np.arange(W) // _WM_BLK).clip(0, _wm.shape[2] - 1))
+            wgt = wgt * _wm[i][np.ix_(_by, _bx)].astype(np.float32)
         wc = wgt * cov[k]
         nr += wc * v[k]
         dr += wc
@@ -1631,7 +1768,9 @@ def stack_drizzle(fs, R_out: np.ndarray, C: np.ndarray, S: np.ndarray,
                   native_shape: Optional[Tuple[int, int]] = None,
                   log=None, emit=None, cancel=None, workers: int = 0,
                   sharp_w: float = 0.0, T=None, fp: float = 0.0,
-                  rej_mode: str = 'winsor', cfa_sel=None) -> Dict:
+                  rej_mode: str = 'winsor', cfa_sel=None,
+                  kernel: str = 'box', psf_target: float = 50.0,
+                  fwhms=None, wmap=None) -> Dict:
     """按输出行分带：每带对全部帧做 drizzle → 排异 → 带权合成
 
     与 stack_strip 的区别（统计上等价、几何上更细）：
@@ -1688,7 +1827,20 @@ def stack_drizzle(fs, R_out: np.ndarray, C: np.ndarray, S: np.ndarray,
         proxy = _FsProxy(np.asarray(fs.arrays), fs.shape, _off, n_all, _bg, _bgd)
     else:                       # 测试用最小桩：只有 strip/shape/__len__
         proxy = fs
-    ctx = {'fs': proxy, 'R_out': R_out, 'C': C, 'S': S,
+    _pm_list = None
+    _kern = str(kernel or 'box').strip().lower()
+    if _kern in ('psfmatch', 'psf') and fwhms is not None:
+        _ff = np.asarray(fwhms, np.float64)
+        _sg = np.where(np.isfinite(_ff) & (_ff > 0), _ff / 2.3548 * float(plan['s']), np.nan)
+        _ok = np.isfinite(_sg)
+        if int(_ok.sum()) >= 4:
+            _tgt = float(np.percentile(_sg[_ok], max(1.0, min(99.0, float(psf_target)))))
+            _ex = np.sqrt(np.maximum(0.0, _tgt * _tgt - np.where(_ok, _sg, _tgt) ** 2))
+            _pm_list = _ex.astype(np.float32)
+            if log:
+                log('[核] PSF 匹配：目标 σ %.2fpx（FWHM %.2fpx，P%g），把更锐的帧糊到同一分辨率'
+                    % (_tgt, _tgt * 2.3548, float(psf_target)))
+    ctx = {'fs': proxy, 'R_out': R_out, 'C': C, 'S': S, 'wmap': wmap,
            'T': T, 'fp': float(fp), 'dx': dx, 'dy': dy,
            'plan': plan, 'A': A, 'B': B, 'rej_k': rej_k, 'rej_gate': rej_gate,
            'sky': sky, 'pixfrac': pixfrac, 'rot': rot, 'theta': theta,
@@ -1696,6 +1848,7 @@ def stack_drizzle(fs, R_out: np.ndarray, C: np.ndarray, S: np.ndarray,
            'scale': scale, 'native_shape': (h, w), 'n': len(idx), 'W': W,
            's': float(plan['s']),
            'P': max(1e-6, float(pixfrac) * float(plan['s'])),
+           'psf_extra': _pm_list,
            'dist': (None if dist is None else np.asarray(dist, np.float64)),
            'idx': idx, 'use_rot': use_rot, 'mx': mx, 'cfa_sel': cfa_sel, 'fs_n': n_all,
            'bgcoef': _bg, 'bgdeg': _bgd, 'rows_fn': _band_rows,

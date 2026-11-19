@@ -127,7 +127,7 @@ CAP_WORKERS = 8
 CAP_FWHM = 12
 #   叠加（drizzle 分带）：内存带宽受限，实测 4/6/8/10 进程为 25.7/23.8/24.8/24.4s
 #   （M81 40 帧 1600² ×2，6 核以上机器），6 最划算；仍受"核数−2"约束
-CAP_DRIZZLE = 16
+CAP_DRIZZLE = 32
 
 # 逐帧行固定纹去除（row FPN）：默认开，DWT_NO_ROWFPN=1 关掉做 A/B
 _ROWFPN = bool(os.environ.get('DWT_ROWFPN'))   # 实验开关：默认关，实测未改善成品行纹
@@ -1913,6 +1913,198 @@ def save_linear_xisf(path: Path, arr: np.ndarray, metas: List[Dict], mode_text: 
         f'元数据：关键字 {len(img.fits_keywords)}  Property {len(prop_raws)}')
 
 
+def _ca_shift_axis(a: np.ndarray, s: float, axis: int) -> np.ndarray:
+    """沿 axis 做 Lanczos-3 亚像素平移（s 可为负）。"""
+    if abs(s) < 1e-3:
+        return a
+    n = 6
+    i0 = int(np.floor(s)) - n // 2 + 1
+    taps = np.arange(i0, i0 + n)
+    w = np.sinc(taps - s) * np.sinc((taps - s) / 3.0)
+    w = w / w.sum()
+    out = np.zeros_like(a, dtype=np.float32)
+    for k, wt in zip(taps, w):
+        if wt == 0.0:
+            continue
+        if axis == 0:
+            src = np.roll(a, -int(k), axis=0)
+            if k > 0:
+                src[:int(k)] = src[int(k)]
+            elif k < 0:
+                src[int(k):] = src[int(k) - 1]
+        else:
+            src = np.roll(a, -int(k), axis=1)
+            if k > 0:
+                src[:, :int(k)] = src[:, int(k):int(k) + 1]
+            elif k < 0:
+                src[:, int(k):] = src[:, int(k) - 1:int(k)]
+        out += wt * src
+    return out
+
+
+def _ca_estimate(G: np.ndarray, R: np.ndarray, B: np.ndarray, log, n_star: int = 60):
+    """用亮星重心估 (R−G)、(B−G) 的亚像素偏移，返回 ((dyR,dxR),(dyB,dxB))。"""
+    try:
+        from scipy import ndimage
+    except Exception:
+        return (0.0, 0.0), (0.0, 0.0)
+    h, w = G.shape
+    v = G[np.isfinite(G)]
+    thr = float(np.median(v) + 30.0 * np.std(v))
+    sm = ndimage.uniform_filter(np.nan_to_num(G), 3)
+    pk = (sm == ndimage.maximum_filter(sm, 9)) & (G > thr)
+    ys, xs = np.nonzero(pk)
+    sel = (ys > 40) & (ys < h - 40) & (xs > 40) & (xs < w - 40)
+    ys, xs = ys[sel], xs[sel]
+    if len(ys) > n_star:
+        step = max(1, len(ys) // n_star)
+        ys, xs = ys[::step][:n_star], xs[::step][:n_star]
+
+    def ctr(img, y, x, r=6):
+        win = img[y - r:y + r + 1, x - r:x + r + 1].astype(np.float64)
+        win = win - np.median(win)
+        np.clip(win, 0, None, out=win)
+        s = win.sum()
+        if not np.isfinite(s) or s <= 0:
+            return None
+        yy, xx = np.mgrid[-r:r + 1, -r:r + 1]
+        return y + (win * yy).sum() / s, x + (win * xx).sum() / s
+
+    dr, db = [], []
+    for y, x in zip(ys, xs):
+        cg = ctr(G, y, x)
+        cr = ctr(R, y, x)
+        cb = ctr(B, y, x)
+        if cg is None or cr is None or cb is None:
+            continue
+        if abs(cr[1] - x) > 3 or abs(cb[1] - x) > 3:
+            continue
+        dr.append((cr[0] - cg[0], cr[1] - cg[1]))
+        db.append((cb[0] - cg[0], cb[1] - cg[1]))
+    if len(dr) < 8:
+        log('[CA] 星点太少（%d），跳过通道对齐' % len(dr))
+        return (0.0, 0.0), (0.0, 0.0)
+    dr = np.array(dr); db = np.array(db)
+    oR = (float(np.median(dr[:, 0])), float(np.median(dr[:, 1])))
+    oB = (float(np.median(db[:, 0])), float(np.median(db[:, 1])))
+    log('[CA] 通道偏移（相对 G）：R dy=%+.3f dx=%+.3f  B dy=%+.3f dx=%+.3f px（%d 颗星）'
+        % (oR[0], oR[1], oB[0], oB[1], len(dr)))
+    return oR, oB
+
+
+def _find_cfa_ref(photos: Path) -> Optional[Path]:
+    """自动找 WBPP 的 debayered 目录：素材目录的兄弟（或它自己的子目录）。"""
+    cands = []
+    for base in (photos, photos.parent, photos.parent.parent):
+        for name in ('debayered', 'Debayered', 'debayered_delete'):
+            c = base / name
+            if c.is_dir():
+                cands.append(c)
+        # 也允许 debayered 下再套一层滤镜目录
+        if (base / 'debayered').is_dir():
+            for sub in (base / 'debayered').iterdir():
+                if sub.is_dir():
+                    cands.append(sub)
+    for c in cands:
+        try:
+            hit = next(c.rglob('*_c_d_R.xisf'), None)
+        except Exception:
+            hit = None
+        if hit is not None:
+            return c
+    return None
+
+
+def _ca_from_fs(fs, pattern: str, log, n_star: int = 50):
+    """在帧组首帧上估 (R−G)、(B−G) 偏移：判断这套系统有没有明显色差。"""
+    try:
+        _src = np.asarray(fs.frame(0), np.float32)
+        R = _cfa.plane(_src, pattern, 'R')
+        G = _cfa.plane(_src, pattern, 'G')
+        B = _cfa.plane(_src, pattern, 'B')
+    except Exception as _e:
+        log('[CA] 估色差失败（%s: %s），按无明显色差处理' % (type(_e).__name__, _e))
+        return (0.0, 0.0), (0.0, 0.0)
+    return _ca_estimate(G, R, B, log, n_star=n_star)
+
+
+
+def _cfa_weights_auto(frames, pattern: str, log, k: int = 6, n_star: int = 40):
+    """在前 k 帧上分别量 R/G/B 的逐帧 FWHM，返回 (相关最小值, {ch: fwhm})."""
+    try:
+        from . import cfa as _c
+    except Exception:
+        try:
+            import cfa as _c
+        except Exception:
+            return None, {}
+    n = len(frames)
+    if n < 4:
+        return None, {}
+    idx = sorted(set(int(round(i * (n - 1) / float(k - 1))) for i in range(k))) if k > 1 else [0]
+    try:
+        from DWT_DetailCore import read_frame  # noqa: E402
+    except Exception as _e:
+        log('[CFA] 权重 auto：取不到 read_frame（%s），跳过探测' % _e)
+        return None, {}
+    stars = None
+    out = {}
+    for ch in ('R', 'G', 'B'):
+        vals = []
+        for i in idx:
+            try:
+                _d = np.asarray(read_frame(frames[i])[0], np.float32)
+                _p = _c.plane(_d, pattern, ch)
+            except Exception:
+                continue
+            if stars is None:
+                stars = build_star_table(_p, n_star=max(24, int(n_star)))
+                if len(stars) < 8:
+                    return None, {}
+            vals.append(float(measure_fwhm(_p, stars[:n_star] if len(stars) > n_star else stars)))
+        if vals:
+            out[ch] = np.asarray(vals, np.float64)
+    if not all(c in out for c in ('R', 'G', 'B')):
+        return None, out
+    m = min(len(v) for v in out.values())
+    if m < 3:
+        return None, out
+    cr = float(np.corrcoef(out['R'][:m], out['G'][:m])[0, 1])
+    cb = float(np.corrcoef(out['B'][:m], out['G'][:m])[0, 1])
+    return min(cr, cb), out
+
+
+
+def _ca_from_ref(ref: Path, log, n_frames: int = 5):
+    """用参考目录里的 R/G/B 帧（各取前 n 帧平均）估通道偏移。"""
+    import glob
+    try:
+        from xisf_io import read_xisf
+    except Exception:
+        return None
+    out = {}
+    for ch in ('R', 'G', 'B'):
+        fs = sorted(glob.glob(str(ref / '**' / ('*_c_d_%s.xisf' % ch)), recursive=True))
+        if not fs:
+            return None
+        acc = None
+        for f in fs[:n_frames]:
+            try:
+                d = np.asarray(read_xisf(f)[0].data, np.float32)
+            except Exception:
+                continue
+            if d.ndim == 3:
+                d = d[:, :, 0]
+            acc = d if acc is None else acc + d
+        if acc is None:
+            return None
+        out[ch] = acc / max(1.0, float(len(fs[:n_frames])))
+    oR, oB = _ca_estimate(out['G'], out['R'], out['B'], lambda *a: None)
+    log('[参考] 用 WBPP debayered 帧估色差：R dy=%+.3f dx=%+.3f  B dy=%+.3f dx=%+.3f'
+        % (oR[0], oR[1], oB[0], oB[1]))
+    return oR, oB
+
+
 def _merge_cfa_rgb(out_dir, stem: str, log) -> None:
     """CFA 三通道成品合成一张 3 通道 XISF（H×W×3，Planar）。
 
@@ -1932,15 +2124,85 @@ def _merge_cfa_rgb(out_dir, stem: str, log) -> None:
         if d.ndim == 3:
             d = d[:, :, 0]
         planes.append(d)
+    # ---- 通道间亚像素对齐（色差校正）----
+    if str(os.environ.get('DWT_CFA_CA', '1')).lower() not in ('0', 'off', 'false', 'no') and len(planes) == 3:
+        try:
+            # 以「成品上量的偏移」为准：参考目录的帧是未叠加的，量不到堆叠引入的
+            # 那一部分（实测 R 在成品上还多出 +0.38px 的 x 偏移）。参考目录只作对照。
+            _oR, _oB = _ca_estimate(planes[1], planes[0], planes[2], log)
+            _rdir = getattr(_merge_cfa_rgb, '_ref_dir', None)
+            if _rdir is not None:
+                _got = _ca_from_ref(_rdir, log)
+                if _got:
+                    log('[参考] 参考帧偏移 R dy=%+.3f dx=%+.3f；与成品量到的差 '
+                        '(dy=%+.3f, dx=%+.3f) 视为堆叠引入' %
+                        (_got[0][0], _got[0][1], _oR[0] - _got[0][0], _oR[1] - _got[0][1]))
+            _okR = np.isfinite(np.asarray(_oR, np.float64)).all()
+            _okB = np.isfinite(np.asarray(_oB, np.float64)).all()
+            if not (_okR and _okB):
+                # 星点太少时 _ca_estimate 会给 NaN；拿 NaN 去做插值平移会把整层
+                # 变成 NaN（x43 那次就是 R/B 全空、只剩 G）。这里直接跳过。
+                log('[CA] 偏移估计无效（R %s / B %s），跳过平移' % (_oR, _oB))
+            else:
+                if max(abs(_oR[0]), abs(_oR[1])) > 0.05:
+                    planes[0] = _ca_shift_axis(_ca_shift_axis(planes[0], _oR[0], 0), _oR[1], 1)
+                if max(abs(_oB[0]), abs(_oB[1])) > 0.05:
+                    planes[2] = _ca_shift_axis(_ca_shift_axis(planes[2], _oB[0], 0), _oB[1], 1)
+                log('[CA] 已按偏移平移 R/B（Lanczos-3 亚像素）')
+        except Exception as _e:
+            log('[CA] 通道对齐失败（跳过）：%s' % _e)
     # 通道平衡：三个通道是各自归一化叠加出来的，天空水平天然不一致，
     # 直接合并就是一片惨绿/惨红。按天空（25 百分位，避开星点）把 R/B 拉到 G，
     # 相当于 PI 里的 BackgroundNeutralization；真正的色彩还原仍交给用户的 CC。
-    _sky = [float(np.percentile(p, 25)) for p in planes]
-    if _sky[1] > 1e-12:
+    # 用 nanpercentile：单通道成品里只要有一个 NaN 像素（排异把某像素的样本
+    # 全剔掉就会出现），np.percentile/median 就会整体返回 NaN，接着
+    # R×NaN 把整层 R/B 抹成 NaN（x43 那次三通道只剩 G，就是这个）。
+    _sky = [float(np.nanpercentile(p, 25)) for p in planes]
+    if all(np.isfinite(_sky)) and _sky[1] > 1e-12:
         _fac = [_sky[1] / max(_sky[i], 1e-12) if i != 1 else 1.0 for i in range(3)]
         planes = [np.asarray(p * _fac[i], dtype=np.float32) for i, p in enumerate(planes)]
         log(f'[CFA] 通道平衡（天空对齐 G）：R×{_fac[0]:.3f}  B×{_fac[2]:.3f}'
             f'（原始天空 R {_sky[0]:.3e} G {_sky[1]:.3e} B {_sky[2]:.3e}）')
+    else:
+        log(f'[CFA] 通道平衡跳过（天空估计无效：{_sky}）')
+    # 共同有效区：真 CFA 下 R/B 的覆盖天生比 G 稀，边界上容易「G 有、B 没有」，
+    # 直接合并就是一条绿边。三个通道的 _ncov.npy 都在，取交集，谁没覆盖到
+    # 就三个通道一起置 NaN（后续自动裁边会把它裁掉）。
+    try:
+        _covs = []
+        for ch in ('R', 'G', 'B'):
+            _cf = src / f'{stem}_{ch}_ncov.npy'
+            if _cf.exists():
+                _covs.append(np.load(str(_cf), mmap_mode='r'))
+        if len(_covs) == 3:
+            _shp = [(int(c.shape[0]), int(c.shape[1])) for c in _covs]
+            if len(set(_shp)) == 1:
+                _h0 = min(p.shape[0] for p in planes)
+                _w0 = min(p.shape[1] for p in planes)
+                _ok = np.ones((_h0, _w0), bool)
+                for _ci, _c in enumerate(_covs):
+                    _v = np.asarray(_c[:_h0, :_w0], np.float32)
+                    _cname = 'RGB'[_ci]
+                    # 相对阈值：每通道覆盖率不同（G≈2×R/B），用「本通道中位的一半」
+                    # 当有效线，边缘的薄覆盖自然被剔掉，不会留下单通道色边。
+                    # 只用「几乎没有任何样本」判定无效：0.5 = 半个样本。
+                    # 曾经用过「本通道 ncov 中位的一半」当阈值，结果星点核心区
+                    # （饱和 + 排届让 R/B 的 ncov 掉到 1~15，而中位 13 → 阈值 6.6）
+                    # 整片被判成无数据，合成 RGB 的核心就成了黑洞。
+                    _th = 0.5
+                    _ok &= np.isfinite(_v) & (_v >= _th)
+                    _med = float(np.nanmedian(_v)) if _v.size else 0.0
+                    log('[CFA] %s 覆盖率：中位 %.2f，P1 %.2f，低于 %.1f 的像素 %.3f%%'
+                        % (_cname, _med, float(np.nanpercentile(_v, 1)), _th,
+                           100.0 * float((~np.isfinite(_v) | (_v < _th)).mean())))
+                if not _ok.all():
+                    _bad = int((~_ok).sum())
+                    planes = [np.where(_ok, p[:_h0, :_w0], np.nan).astype(np.float32)
+                              for p in planes]
+                    log(f'[CFA] 三通道共同覆盖：裁掉 {_bad} 个「某通道无数据」的像素'
+                        f'（{100.0 * _bad / _ok.size:.2f}%）')
+    except Exception as _em:
+        log(f'[CFA] 共同覆盖区计算失败（{type(_em).__name__}: {_em}），按原样合并')
     _shapes = sorted({(int(p.shape[0]), int(p.shape[1])) for p in planes})
     if len(_shapes) > 1:
         log(f'[CFA] 注意：三个通道画布不一致 {_shapes}，按最小画布合并且不做平移；'
@@ -2044,7 +2306,11 @@ def _run(p: PwsParams) -> Dict:
         if cfa_pat:
             log(f'[CFA] 彩机素材，拜耳阵列 {cfa_pat}：R/G/B 三通道各自拆色后叠加'
                 f'（G 先跑并记录配准与画布，R/B 复用同一套几何，保证三通道像素级对齐）')
-    _share = str(getattr(p, 'cfa_weights', 'shared') or 'shared').lower() == 'shared'
+    _wshare = str(getattr(p, 'cfa_weights', 'shared') or 'shared').lower() == 'shared'
+    # 逐通道独立配准（PI 的做法）：只关掉「几何复用」，权重仍可共用
+    _align_own = str(getattr(p, 'cfa_align', 'shared') or 'shared').strip().lower() == 'own'
+    _gshare = bool(_wshare) and not _align_own
+    _share = _wshare
     # shared：G 先跑（绿像素最多、星点测量最稳），R/B 复用它量到的 C/S/T
     if cfa_pat and str(getattr(p, 'cfa_debayer', 'bilinear') or 'bilinear').lower() == 'superpixel':
         log('[CFA] 注意：2×2 合并尚未接线，本次按双线性全分辨率拆色（画幅不变）')
@@ -2056,9 +2322,23 @@ def _run(p: PwsParams) -> Dict:
                       if c in _want) or (('G',) if _share else ('R',))
     else:
         chans = (None,)
+    if (cfa_pat and str(getattr(p, 'cfa_weights', 'shared') or 'shared').strip().lower() == 'auto'
+            and not _CFA.get('wauto_done')):
+        _CFA['wauto_done'] = True
+        # 实测结论（2026-11-19，M81 60 帧 + 12/16 帧探针）：真 CFA 下逐帧 FWHM
+        # 的逐通道估计被量测噪声主导——12 帧 60 颗星时 R/G、B/G 的相关系数只有
+        # -0.10 / 0.32，16 帧 80 颗星也只到 0.32；而拿 debayered 帧逐通道正常
+        # 叠出来的排序相关是 0.986~0.995。也就是说「逐通道权重」在这里引入的
+        # 主要是噪声，不是信息，还要多花两遍 C 测量（60 帧约 26 s）。
+        # 因此 auto = 共用；真要逐通道，手动填 --cfa-weights own。
+        log('[CFA] 权重 auto：真 CFA 下逐通道 FWHM 估计被噪声主导（实测排序相关≈0.3），'
+            '逐通道权重只会放大噪声且多花两遍测量 → 使用共用权重；要强制逐通道请填 own')
     _CFA['share'] = None
-    _CFA['want_share'] = bool(cfa_pat and _share)
+    _CFA['want_share'] = bool(cfa_pat and _gshare)
+    _CFA['want_wshare'] = bool(cfa_pat and _wshare)
+    _CFA['want_wshare'] = bool(cfa_pat and _wshare)
     _CFA['geo'] = None
+    _CFA['auto_own'] = None
     t_start = time.perf_counter()
     res: Dict = {}
     summaries: List[Dict] = []
@@ -2088,7 +2368,25 @@ def _run(p: PwsParams) -> Dict:
                 })
                 break
             _CFA['ch'], _CFA['pattern'] = ch, cfa_pat
-            _CFA['raw'] = os.environ.get('DWT_CFA_RAW', '') == '1'
+            _env_raw = str(os.environ.get('DWT_CFA_RAW', '') or '').strip().lower()
+            _p_raw = str(getattr(p, 'cfa_raw', 'auto') or 'auto').strip().lower()
+            if _env_raw in ('0', '1'):
+                _CFA['raw'] = (_env_raw == '1')
+            elif _p_raw in ('hybrid', 'mix', 'mixed'):
+                # 混合：亮度（G）走真 CFA 保锐度，色度（R/B）走插值保信噪比。
+                # 这正是彩色相机的「色度子采样」思路：人眼对色度分辨率不敏感。
+                _CFA['raw'] = (ch == 'G')
+            elif _p_raw in ('on', '1', 'true'):
+                _CFA['raw'] = True
+            elif _p_raw in ('off', '0', 'false'):
+                _CFA['raw'] = False
+            else:   # auto
+                _CFA['raw'] = bool(cfa_pat) and bool(getattr(p, 'drizzle', False))
+            if cfa_pat:
+                _tag = '真 CFA（不插值，按颜色投样本）' if _CFA['raw'] else '插值拆色（双线性/2×2）'
+                if _p_raw in ('hybrid', 'mix', 'mixed') and ch != 'G':
+                    _tag += '（混合模式：色度通道）'
+                log('[CFA] 采样模式：%s' % _tag)
             if cfa_pat:
                 log(f'—— CFA 通道 {ch} ——')
             stem_ch = stem if ch is None else f'{stem}_{ch}'
@@ -2107,6 +2405,27 @@ def _run(p: PwsParams) -> Dict:
                 res['stack'] = None      # 成品已落盘；别把每组成品都攒在内存里
         if cfa_pat:
             try:
+                # 彩机参考目录（WBPP debayered）：有就用它估色差，比在成品上估更干净
+                _ref = None
+                try:
+                    _man = str(getattr(p, 'cfa_ref', '') or '').strip()
+                    if _man:
+                        _ref = Path(_man)
+                        if not _ref.is_dir():
+                            log(f'[参考] 指定的彩机参考目录不存在：{_man}（改用自动扫描）')
+                            _ref = None
+                    if _ref is None:
+                        _src = Path(str(getattr(p, 'photos', '') or ''))
+                        if _src.is_dir():
+                            _ref = _find_cfa_ref(_src)
+                    if _ref is not None:
+                        _merge_cfa_rgb._ref_dir = _ref
+                        log(f'[参考] 彩机参考目录：{_ref}')
+                    else:
+                        _merge_cfa_rgb._ref_dir = None
+                except Exception as _e:
+                    _merge_cfa_rgb._ref_dir = None
+                    log(f'[参考] 扫描彩机参考目录失败（跳过）：{_e}')
                 _merge_cfa_rgb(out_dir, stem, log)
             except Exception as e:
                 log(f'[CFA] RGB 合成失败（不影响三个单通道成品）：{e}')
@@ -2162,12 +2481,60 @@ def _ln_normalize(fs, ref_idx: int, block: int = 32,
         f'系数 {cmin:.3f}~{cmax:.3f}')
 
 
+def _local_sharp_maps(fs, idx, plan, blk: int = 64, log=None):
+    """逐帧、逐块的局部锐度（高频能量）相对量，返回 (n, nby, nbx) 乘性权重。
+
+    只看「同一块里这一帧相对其它帧更锐还是更糊」，绝对值无意义，
+    所以每块都对中位数归一，再 clamp 到 [0.5, 2.0] 防止个别块暴走。
+    """
+    import numpy as _np
+    try:
+        from scipy import ndimage as _nd
+    except Exception:
+        return None
+    H, W = int(plan['H']), int(plan['W'])
+    nby, nbx = int(_np.ceil(H / blk)), int(_np.ceil(W / blk))
+    n = len(fs)
+    E = _np.full((n, nby, nbx), _np.nan, _np.float32)
+    for k, i in enumerate(idx):
+        try:
+            a = _np.asarray(fs.frame(int(i)), _np.float32)
+        except Exception:
+            continue
+        if a.ndim != 2:
+            continue
+        # 目标网格上抽样：与 drizzle 的 plan 对齐（最近邻即可，块统计对亚像素不敏感）
+        ys = _np.clip(((_np.arange(int(a.shape[0])) * plan['s'] + plan['oy'])), 0, H - 1).astype(_np.int64)
+        xs = _np.clip(((_np.arange(int(a.shape[1])) * plan['s'] + plan['ox'])), 0, W - 1).astype(_np.int64)
+        # 高频：减去 3x3 均值
+        hp = a - _nd.uniform_filter(a, 3)
+        # 按输出块聚合（用采集到的坐标索引）
+        b = _np.zeros((nby, nbx), _np.float64)
+        w = _np.zeros((nby, nbx), _np.float64)
+        by = _np.broadcast_to((ys[:, None] // blk), a.shape).astype(_np.int64)
+        bx = _np.broadcast_to((xs[None, :] // blk), a.shape).astype(_np.int64)
+        v = (hp * hp).astype(_np.float64)
+        _np.add.at(b, (by.ravel(), bx.ravel()), v.ravel())
+        _np.add.at(w, (by.ravel(), bx.ravel()), 1.0)
+        ok = w > 0
+        b[ok] /= w[ok]
+        E[k] = _np.where(ok, b, _np.nan)
+    with _np.errstate(invalid='ignore'):
+        med = _np.nanmedian(E, axis=0)
+    r = E / _np.where(med > 0, med, _np.nan)
+    r = _np.clip(_np.nan_to_num(r, nan=1.0), 0.5, 2.0)
+    if log:
+        log('[两遍] 局部锐度场：%d 帧 × %d×%d 块（%dpx），相对权重 %.2f~%.2f'
+            % (n, nby, nbx, blk, float(_np.min(r)), float(_np.max(r))))
+    return r.astype(_np.float32)
+
 def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                out_dir: Path, stem: str) -> Dict:
     """单滤镜组的叠加本体：展开素材与建输出目录由 _run 完成，此处只做该组的
     完整流程（读帧→星表→R 场→叠加→导出），成品文件主名由 stem 给出。"""
     # 参数别名：算法体统一从 PwsParams 取值
     A, B = float(p.A), float(p.B)
+    # A 完全按用户填的走（彩机/黑白都不再自动改），选项栏下方给了建议值。
     r_floor = float(p.r_floor)
     env_win_mult, env_eps, env_p = float(p.env_win_mult), float(p.env_eps), float(p.env_p)
     star_grow_pct = float(p.star_grow_pct)
@@ -2188,6 +2555,21 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                         bgdeg=int(getattr(p, 'bgdeg', 1) or 0),
                         bg_r=int(getattr(p, 'bg_r', 0) or 0))
     n = len(fs)
+    # ---- 彩机对齐方式 auto：在 G 通道这遍（第一个通道）量一次色差 ----
+    if (_CFA.get('pattern') and _CFA.get('ch') == 'G'
+            and str(getattr(p, 'cfa_align', 'auto') or 'auto').strip().lower() == 'auto'
+            and _CFA.get('auto_own') is None):
+        try:
+            (_dyR, _dxR), (_dyB, _dxB) = _ca_from_fs(fs, _CFA['pattern'], log)
+            _ca_max = max(abs(_dyR), abs(_dxR), abs(_dyB), abs(_dxB))
+            _CFA['auto_own'] = bool(_ca_max > 0.15)
+            log('[CFA] 对齐方式 auto：首帧色差最大 %.3f px（阈值 0.15）→ %s'
+                % (_ca_max, '逐通道独立配准' if _CFA['auto_own'] else '共用几何'))
+        except Exception as _e:
+            _CFA['auto_own'] = False
+            log('[CFA] auto 判色差失败（%s: %s），退回共用几何' % (type(_e).__name__, _e))
+    if _CFA.get('auto_own'):
+        _CFA['want_share'] = False
     metas = fs.metas
     skies = fs.skies
     # 量纲回乘：内部一切计算都在 EXPTIME_REF 基准上（权重/排异全是比值，不受影响），
@@ -2290,7 +2672,21 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     ini, ini_args = fs.reader
     nw = 0 if (not fs.parallelable or _no_parallel()) \
         else min(plan_workers(32 * 2 ** 20, '测星点', cap=CAP_FWHM), n)
-    if nw > 1:
+    if _CFA.get('raw') and _CFA.get('pattern'):
+        # 真 CFA：帧存储是马赛克，必须在 G 平面上量（否则拟合全废、C 恒 1）
+        log('[C] 真 CFA：在 G 平面上逐帧量 FWHM（串行）')
+        for i in range(n):
+            _check_cancel()
+            try:
+                _g = _cfa.plane(np.asarray(fs.frame(i), np.float32),
+                                _CFA['pattern'], 'G')
+                fwhms[i] = measure_fwhm(_g, _cs)
+            except Exception as _ec:
+                fwhms[i] = np.nan
+                if i == 0:
+                    log(f'[C] G 平面量 FWHM 失败（{type(_ec).__name__}: {_ec}），C 退回 1.0')
+            _emit('测星点', (i + 1) / max(n, 1), f'{i + 1}/{n} 帧')
+    elif nw > 1:
         ex = ProcessPoolExecutor(max_workers=nw, initializer=ini, initargs=ini_args)
         try:
             for i, v, fx, dn, dc in ex.map(_task_fwhm, ((i, _cs) for i in range(n)),
@@ -2308,6 +2704,10 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             fwhms[i] = measure_fwhm_frame(fs.mm, i, fs.off, _cs)
             _emit('测星点', (i + 1) / max(n, 1), f'{i + 1}/{n} 帧')
     ok = np.isfinite(fwhms)
+    if not bool(ok.any()):
+        log('[C] 所有帧的 FWHM 都没量出来（星点太少或拟合失败）→ 清晰度权重按 1.0 处理')
+        fwhms = np.ones(n, np.float64)
+        ok = np.isfinite(fwhms)
     fmed = float(np.median(fwhms[ok]))
     C = np.where(ok, fmed / np.maximum(fwhms, 1e-9), 1.0)
     log(f'[C] 逐帧星点 FWHM（开源 fit_fwhm，{len(_cs)} 颗中位）'
@@ -2391,7 +2791,10 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         # 分带多进程：帧在磁盘 memmap 上，子进程按路径重建视图（不复制数据）
         try:
             import multiprocessing as _mp
-            _n = max(2, min(CAP_DRIZZLE, max(2, int(_mp.cpu_count()) // 2), 8))
+            # 进程数按物理并发（线程数的一半）自适应：12 核 → 6（实测最优点），
+            # 16c32t → 16，不再写死上限 8。内存带宽是真正的天花板，
+            # 用户嫌慢时可用 --jobs 手动加，或 DWT_JOBS 覆盖。
+            _n = max(2, min(CAP_DRIZZLE, max(2, int(_mp.cpu_count()) // 2)))
             try:
                 _pj = int(getattr(p, 'jobs', 0) or 0)
                 if _pj > 0:
@@ -2425,6 +2828,16 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     cov_map = None
     drz_s = float(getattr(p, 'drizzle_scale', 2.0) or 1.0)
     drz_p = float(getattr(p, 'drizzle_pix', 1.0) or 1.0)
+    # 彩机 CFA：R/B 只有 1/4 像素有真值、G 只有 1/2。Siril 官方建议 CFA drizzle
+    # 用 scale=1、pixfrac=1；再上采样等于要 4 倍的帧数，否则信噪比直接掉一半。
+    # 实测（M81 12 帧、G 通道）：scale1/pix1 → 原生 FWHM 3.04px、N_eff 7.5；
+    # scale2/pix1 → 3.02px、N_eff 4.7（分辨率没涨、等效帧数砍掉 37%）。
+    if bool(getattr(p, 'cfa', 'off') and str(getattr(p, 'cfa', 'off')) != 'off'):
+        if drz_s > 1.0 + 1e-9:
+            # 只提示、不再擅自改 pixfrac：pixfrac*scale 才是液滴边长，缩到 1/scale
+            # 等于液滴只有 1 个输出像素，CFA 下会留下 3/4 的空洞（覆盖率掉、信噪比塌）。
+            log('[CFA] 彩机 drizzle 提示：R/B 每 4 个像素才 1 个真值，'
+                '2× 上采样约需 4 倍帧数；pixfrac 保持你填的 {0:g}'.format(drz_p))
     drz_plan = None
     if drz_on:
         from drizzle import measure_shifts, plan_output, stack_sharp_reference
@@ -2537,12 +2950,23 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             _my = float(np.nanmax(np.abs(dy[_fin])))
             _mt = float(np.nanmax(np.abs(th[_fin])))
             _mk = float(np.nanmax(np.abs(kk[_fin] - 1.0)))
-            if _mx < 0.75 and _my < 0.75 and _mt < 0.05 and _mk < 0.002:
+            _cfa_now = bool(_CFA.get('raw') and _CFA.get('ch'))
+            _canvas_is_frame = (drz_plan is not None
+                                and int(drz_plan.get('H', 0)) == int(h)
+                                and int(drz_plan.get('W', 0)) == int(w))
+            if (_mx < 0.75 and _my < 0.75 and _mt < 0.05 and _mk < 0.002
+                    and not _cfa_now and _canvas_is_frame):
                 drz_on = False
                 drz_plan = None
                 log('[drizzle] 输入帧已基本对齐（最大位移 %.3f/%.3fpx，旋转 %.4f°，'
                     '尺度差 %.4f），跳过重采样直接加权叠加（省一次插值、更锐）'
                     % (_mx, _my, _mt, _mk))
+            elif _cfa_now and _mx < 0.75 and _my < 0.75:
+                log('[CFA] 帧间已对齐，但仍走 drizzle：真 CFA 必须按通道掩膜投样本')
+            elif (not _cfa_now) and (not _canvas_is_frame) and _mx < 0.75 and _my < 0.75:
+                log('[drizzle] 帧间已对齐，但输出画布 %dx%d ≠ 帧 %dx%d（亚像素余量），'
+                    '仍走 drizzle 以保证 R 场与带内数据同一网格'
+                    % (int(drz_plan.get('W', 0)), int(drz_plan.get('H', 0)), w, h))
 
         # ---- 吞吐 T_i：在配准后的真实星点位置上测，跨帧同一颗星才有可比性 ----
         #   形状（C）和噪声（S）都不回答"这帧收了多少光"：通透的夜晚信号高、
@@ -2672,16 +3096,15 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                                 f'({_off[0]:+.2f}, {_off[1]:+.2f})px')
                     except Exception as _e2:
                         log(f'[网格] 星点对账跳过（{type(_e2).__name__}: {_e2}）')
-                    drz_plan = {'s': 1.0, 'ox': 0.0, 'oy': 0.0,
-                                'W': int(_w), 'H': int(_h)}
-                    log(f'[网格] 输出画布直接取参考 {Path(_frame_ref).name}'
-                        f' {_w}×{_h}（放大 {_inv:.4f}× 旋转 {_thm:+.2f}°）')
-                    if drz_on and abs(float(drz_s) - 1.0) > 1e-9:
-                        _ignored = float(drz_s)
-                        log(f'[网格] 注意：勾了「输出网格」时画布由参考图决定，'
-                            f'drizzle 倍率 {_ignored:g}× 不生效'
-                            f'（成品就是参考图的分辨率）；'
-                            f'想要 {_ignored:g}× 请把「输出网格」清空')
+                    # 输出网格只决定「画布几何」（朝向/构图/像素栅格的 1× 基准），
+                    # 分辨率仍听用户的 drizzle 倍率：2× 时画布是参考图的 2 倍。
+                    _s_grid = float(drz_s) if drz_on else 1.0
+                    drz_plan = {'s': _s_grid, 'ox': 0.0, 'oy': 0.0,
+                                'W': int(round(_w * _s_grid)),
+                                'H': int(round(_h * _s_grid))}
+                    log(f'[网格] 输出画布取参考 {Path(_frame_ref).name}'
+                        f' {_w}×{_h} × {_s_grid:g} = {drz_plan["W"]}×{drz_plan["H"]}'
+                        f'（放大 {_inv:.4f}× 旋转 {_thm:+.2f}°）')
                 else:
                     log(f'[网格] 参考图配准失败，退回包围盒画布：{_fi.get("error")}')
             except Exception as _e:
@@ -2691,7 +3114,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         #      合成出来是一堆分开的红绿蓝点）。这里存的必须是**帧块修正之后**的
         #      dx/dy（sh 里是 measure_shifts 的原始值，不含裁剪原点与 master 折算）。
         # ----
-        if _CFA.get('want_share'):
+        if _CFA.get('want_share') or _CFA.get('auto_own'):
             _geo = _CFA.get('geo')
             if _geo is None:
                 try:
@@ -2712,7 +3135,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                         f'{np.nanmax(dx):+.1f}px），后续通道复用')
                 except Exception as _eg:
                     log(f'[CFA] 几何记录失败：{_eg}')
-            else:
+            elif not _CFA.get('auto_own'):
                 seed = int(_geo['seed'])
                 stars = build_star_table(_reg.frame(seed), n_star=n_star)
                 dx = np.array(_geo['dx'], np.float64)
@@ -2735,6 +3158,25 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 log(f'[CFA] 通道 {_CFA["ch"]} 复用通道 {_geo["ch"]} 的几何：'
                     f'参考帧 #{seed}、画布 {drz_plan["W"]}×{drz_plan["H"]}、'
                     f'{int(np.count_nonzero(_kp))}/{n} 帧参与')
+
+        # ---- 逐通道独立配准（auto 判定有彩差）时，画布仍强制统一 ----
+        # 各通道自己配准会得到差 1~2 像素的画布，合并时按最小画布裁就等于把
+        # 整条通道平移了 1 像素（RGB 边缘出彩边）。这里保留各自的 dx/dy，但把
+        # 画布换成首通道的，并把差异折进平移量：s*(u+ox) 不变。
+        if (_CFA.get('pattern') and _CFA.get('auto_own') and not _CFA.get('want_share')
+                and _CFA.get('geo') and drz_plan):
+            _gp = _CFA['geo'].get('plan') or {}
+            if _gp and abs(float(_gp.get('s', 0)) - float(drz_plan['s'])) < 1e-9:
+                _sc = float(drz_plan['s']) or 1.0
+                _ddx = (float(drz_plan['ox']) - float(_gp['ox'])) / _sc
+                _ddy = (float(drz_plan['oy']) - float(_gp['oy'])) / _sc
+                dx = np.asarray(dx, np.float64) - _ddx
+                dy = np.asarray(dy, np.float64) - _ddy
+                drz_plan = {'s': float(_gp['s']), 'ox': float(_gp['ox']),
+                            'oy': float(_gp['oy']), 'W': int(_gp['W']),
+                            'H': int(_gp['H'])}
+                log(f'[CFA] 通道 {_CFA["ch"]} 画布统一到首通道 {_gp["W"]}×{_gp["H"]}'
+                    f'（平移折进 dx/dy：{_ddx:+.2f}, {_ddy:+.2f}px）')
 
         # ---- 画布定稿后，把「用户填的倍率」和「实际画布倍率」统一 ----
         # 勾了输出网格时画布来自参考图（可能 1×），后面所有 σ_psf / 星点映射 /
@@ -2846,7 +3288,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         C, S = _C, _S
         T = _T
         log('[CFA] 权重共用：C/S/T 取 G 通道的量（--cfa-weights shared）')
-    elif _CFA.get('want_share') and _CFA.get('ch') == 'G':
+    elif _CFA.get('want_wshare') and _CFA.get('ch') == 'G':
         _CFA['share'] = (np.array(C, copy=True), np.array(S, copy=True),
                          None if T is None else np.array(T, copy=True))
     if drz_on:
@@ -2869,6 +3311,9 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             import gpu_dz as _g
             _gpu_ok = bool(str(os.environ.get('DWT_GPU', 'auto')).lower() not in ('0', 'off', 'false', 'no')
                            and _g.available())
+            if _gpu_ok and str(os.environ.get('DWT_DZ_KERNEL', '')) == 'lanczos':
+                _gpu_ok = False
+                log('[drizzle] Lanczos 液滴核目前只有 CPU 版，本组走 CPU')
         except Exception:
             _gpu_ok = False
         if _gpu_ok:
@@ -2879,13 +3324,13 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 _free = int(_g.free_mem())
             except Exception:
                 _free = 0
-            _budget = 8192 * 2**20
+            # 不设固定上限：按可用显存的固定比例（70%）算，大卡自然吃满。
+            _budget = int(max(256 * 2**20, _free * 0.70)) if _free > 0 else (4096 * 2**20)
             if _free > 0:
-                _budget = int(min(_budget, max(256 * 2**20, _free * 0.70)))
                 log(f'[drizzle] 显存可用 {_free // 2**20} MB，本带预算 '
-                    f'{_budget // 2**20} MB')
+                    f'{_budget // 2**20} MB（可用量的 70%）')
             _rows = _budget / max(1.0, 2.0 * n * w * 4)
-            band = int(max(64, min(256, _rows)))
+            band = int(max(64, min(512, _rows)))
         else:
             # CPU 侧实测：带高 32/48/64/160 行（6 进程、M81 60 帧 1600²×2）=
             # 35.7/38.1/39.5/58.8 s —— 带越宽，每带要来回扫的 (n,bh,w) 缓冲越大，
@@ -2935,6 +3380,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                         int(_CFA.get('origin', (0, 0))[0]) % 2)
             log('[CFA] 真 CFA drizzle：只投 %s 的原始样本（不插值）' % _CFA['ch'])
         _use_wgpu = False   # wgpu 通用后端只在分支 B（DWT-Drizzle-B）里存在
+        _wmap = None
         def _do_stack():
             if _use_wgpu:
                 from gpu_wgpu import stack_pws as _sg
@@ -2948,12 +3394,19 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                                 rej_gate, float(fs.sky0), drz_p, band,
                                 theta=th, scale=kk, dist=_dist, workers=_drizzle_workers(),
                                 T=T, fp=fp, rej_mode=str(getattr(p, 'rej_mode', 'winsor')),
+                                kernel=str(getattr(p, 'kernel', 'box') or 'box'),
+                                psf_target=float(getattr(p, 'psf_target', 50.0) or 50.0),
+                                fwhms=fwhms,
                                 native_shape=fs.shape, log=log, emit=_emit,
                                 cancel=_check_cancel,
                                 sharp_w=float(getattr(p, 'sharp_w', 0.0) or 0.0),
-                                cfa_sel=_cfa_sel)
+                                cfa_sel=_cfa_sel, wmap=_wmap)
         try:
             r_d = _do_stack()
+            if bool(int(getattr(p, 'two_pass', 0) or 0)):
+                _wmap = _local_sharp_maps(fs, np.arange(n), drz_plan, 64, log)
+                if _wmap is not None:
+                    r_d = _do_stack()
         finally:
             fs.close(keep=keep_frames)
         Stk = r_d['stack']
@@ -3103,6 +3556,17 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     if save_xisf:
         p_out = out_dir / f'{stem}.xisf'
         _emit('输出', 0.7, '导出成品')
+        # 未覆盖像素写 NaN（不是 0）：写 0 会让 PI/EZ Soft Stretch 的直方图被
+        # 一大块 0 压成一根针，自动拉伸失效。NaN 在 PI 里显示为纯黑，但直方图
+        # 与统计会跳过它。
+        if cov_map is not None:
+            _cm = np.asarray(cov_map)
+            if _cm.shape == Stk.shape:
+                _bad = ~(_cm > 0)
+                _nan_n = int(np.count_nonzero(_bad))
+                if _nan_n:
+                    Stk = np.where(_bad, np.nan, Stk).astype(Stk.dtype, copy=False)
+                    log(f'[输出] 未覆盖像素置 NaN：{_nan_n} 个（{_nan_n / Stk.size:.3%}）')
         save_linear_xisf(p_out, Stk, metas,
                          f'PWS A={A:g} B={B:g} rej_k={rej_k:g}',
                          diag={'A': A, 'B': B, 'RejK': rej_k, 'RejGate': rej_gate,

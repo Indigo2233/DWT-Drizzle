@@ -73,7 +73,10 @@ class PwsParams:
     aligned: int = 0
     cfa: str = 'off'          # off / auto / RGGB / BGGR / GRBG / GBRG
     cfa_debayer: str = 'bilinear'   # 解马赛克算法
-    cfa_weights: str = 'shared'     # shared（三通道共用，对齐 PI）/ own
+    cfa_weights: str = 'auto'       # auto|shared|own：彩机权重是否逐通道各算
+    cfa_ref: str = ''               # 彩机参考目录（WBPP debayered），空=自动扫描
+    cfa_raw: str = 'auto'           # auto|on|off：真 CFA（不插值，按颜色投样本）
+    cfa_align: str = 'auto'         # auto|shared|own：彩机三通道对齐方式
 
     # ---- CFA Drizzle（Bayer drizzle）：不解马赛克，按颜色分平面叠加 ----
     cfa_drizzle: bool = False
@@ -83,6 +86,13 @@ class PwsParams:
     c_star: int = 64
     jobs: int = 0
     rej_mode: str = 'winsor'
+
+    kernel: str = 'box'
+
+
+    two_pass: int = 0
+
+    psf_target: float = 50.0
     rej_gate: float = 1 / 3
     # ---- 高级 · drizzle（几何层）----
     drizzle: bool = False
@@ -281,9 +291,27 @@ PARAMS: Tuple[Param, ...] = (
           choices=(('双线性', 'bilinear'), ('2×2 合并', 'superpixel'))),
     Param('cfa_weights', '彩色权重', 'choice', '高级',
           '三通道共用一套权重，还是逐通道各算',
-          '共用与 PI 一致，省掉两遍星点测量与配准；实测只差 R +1.0%、B +2.0% 的 FWHM'
-          '（≈0.05px）。逐通道在红蓝焦距明显不同时才值得开。',
-          choices=(('共用（推荐）', 'shared'), ('逐通道', 'own'))),
+          'auto：先用 6 帧探通道间锐度排序（相关 <0.95 才逐通道）；实测同通道排序相关 0.986~0.995，'
+          '一般共用即可（只差 R +1.0%、B +2.0% FWHM，而逐通道多花约 24% 时间）。',
+          choices=(('自动（推荐）', 'auto'), ('共用', 'shared'), ('逐通道', 'own'))),
+    Param('cfa_ref', '彩机参考目录', 'str', '高级',
+          'WBPP 的 debayered 目录，留空自动扫描',
+          '用于估通道色差偏移（比在成品上估更干净）。叠加本身仍然只用原始 CFA 帧，'
+          '不会退化成插值路线。留空时自动找素材同级的 debayered 目录。'),
+    Param('cfa_align', '彩机对齐方式', 'choice', '高级',
+          '三通道共用一套几何（快、像素级对齐），还是各通道独立配准（吸收色差）',
+          'own 与 PI 的 WBPP 一致：每个通道在自己的图层上配准，色差偏移会在配准里'
+          '被吸收，不必在合并时平移；代价是配准与星表要跑三遍，且 R/B 噪声大、'
+          '星点少时可能配不准（此时建议保持 shared）。',
+          choices=(('自动（推荐）', 'auto'), ('共用几何（快）', 'shared'), ('逐通道独立配准', 'own'))),
+    Param('cfa_raw', '真 CFA 采样', 'choice', '高级',
+          '真 CFA = 保留原始马赛克，drizzle 只投本通道的样本（不插值）',
+          'auto（默认）：识别到拜耳阵列且开了 drizzle 就用真 CFA。'
+          'on/off 用来强制，便于与「插值拆色」做 A/B 对照；'
+          '插值路线噪声更低但细节是补出来的，真 CFA 锐度更高、R/B 噪声更大。',
+          choices=(('自动（推荐）', 'auto'), ('强制开', 'on'),
+                 ('强制关（走插值）', 'off'),
+                 ('混合（G 真 CFA + R/B 插值）', 'hybrid'))),
     Param('cfa_drizzle', 'CFA Drizzle（不解马赛克）', 'bool', '高级',
           '彩机专用：不解马赛克，直接把原始 CFAPattern 像素按颜色分平面叠加',
           '与 PI 的 Bayer Drizzle 同思路：不 debayer、每个像素只进自己颜色的平面，'
@@ -317,9 +345,25 @@ PARAMS: Tuple[Param, ...] = (
           '三种都是噪声尺度的鲁棒估计：winsor 先按 3σ 截尾再求 mean|x−μ|×1.2533，'
           '免排序又不会被拖线抬高阈值（PI 3.1.1 在 7~14 帧也用这一档）；'
           'mad 是旧算法（median|x−μ|×1.4826，要排序、最慢）；'
-          'fast 是不截尾的均值版，最快但剔除更松（实测剔除率 1.16% → 0.77%）。',
+          'fast 是不截尾的均值版，最快但剔除更松（实测剔除率 1.16% → 0.77%）；esd 用 Rosner 广义 ESD，最多 3 轮，对孤立热像素/拖线更准，略慢。',
           choices=(('winsorized（推荐）', 'winsor'), ('中位绝对偏差（旧）', 'mad'),
-                   ('平均绝对偏差（最快）', 'fast'))),
+                   ('平均绝对偏差（最快）', 'fast'), ('广义 ESD（Rosner）', 'esd'))),
+
+    Param('two_pass', '两遍加权（局部锐度）', 'choice', '高级',
+
+          '第一遍叠一张，再按 64px 块量出每帧的局部锐度，第二遍带上这份权重场重叠',
+
+          '开着更稳但叠加耗时约 +40%；默认关',
+
+          choices=(('关（默认）', '0'), ('开', '1'))),
+    Param('kernel', 'drizzle 液滴核', 'choice', '高级',
+          '方框最稳；PSF 匹配会把更锐的帧先糊到同一分辨率再叠（用信噪比换一致性）',
+          '默认 box；想压噪声又不想只留最锐那几帧时用 psfmatch',
+          choices=(('方框（默认）', 'box'), ('PSF 匹配（MMSE 折中）', 'psfmatch'))),
+    Param('psf_target', 'PSF 匹配目标分位', 'float', '高级',
+          '百分位：50 = 糊到中位视宁度，20 = 保留较锐的两成，95 = 接近全匹配',
+          '只在 kernel=psfmatch 时生效',
+          lo=1.0, hi=99.0, step=5.0, dec=0),
     Param('jobs', '并行进程', 'int', '高级',
           '叠加分带时同时跑几个进程；0 = 自动（按 CPU 核数的一半，最多 8，当前机器 12 核取 6）',
           '内存带宽是瓶颈：实测 12 核机器上 6 进程 38.5s、11 进程 43.9s，多加反而更慢。'

@@ -97,7 +97,10 @@ def crop_box(ncov, frac=0.9, min_frames=3.0, close=9):
     a = np.asarray(ncov, np.float64)
     if a.ndim != 2 or not a.size:
         return None
-    top = float(np.nanmax(a))
+    # 用 99.5 百分位当参考：孤立的热像素 / 加权覆盖的尖点会把 nanmax 抬到天上，
+    # 于是「≥90% 最大覆盖」只剩极小一块（真 CFA 的 B 通道曾被裁成 213×225）。
+    with np.errstate(all='ignore'):
+        top = float(np.nanpercentile(a, 99.5))
     if not np.isfinite(top) or top <= 0:
         return None
     thr = max(float(min_frames), float(frac) * top)
