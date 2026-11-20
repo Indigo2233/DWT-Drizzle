@@ -3421,13 +3421,12 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         elif _wgpu_ok and _cfa_sel is not None:
             _pf = float(getattr(p, 'drizzle_pix', 1.0) or 1.0)
             _sc = float(drz_plan.get('s', 1.0)) if drz_plan else 1.0
-            if abs(_pf * _sc - 1.0) > 0.02:
-                log('[wgpu] 真 CFA 只支持 pixfrac×倍率≈1（当前 %.2f×%.2f），'
-                    '本组走 CPU 的 scatter drizzle 以免画质下降' % (_pf, _sc))
-                _wgpu_ok = False
+            _near = os.environ.get('DWT_WGPU_CFA_NEAR', '').strip() == '1'
+            if _near and abs(_pf * _sc - 1.0) <= 0.02:
+                log('[wgpu] 真 CFA：最近同色样本（DWT_WGPU_CFA_NEAR=1，实验路径）')
             else:
-                log('[wgpu] 真 CFA：最近同色样本 + 两遍 σ-clipping'
-                    '（pixfrac×倍率≈1，与 CPU 的 1×1 液滴等价）')
+                log('[wgpu] 真 CFA：液滴散射（定点原子加，pixfrac×倍率=%.2f）'
+                    % (_pf * _sc))
         _use_wgpu = _wgpu_ok
         _wmap = None
         def _do_stack():
@@ -3437,11 +3436,20 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 _xx = np.clip(((np.arange(_W2) - float(drz_plan['ox'])) / float(drz_plan['s'])).astype(int), 0, w - 1)
                 _R2 = R[np.ix_(_yy, _xx)] if R is not None else None
                 if _cfa_sel is not None:
-                    from gpu_wgpu_pws import stack_pws_cfa as _sgc
-                    return _sgc(fs, C, S, dx, dy, th, kk, drz_plan, A, B,
+                    _pf = float(getattr(p, 'drizzle_pix', 1.0) or 1.0)
+                    _pd = _pf * float(drz_plan.get('s', 1.0))
+                    # 默认全部走散射：最近邻在 P=1 且带旋转时会丢掉液滴的分数覆盖
+                    # （20 帧实测 corr 仅 0.92），散射与 CPU 逐像素等价（corr 0.9997）
+                    if os.environ.get('DWT_WGPU_CFA_NEAR', '').strip() == '1' and abs(_pd - 1.0) <= 0.02:
+                        from gpu_wgpu_pws import stack_pws_cfa as _sgc
+                        return _sgc(fs, C, S, dx, dy, th, kk, drz_plan, A, B,
+                                    pattern=_CFA['pattern'], channel=_CFA['ch'],
+                                    sky=0.0, R=_R2, rej_k=rej_k, log=log, n=n,
+                                    pixfrac=_pf)
+                    from gpu_wgpu_cfa_scatter import stack_cfa_scatter as _sgs
+                    return _sgs(fs, C, S, dx, dy, th, kk, drz_plan, A, B,
                                 pattern=_CFA['pattern'], channel=_CFA['ch'],
-                                sky=0.0, R=_R2, rej_k=rej_k, log=log, n=n,
-                                pixfrac=float(getattr(p, 'drizzle_pix', 1.0) or 1.0))
+                                R=_R2, pixfrac=_pf, rej_k=rej_k, log=log, n=n)
                 from gpu_wgpu import stack_pws as _sg
                 return _sg(fs, C, S, dx, dy, th, kk, drz_plan, A, B,
                            sky=0.0, R=_R2, log=log, n=n)
