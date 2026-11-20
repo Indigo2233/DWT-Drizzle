@@ -3452,7 +3452,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                         from gpu_wgpu_cfa_bucket import stack_cfa_bucket as _sgb
                         return _sgb(fs, C, S, dx, dy, th, kk, drz_plan, A, B,
                                     rej_k=rej_k, rej_gate=rej_gate, R=_R2,
-                                    pixfrac=_pf, log=log,
+                                    pixfrac=_pf, log=log, T=T, fp=fp,
                                     pattern=_CFA['pattern'], channel=_CFA['ch'])
                     except Exception as _e_bk:
                         if os.environ.get('DWT_WGPU_DEBUG') == '1':

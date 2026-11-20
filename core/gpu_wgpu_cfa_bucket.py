@@ -39,6 +39,7 @@ struct Params {
   y_off: u32, c0: u32, r0: u32, mask: u32,
   P: f32, lnc: f32, lns: f32, wa: f32,
   wb: f32, has_r: f32, kslot: u32, s_off: u32,
+  lnt: f32,
 }
 
 @group(0) @binding(0) var<uniform> Q: Params;
@@ -89,7 +90,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       let wgt = exp(Q.wa * R * Q.lnc + Q.wb * (1.0 - R) * Q.lns);
       // CPU 的 _scatter_band 用 1/P² 归一（液滴面积），这里同口径；
       // 不同帧 kk 略有差异时这一步会改变相对权重。
-      let w = wgt * wx * wy / (Q.P * Q.P);
+      let w = wgt * wx * wy / (Q.P * Q.P) * exp(Q.lnt);
       let slot = atomicAdd(&aCnt[idx], 1u);
       if (slot < u32(K)) {
         aVal[idx * u32(K) + slot] = w * v;
@@ -133,7 +134,8 @@ def available() -> bool:
 
 
 def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
-                     R=None, pixfrac=1.0, band_rows=512, kslots=16,
+                     R=None, pixfrac=1.0, band_rows=512, kslots=None,
+                     T=None, fp=1.0,
                      log=None, pattern=None, channel=None, **kw):
     """返回 dict(stack, cov, neff, ...)，与 drizzle.stack_drizzle 的返回键兼容。"""
     if not available():
@@ -158,14 +160,14 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
     # 每像素桶深按帧数自适应：一个输出像素最多被「每帧 ~1 个样本」命中，
     # 再加少量余量给 2×/pixfrac<1 的重叠；同时受显存预算约束。
     K = 8
-    while K < len(idx) + 4 and K < 64:
+    while K < len(idx) + 4 and K < 32:
         K *= 2
     if kslots:
         K = int(kslots)
     K = int(os.environ.get('DWT_BUCKET_K', K))
-    _mem_cap = int(os.environ.get('DWT_BUCKET_MB', '768')) * 1024 * 1024
-    while K > 4 and band_rows * W * K * 8 > _mem_cap:
-        K //= 2
+    # 桶深只由帧数决定（少了会溢出丢样本）；显存不够时缩短每条带的行数，
+    # 而不是降低桶深——这一点在 51 帧实测里差别很大（K=16 溢出 9.35%）。
+    _ = int(os.environ.get('DWT_BUCKET_MB', '768'))
     stack = np.zeros((H, W), np.float32)
     cov = np.zeros((H, W), np.float32)
     neff = np.zeros((H, W), np.float32)
@@ -196,6 +198,9 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
     _rmap = _sbuf(dev, U, H * W)
     queue.write_buffer(_rmap, 0, np.ascontiguousarray(_rr).tobytes())
     _t_up += time.perf_counter() - _t0
+    _bud_mb = int(os.environ.get('DWT_BUCKET_MB', '768'))
+    _rows_by_mem = max(32, int(_bud_mb * 1024 * 1024 // max(1, W * K * 8)))
+    band_rows = int(min(band_rows, _rows_by_mem))
     for y0 in range(0, H, band_rows):
         bh = min(band_rows, H - y0)
         Ylo, Yhi = y0 - 2.0 * pixfrac * s_grid - 4, y0 + bh + 2.0 * pixfrac * s_grid + 4
@@ -296,6 +301,8 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
             p[19] = np.float32(1.0 if R is not None else 0.0)
             _pu[20] = np.uint32(K)
             _pu[21] = np.uint32(j * plane)
+            _tv = float(T[j]) if T is not None else 1.0
+            p[22] = np.float32(float(fp) * math.log(max(_tv, 1e-6)))
             queue.write_buffer(uni, 0, p.tobytes())
             enc = dev.create_command_encoder()
             cp = enc.begin_compute_pass()
@@ -311,8 +318,8 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
         cnt = _read(dev, queue, aCnt, bh * W, U)
         # _read 返回的是 uint32 视图，必须 view(float32) 再转 float64，
         # 否则读回来的是 IEEE754 位模式（整数），全部错位。
-        vals = _read(dev, queue, aVal, bh * W * K, U).view(np.float32).astype(np.float64)
-        wts = _read(dev, queue, aWt, bh * W * K, U).view(np.float32).astype(np.float64)
+        vals = _read(dev, queue, aVal, bh * W * K, U).view(np.float32)
+        wts = _read(dev, queue, aWt, bh * W * K, U).view(np.float32)
         _t_back += time.perf_counter() - _t0
         _t0 = time.perf_counter()
 
@@ -325,25 +332,27 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
         Vm = vals.reshape(bh * W, K)
         Wm = wts.reshape(bh * W, K)
         ok = Wm > 0
-        Wsum = Wm.sum(axis=1)
-        Vsum = Vm.sum(axis=1)
+        Wsum = Wm.sum(axis=1, dtype=np.float64)
+        Vsum = Vm.sum(axis=1, dtype=np.float64)
         with np.errstate(invalid='ignore', divide='ignore'):
             mu = np.where(Wsum > 1e-12, Vsum / np.maximum(Wsum, 1e-30), 0.0)
-            dv = np.abs(Vm - mu[:, None]) * ok
-            var = (Wm * dv * dv).sum(axis=1) / np.maximum(Wsum, 1e-30)
+            dv = np.abs(Vm - mu[:, None].astype(np.float32)) * ok
+            var = (Wm * dv * dv).sum(axis=1, dtype=np.float64) / np.maximum(Wsum, 1e-30)
             sd = np.sqrt(np.maximum(var, 0.0))
             lim = 3.0 * sd
-            devc = np.minimum(dv, lim[:, None])
-            s = np.where(Wsum > 1e-12, 1.15 * (Wm * devc).sum(axis=1) / np.maximum(Wsum, 1e-30), 0.0)
+            devc = np.minimum(dv, lim[:, None].astype(np.float32))
+            s = np.where(Wsum > 1e-12,
+                         1.15 * (Wm * devc).sum(axis=1, dtype=np.float64) / np.maximum(Wsum, 1e-30), 0.0)
             if rej_k > 0:
-                keep = ok & (np.abs(Vm - mu[:, None]) <= rej_k * s[:, None])
+                keep = ok & (np.abs(Vm - mu[:, None].astype(np.float32))
+                         <= (rej_k * s[:, None]).astype(np.float32))
             else:
                 keep = ok
-            Wk = np.where(keep, Wm, 0.0)
-            Vk = np.where(keep, Vm, 0.0)
-            Wk_sum = Wk.sum(axis=1)
-            out = np.where(Wk_sum > 1e-12, Vk.sum(axis=1) / np.maximum(Wk_sum, 1e-30), 0.0)
-            w2 = (Wk * Wk).sum(axis=1)
+            Wk = np.where(keep, Wm, np.float32(0.0))
+            Vk = np.where(keep, Vm, np.float32(0.0))
+            Wk_sum = Wk.sum(axis=1, dtype=np.float64)
+            out = np.where(Wk_sum > 1e-12, Vk.sum(axis=1, dtype=np.float64) / np.maximum(Wk_sum, 1e-30), 0.0)
+            w2 = (Wk * Wk).sum(axis=1, dtype=np.float64)
         stack[y0:y0 + bh, :] = out.reshape(bh, W).astype(np.float32)
         _t_host += time.perf_counter() - _t0
         cov[y0:y0 + bh, :] = Wk_sum.reshape(bh, W).astype(np.float32)
