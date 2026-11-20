@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 from typing import Dict, Optional
 
+import os
 import numpy as np
 
 try:
@@ -153,7 +154,17 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
         raise RuntimeError('有效帧不足')
 
     rej_k = float(rej_k or 0.0)
-    K = int(kslots or 16)
+    # 每像素桶深按帧数自适应：一个输出像素最多被「每帧 ~1 个样本」命中，
+    # 再加少量余量给 2×/pixfrac<1 的重叠；同时受显存预算约束。
+    K = 8
+    while K < len(idx) + 4 and K < 64:
+        K *= 2
+    if kslots:
+        K = int(kslots)
+    K = int(os.environ.get('DWT_BUCKET_K', K))
+    _mem_cap = int(os.environ.get('DWT_BUCKET_MB', '768')) * 1024 * 1024
+    while K > 4 and band_rows * W * K * 8 > _mem_cap:
+        K //= 2
     stack = np.zeros((H, W), np.float32)
     cov = np.zeros((H, W), np.float32)
     neff = np.zeros((H, W), np.float32)

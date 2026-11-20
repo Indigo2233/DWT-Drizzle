@@ -3460,10 +3460,14 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                             _tb.print_exc()
                         log('[wgpu] 分桶后端不可用（%s: %s），退回定点散射'
                             % (type(_e_bk).__name__, _e_bk))
-                    from gpu_wgpu_cfa_scatter import stack_cfa_scatter as _sgs
-                    return _sgs(fs, C, S, dx, dy, th, kk, drz_plan, A, B,
-                                pattern=_CFA['pattern'], channel=_CFA['ch'],
-                                R=_R2, pixfrac=_pf, rej_k=rej_k, log=log, n=n)
+                    if os.environ.get('DWT_WGPU_CFA_SCATTER', '').strip() == '1':
+                        # 定点散射只在 1×/pix1 附近可靠；2× 或 pixfrac<1 时覆盖率会掉，
+                        # 所以默认不再用它兜底，直接让上层退回 CPU 重算本组。
+                        from gpu_wgpu_cfa_scatter import stack_cfa_scatter as _sgs
+                        return _sgs(fs, C, S, dx, dy, th, kk, drz_plan, A, B,
+                                    pattern=_CFA['pattern'], channel=_CFA['ch'],
+                                    R=_R2, pixfrac=_pf, rej_k=rej_k, log=log, n=n)
+                    raise
                 from gpu_wgpu import stack_pws as _sg
                 return _sg(fs, C, S, dx, dy, th, kk, drz_plan, A, B,
                            sky=0.0, R=_R2, log=log, n=n)
