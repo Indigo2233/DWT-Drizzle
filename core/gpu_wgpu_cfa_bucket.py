@@ -206,7 +206,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 """
 
 _CLIP_WGSL = """
-struct RC { n_pix: u32, K: u32, pad0: u32, pad1: u32 };
+struct RC { n_pix: u32, K: u32, w_out: u32, bw: u32, bs: u32, pad0: u32, pad1: u32, pad2: u32 };
 @group(0) @binding(0) var<storage, read> rVals: array<f32>;
 @group(0) @binding(1) var<storage, read> rWts: array<f32>;
 @group(0) @binding(2) var<storage, read> rMu: array<f32>;
@@ -221,7 +221,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (i >= U.n_pix) { return; }
   let K = U.K;
   let mu = rMu[i];
-  let lim = rLim[i];
+  let x = i % U.w_out;
+  let y = i / U.w_out;
+  let bid = (y / U.bs) * U.bw + (x / U.bs);
+  let lim = rLim[bid];
   var ads: f32 = 0.0;
   var ws: f32 = 0.0;
   for (var k: u32 = 0u; k < K; k = k + 1u) {
@@ -509,6 +512,25 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
             cp.end()
             queue.submit([enc.finish()])
 
+
+        def _block_mean_small(a2, bh_, W_, BS, ST, use_pos=False):
+            """CPU 同口径的块均值，但只返回 (Hb, Wb) 的小数组，不展开到整幅。
+
+            CPU 的 _winsor_scale 是「64×64 块内、每 ST 像素抽样求均值」；这里用
+            分块累加（reduceat）实现，避免 pad + kron 各开一份整幅缓冲
+            （全幅 2× 时单份就是 417 MB）。
+            """
+            Hb = (bh_ + BS - 1) // BS
+            Wb = (W_ + BS - 1) // BS
+            pad = np.zeros((Hb * BS, Wb * BS), np.float32)
+            pad[:bh_, :W_] = a2
+            sub = pad.reshape(Hb, BS, Wb, BS)[:, ::ST, :, ::ST]
+            if use_pos:
+                msk = (sub > 0).astype(np.float32)
+                tot = (sub * msk).sum(axis=(1, 3))
+                cnt = msk.sum(axis=(1, 3))
+                return np.where(cnt > 0, tot / np.maximum(cnt, 1.0), 0.0).astype(np.float32)
+            return sub.mean(axis=(1, 3)).astype(np.float32)
         def _block_mean(a2, bh_, W_, BS, ST, use_pos=False):
             """CPU 同口径：块内对「每 ST 像素抽样」的点求均值；use_pos 时只统计 >0 的点。"""
             Hb = (bh_ + BS - 1) // BS
@@ -541,16 +563,24 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
         sdp = _read(dev, queue, bSd, n_pix, U).view(np.float32)
 
         # lim = max(2, rej_k) · 块内 σ 均值（CPU 的 _winsor_scale 第一步）
-        lim = (max(2.0, float(rej_k)) * _block_mean(sdp.reshape(bh, W), bh, W, BS, ST, use_pos=True))
-        queue.write_buffer(bLim, 0, lim.astype(np.float32).tobytes())
+        _mb = _block_mean_small(sdp.reshape(bh, W), bh, W, BS, ST, use_pos=True)
+        _Hb, _Wb = _mb.shape
+        lim = (np.float32(max(2.0, float(rej_k))) * _mb).astype(np.float32)
+        queue.write_buffer(bLim, 0, lim.tobytes())
 
         # 第二段：按 lim 截尾求 Σw|dev| 与 Σw
-        bU2 = _uni([n_pix, K], {})
+        bU2 = dev.create_buffer(size=64, usage=U.UNIFORM | U.COPY_DST)
+        _u2 = np.zeros(8, np.float32)
+        _u2.view(np.uint32)[0:2] = np.array([n_pix, K], np.uint32)
+        _u2.view(np.uint32)[2] = np.uint32(W)
+        _u2.view(np.uint32)[3] = np.uint32(_Wb)
+        _u2.view(np.uint32)[4] = np.uint32(BS)
+        queue.write_buffer(bU2, 0, _u2.tobytes())
         bg2 = dev.create_bind_group(layout=cpipe.get_bind_group_layout(0), entries=[
             {'binding': 0, 'resource': {'buffer': aVal, 'offset': 0, 'size': max(16, n_pix * K * 4)}},
             {'binding': 1, 'resource': {'buffer': aWt, 'offset': 0, 'size': max(16, n_pix * K * 4)}},
             {'binding': 2, 'resource': {'buffer': bMu, 'offset': 0, 'size': max(16, n_pix * 4)}},
-            {'binding': 3, 'resource': {'buffer': bLim, 'offset': 0, 'size': max(16, n_pix * 4)}},
+            {'binding': 3, 'resource': {'buffer': bLim, 'offset': 0, 'size': max(16, int(_Hb * _Wb * 4))}},
             {'binding': 4, 'resource': {'buffer': bAds, 'offset': 0, 'size': max(16, n_pix * 4)}},
             {'binding': 5, 'resource': {'buffer': bWs, 'offset': 0, 'size': max(16, n_pix * 4)}},
             {'binding': 6, 'resource': {'buffer': bU2, 'offset': 0, 'size': 64}},
@@ -561,8 +591,8 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
 
         # scale = 1.15 · 块内 Σw|dev| / Σw（CPU 的 _winsor_scale 第二步）
         _kc = float(os.environ.get('DWT_WINSOR_C', '1.15') or 1.15)
-        sa_b = _block_mean(ads.reshape(bh, W), bh, W, BS, ST)
-        sw_b = _block_mean(wss.reshape(bh, W), bh, W, BS, ST)
+        sa_b = _block_mean_small(ads.reshape(bh, W), bh, W, BS, ST)
+        sw_b = _block_mean_small(wss.reshape(bh, W), bh, W, BS, ST)
         scale = np.where(sw_b > 1e-20, _kc * sa_b / np.maximum(sw_b, 1e-20), 0.0).astype(np.float32)
         queue.write_buffer(bBlk, 0, scale.tobytes())
 
@@ -573,14 +603,14 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
         fu[0:2].view(np.uint32)[:] = np.array([n_pix, K], np.uint32)
         fu[2] = np.float32(rej_k)
         fu.view(np.uint32)[3] = np.uint32(W)
-        fu.view(np.uint32)[4] = np.uint32(W)
-        fu.view(np.uint32)[5] = np.uint32(1)
+        fu.view(np.uint32)[4] = np.uint32(int(_Wb))
+        fu.view(np.uint32)[5] = np.uint32(BS)
         queue.write_buffer(bU3b, 0, fu.tobytes())
         bg3 = dev.create_bind_group(layout=fpipe.get_bind_group_layout(0), entries=[
             {'binding': 0, 'resource': {'buffer': aVal, 'offset': 0, 'size': max(16, n_pix * K * 4)}},
             {'binding': 1, 'resource': {'buffer': aWt, 'offset': 0, 'size': max(16, n_pix * K * 4)}},
             {'binding': 2, 'resource': {'buffer': bMu, 'offset': 0, 'size': max(16, n_pix * 4)}},
-            {'binding': 3, 'resource': {'buffer': bBlk, 'offset': 0, 'size': max(16, n_pix * 4)}},
+            {'binding': 3, 'resource': {'buffer': bBlk, 'offset': 0, 'size': max(16, int(_Hb * _Wb * 4))}},
             {'binding': 4, 'resource': {'buffer': bOut, 'offset': 0, 'size': max(16, n_pix * 4)}},
             {'binding': 5, 'resource': {'buffer': bCov, 'offset': 0, 'size': max(16, n_pix * 4)}},
             {'binding': 6, 'resource': {'buffer': bNef, 'offset': 0, 'size': max(16, n_pix * 4)}},

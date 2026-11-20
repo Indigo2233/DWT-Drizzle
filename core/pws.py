@@ -3472,26 +3472,34 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                                     pixfrac=_pf, log=log, T=T, fp=fp,
                                     pattern=_CFA['pattern'], channel=_CFA['ch'])
                     except Exception as _e_bk:
+                        _emsg = '%s: %s' % (type(_e_bk).__name__, _e_bk)
                         if os.environ.get('DWT_WGPU_DEBUG') == '1':
                             import traceback as _tb
                             _tb.print_exc()
-                        log('[wgpu] 分桶后端不可用（%s: %s），退回定点散射'
-                            % (type(_e_bk).__name__, _e_bk))
-                    if os.environ.get('DWT_WGPU_CFA_SCATTER', '').strip() == '1':
-                        # 定点散射只在 1×/pix1 附近可靠；2× 或 pixfrac<1 时覆盖率会掉，
-                        # 所以默认不再用它兜底，直接让上层退回 CPU 重算本组。
-                        from gpu_wgpu_cfa_scatter import stack_cfa_scatter as _sgs
-                        return _sgs(fs, C, S, dx, dy, th, kk, drz_plan, A, B,
-                                    pattern=_CFA['pattern'], channel=_CFA['ch'],
-                                    R=_R2, pixfrac=_pf, rej_k=rej_k, log=log, n=n)
-                    raise RuntimeError('wgpu 真 CFA 后端不可用：%s: %s'
-                                       % (type(_e_bk).__name__, _e_bk))
+                        log('[wgpu] 分桶后端不可用（%s），退回 CPU 重算本组' % _emsg)
+                        if os.environ.get('DWT_WGPU_CFA_SCATTER', '').strip() == '1':
+                            from gpu_wgpu_cfa_scatter import stack_cfa_scatter as _sgs
+                            return _sgs(fs, C, S, dx, dy, th, kk, drz_plan, A, B,
+                                        pattern=_CFA['pattern'], channel=_CFA['ch'],
+                                        R=_R2, pixfrac=_pf, rej_k=rej_k, log=log, n=n)
+                        raise RuntimeError('wgpu 真 CFA 后端不可用：' + _emsg)
                 from gpu_wgpu import stack_pws as _sg
                 return _sg(fs, C, S, dx, dy, th, kk, drz_plan, A, B,
                            sky=0.0, R=_R2, log=log, n=n)
+            # 并行进程数要按画布内存收敛：每个子进程一趟要持有整幅输出（float32），
+            # 全幅 2× 的画布是 ~417 MB/进程，8 进程光输出缓冲就 3.3 GB。
+            try:
+                _cv_mb = float(drz_plan['W'] * drz_plan['H'] * 4) / (1024.0 * 1024.0)
+                _cap = max(1, int(2048.0 // max(1.0, _cv_mb * 2.0)))
+                _nw = max(1, min(int(_drizzle_workers()), _cap))
+                if _nw < int(_drizzle_workers()):
+                    log('[drizzle] 画布 %.0f MB，并行进程从 %d 降到 %d（避免内存打爆）'
+                        % (_cv_mb, int(_drizzle_workers()), _nw))
+            except Exception:
+                _nw = int(_drizzle_workers())
             return stack_drizzle(fs, R, C, S, dx, dy, drz_plan, A, B, rej_k,
                                 rej_gate, float(fs.sky0), drz_p, band,
-                                theta=th, scale=kk, dist=_dist, workers=_drizzle_workers(),
+                                theta=th, scale=kk, dist=_dist, workers=_nw,
                                 T=T, fp=fp, rej_mode=str(getattr(p, 'rej_mode', 'winsor')),
                                 kernel=str(getattr(p, 'kernel', 'box') or 'box'),
                                 psf_target=float(getattr(p, 'psf_target', 50.0) or 50.0),
@@ -3638,9 +3646,13 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         f_out_px = measure_fwhm(Stk, stars_o, fwhm_guess=6.0 * drz_s,
                                 half=hw, fit_shape=fsz)
         f_out = f_out_px / drz_s
-        log(f'[输出] 成品星点 FWHM {f_out:.2f}px（本机口径；图上 {f_out_px:.2f}px'
-            f' @×{drz_s:g}）  单帧中位 {fmed:.2f}px  '
-            f'改善 {100 * (1 - f_out / fmed):.1f}%')
+        if np.isfinite(f_out) and np.isfinite(fmed) and fmed > 0:
+            log(f'[输出] 成品星点 FWHM {f_out:.2f}px（本机口径；图上 {f_out_px:.2f}px'
+                f' @×{drz_s:g}）  单帧中位 {fmed:.2f}px  '
+                f'改善 {100 * (1 - f_out / fmed):.1f}%')
+        else:
+            log('[输出] 成品星点 FWHM 量不出来（该通道样本太少或太暗，'
+                '高斯拟合不收敛）；图本身正常，以目视/外部工具为准')
         log(f'[输出] 采样口径：σ_psf {sigma_psf:.2f}→{sigma_psf * drz_s:.2f}px'
             f'（1.5~2 为目标区间）')
         if f_out > 1.15 * fmed:
