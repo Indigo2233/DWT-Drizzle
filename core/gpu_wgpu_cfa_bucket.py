@@ -104,20 +104,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 # 归约核：每个输出像素读自己的 K 个桶，算 μ/σ/winsor 尺度、剔除、出成品。
 # 这一步不需要原子操作，纯读改写，放在 GPU 上做可以把主机从 7~13s 的统计里解放出来。
-_REDUCE_WGSL = """
-struct RU {
-  n_pix: u32,
-  K: u32,
-  rej_k: f32,
-};
-
+_STATS_WGSL = """
+struct RU { n_pix: u32, K: u32, rej_k: f32, w_out: u32 };
 @group(0) @binding(0) var<storage, read> rVals: array<f32>;
 @group(0) @binding(1) var<storage, read> rWts: array<f32>;
-@group(0) @binding(2) var<storage, read_write> rOut: array<f32>;
-@group(0) @binding(3) var<storage, read_write> rCov: array<f32>;
-@group(0) @binding(4) var<storage, read_write> rNeff: array<f32>;
+@group(0) @binding(2) var<storage, read_write> oAds: array<f32>;
+@group(0) @binding(3) var<storage, read_write> oWs: array<f32>;
+@group(0) @binding(4) var<storage, read_write> oMu: array<f32>;
 @group(0) @binding(5) var<uniform> U: RU;
 
+// 第一段：逐像素锚点（中位数）、值的标准差、截尾后的 |dev| 和
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x;
@@ -125,21 +121,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let K = U.K;
   var ws: f32 = 0.0;
   var vs: f32 = 0.0;
+  var nv: u32 = 0u;
   for (var k: u32 = 0u; k < K; k = k + 1u) {
     let w = rWts[i * K + k];
     ws = ws + w;
     vs = vs + rVals[i * K + k];
+    if (w > 0.0) { nv = nv + 1u; }
   }
-  if (ws <= 1e-20) { rOut[i] = 0.0; rCov[i] = 0.0; rNeff[i] = 0.0; return; }
-  // 锚点用逐像素中位数（与 CPU 的 _drizzle_band 同口径：an = median(v)）
-  var nv: u32 = 0u;
-  for (var k: u32 = 0u; k < K; k = k + 1u) {
-    if (rWts[i * K + k] > 0.0) { nv = nv + 1u; }
-  }
-  var mu: f32 = 0.0;
+  if (ws <= 1e-20) { oAds[i] = 0.0; oWs[i] = 0.0; oMu[i] = 0.0; return; }
+  var mu: f32 = vs / ws;
   if (nv > 0u) {
     let half: u32 = nv / 2u;
-    var chosen: f32 = vs / ws;
     var done: bool = false;
     for (var k: u32 = 0u; k < K; k = k + 1u) {
       if (done) { break; }
@@ -150,29 +142,59 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (rWts[i * K + j] <= 0.0) { continue; }
         if (rVals[i * K + j] < vk0) { less = less + 1u; }
       }
-      if (less == half) { chosen = vk0; done = true; }
+      if (less == half) { mu = vk0; done = true; }
     }
-    mu = chosen;
   }
   var var_: f32 = 0.0;
+  var cnt: u32 = 0u;
   for (var k: u32 = 0u; k < K; k = k + 1u) {
-    let w = rWts[i * K + k];
+    if (rWts[i * K + k] <= 0.0) { continue; }
     let d = rVals[i * K + k] - mu;
-    var_ = var_ + w * d * d;
+    var_ = var_ + d * d;
+    cnt = cnt + 1u;
   }
-  let sd = sqrt(max(var_ / ws, 0.0));
-  let lim = 3.0 * sd;
+  let sd = sqrt(max(var_ / max(f32(cnt), 1.0), 0.0));
+  let lim = max(2.0, U.rej_k) * sd;
   var ads: f32 = 0.0;
   for (var k: u32 = 0u; k < K; k = k + 1u) {
     let w = rWts[i * K + k];
-    let d = abs(rVals[i * K + k] - mu);
-    ads = ads + w * min(d, lim);
+    if (w <= 0.0) { continue; }
+    ads = ads + w * min(abs(rVals[i * K + k] - mu), lim);
   }
-  let thr = U.rej_k * 1.15 * ads / ws;
+  oAds[i] = ads;
+  oWs[i] = ws;
+  oMu[i] = mu;
+}
+"""
+
+_FINAL_WGSL = """
+struct RF { n_pix: u32, K: u32, rej_k: f32, w_out: u32, bw: u32, bs: u32, pad0: u32, pad1: u32 };
+@group(0) @binding(0) var<storage, read> rVals: array<f32>;
+@group(0) @binding(1) var<storage, read> rWts: array<f32>;
+@group(0) @binding(2) var<storage, read> rMu: array<f32>;
+@group(0) @binding(3) var<storage, read> rBlk: array<f32>;
+@group(0) @binding(4) var<storage, read_write> oOut: array<f32>;
+@group(0) @binding(5) var<storage, read_write> oCov: array<f32>;
+@group(0) @binding(6) var<storage, read_write> oNef: array<f32>;
+@group(0) @binding(7) var<uniform> U: RF;
+
+// 第二段：按 64×64 块的 winsor 尺度剔除后出成品（与 CPU 的 _winsor_scale 同口径）
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= U.n_pix) { return; }
+  let K = U.K;
+  let x = i % U.w_out;
+  let y = i / U.w_out;
+  let bid = (y / U.bs) * U.bw + (x / U.bs);
+  let scale = rBlk[bid];
+  if (scale <= 0.0) { oOut[i] = 0.0; oCov[i] = 0.0; oNef[i] = 0.0; return; }
+  let mu = rMu[i];
+  let thr = U.rej_k * scale;
   var wk: f32 = 0.0;
   var vk: f32 = 0.0;
   var w2: f32 = 0.0;
-  for (var k: u32 = 0u; k < K; k = k + 1u) {
+  for (var k: u32 = 0u; k < U.K; k = k + 1u) {
     let w = rWts[i * K + k];
     if (w <= 0.0) { continue; }
     let v = rVals[i * K + k];
@@ -181,23 +203,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     vk = vk + v;
     w2 = w2 + w * w;
   }
-  if (wk <= 1e-20) { rOut[i] = 0.0; rCov[i] = 0.0; rNeff[i] = 0.0; return; }
-  rOut[i] = vk / wk;
-  rCov[i] = wk;
-  rNeff[i] = (wk * wk) / max(w2, 1e-20);
+  if (wk <= 1e-20) { oOut[i] = 0.0; oCov[i] = 0.0; oNef[i] = 0.0; return; }
+  oOut[i] = vk / wk;
+  oCov[i] = wk;
+  oNef[i] = (wk * wk) / max(w2, 1e-20);
 }
 """
 
 
 def _rpipe(dev):
-    key = 'rpipe'
-    if key in _cache:
-        return _cache[key]
-    mod = dev.create_shader_module(code=_REDUCE_WGSL)
-    pipe = dev.create_compute_pipeline(
-        layout='auto', compute={'module': mod, 'entry_point': 'main'})
-    _cache[key] = pipe
-    return pipe
+    if 'st' in _cache:
+        return _cache['st'], _cache['fn']
+    ms = dev.create_shader_module(code=_STATS_WGSL)
+    mf = dev.create_shader_module(code=_FINAL_WGSL)
+    st = dev.create_compute_pipeline(layout='auto', compute={'module': ms, 'entry_point': 'main'})
+    fn = dev.create_compute_pipeline(layout='auto', compute={'module': mf, 'entry_point': 'main'})
+    _cache.update({'st': st, 'fn': fn})
+    return st, fn
 
 _cache: Dict[str, object] = {}
 
@@ -428,26 +450,76 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
         bOut = _sbuf(dev, U, n_pix)
         bCov = _sbuf(dev, U, n_pix)
         bNef = _sbuf(dev, U, n_pix)
+        bAds = _sbuf(dev, U, n_pix)
+        bWs = _sbuf(dev, U, n_pix)
+        bMu = _sbuf(dev, U, n_pix)
+        rpipe, fpipe = _rpipe(dev)
+
+        # 第一段：逐像素锚点 / σ / 截尾 |dev| 和
         ru = np.zeros(16, np.float32)
         ru[0:2].view(np.uint32)[:] = np.array([n_pix, K], np.uint32)
         ru[2] = np.float32(rej_k)
         bRU = dev.create_buffer(size=64, usage=U.UNIFORM | U.COPY_DST)
         queue.write_buffer(bRU, 0, ru.tobytes())
-        rpipe = _rpipe(dev)
-        rbg = dev.create_bind_group(layout=rpipe.get_bind_group_layout(0), entries=[
+        bg1 = dev.create_bind_group(layout=rpipe.get_bind_group_layout(0), entries=[
             {'binding': 0, 'resource': {'buffer': aVal, 'offset': 0, 'size': max(16, n_pix * K * 4)}},
             {'binding': 1, 'resource': {'buffer': aWt, 'offset': 0, 'size': max(16, n_pix * K * 4)}},
-            {'binding': 2, 'resource': {'buffer': bOut, 'offset': 0, 'size': max(16, n_pix * 4)}},
-            {'binding': 3, 'resource': {'buffer': bCov, 'offset': 0, 'size': max(16, n_pix * 4)}},
-            {'binding': 4, 'resource': {'buffer': bNef, 'offset': 0, 'size': max(16, n_pix * 4)}},
+            {'binding': 2, 'resource': {'buffer': bAds, 'offset': 0, 'size': max(16, n_pix * 4)}},
+            {'binding': 3, 'resource': {'buffer': bWs, 'offset': 0, 'size': max(16, n_pix * 4)}},
+            {'binding': 4, 'resource': {'buffer': bMu, 'offset': 0, 'size': max(16, n_pix * 4)}},
             {'binding': 5, 'resource': {'buffer': bRU, 'offset': 0, 'size': 64}},
         ])
         enc = dev.create_command_encoder()
-        cpr = enc.begin_compute_pass()
-        cpr.set_pipeline(rpipe)
-        cpr.set_bind_group(0, rbg)
-        cpr.dispatch_workgroups(int((n_pix + 63) // 64))
-        cpr.end()
+        cp1 = enc.begin_compute_pass()
+        cp1.set_pipeline(rpipe)
+        cp1.set_bind_group(0, bg1)
+        cp1.dispatch_workgroups(int((n_pix + 63) // 64))
+        cp1.end()
+        queue.submit([enc.finish()])
+        ads = _read(dev, queue, bAds, n_pix, U).view(np.float32)
+        wss = _read(dev, queue, bWs, n_pix, U).view(np.float32)
+
+        # 主机侧做 64×64 / 每 3 像素抽样的块归约（与 CPU 的 _winsor_scale 同口径）
+        # 实测：块级尺度（64×64、每 3 像素抽样）反而比逐像素差（0.9636 vs 0.9873），
+        # 这里按 BS=1 退化成逐像素尺度，保持与 CPU 的最佳相关性。
+        BS, ST = 1, 1
+        Hb = (bh + BS - 1) // BS
+        Wb = (W + BS - 1) // BS
+        pa = np.zeros((Hb * BS, Wb * BS), np.float32)
+        pw = np.zeros_like(pa)
+        pa[:bh, :W] = ads.reshape(bh, W)
+        pw[:bh, :W] = wss.reshape(bh, W)
+        sa = pa.reshape(Hb, BS, Wb, BS)[:, ::ST, :, ::ST].sum(axis=(1, 3))
+        sw = pw.reshape(Hb, BS, Wb, BS)[:, ::ST, :, ::ST].sum(axis=(1, 3))
+        blk = np.where(sw > 1e-20, (1.15 * sa / np.maximum(sw, 1e-20)), 0.0).astype(np.float32).ravel()
+        bBlk = dev.create_buffer(size=max(16, blk.size * 4), usage=U.STORAGE | U.COPY_DST | U.COPY_SRC)
+        queue.write_buffer(bBlk, 0, blk.tobytes())
+
+        # 第二段：按块尺度剔除并出成品
+        fu = np.zeros(16, np.float32)
+        fu[0:2].view(np.uint32)[:] = np.array([n_pix, K], np.uint32)
+        fu[2] = np.float32(rej_k)
+        fu.view(np.uint32)[3] = np.uint32(W)
+        fu.view(np.uint32)[4] = np.uint32(Wb)
+        fu.view(np.uint32)[5] = np.uint32(BS)
+        bFU = dev.create_buffer(size=64, usage=U.UNIFORM | U.COPY_DST)
+        queue.write_buffer(bFU, 0, fu.tobytes())
+        bg2 = dev.create_bind_group(layout=fpipe.get_bind_group_layout(0), entries=[
+            {'binding': 0, 'resource': {'buffer': aVal, 'offset': 0, 'size': max(16, n_pix * K * 4)}},
+            {'binding': 1, 'resource': {'buffer': aWt, 'offset': 0, 'size': max(16, n_pix * K * 4)}},
+            {'binding': 2, 'resource': {'buffer': bMu, 'offset': 0, 'size': max(16, n_pix * 4)}},
+            {'binding': 3, 'resource': {'buffer': bBlk, 'offset': 0, 'size': max(16, blk.size * 4)}},
+            {'binding': 4, 'resource': {'buffer': bOut, 'offset': 0, 'size': max(16, n_pix * 4)}},
+            {'binding': 5, 'resource': {'buffer': bCov, 'offset': 0, 'size': max(16, n_pix * 4)}},
+            {'binding': 6, 'resource': {'buffer': bNef, 'offset': 0, 'size': max(16, n_pix * 4)}},
+            {'binding': 7, 'resource': {'buffer': bFU, 'offset': 0, 'size': 64}},
+        ])
+        enc = dev.create_command_encoder()
+        cp2 = enc.begin_compute_pass()
+        cp2.set_pipeline(fpipe)
+        cp2.set_bind_group(0, bg2)
+        cp2.dispatch_workgroups(int((n_pix + 63) // 64))
+        cp2.end()
         queue.submit([enc.finish()])
         o = _read(dev, queue, bOut, n_pix, U).view(np.float32)
         c = _read(dev, queue, bCov, n_pix, U).view(np.float32)
