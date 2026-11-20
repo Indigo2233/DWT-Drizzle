@@ -93,7 +93,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       let w = wgt * wx * wy / (Q.P * Q.P) * exp(Q.lnt);
       let slot = atomicAdd(&aCnt[idx], 1u);
       if (slot < u32(K)) {
-        aVal[idx * u32(K) + slot] = w * v;
+        // 存「未加权」的样本值：CPU 的锚点/中位数是在逐帧几何值上算的，
+        // 若这里存 w·v，帧权重不同会让中位数跑偏（实测差 0.7%）
+        aVal[idx * u32(K) + slot] = v;
         aWt[idx * u32(K) + slot] = w;
       }
     }
@@ -129,7 +131,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (w > 0.0) { nv = nv + 1u; }
   }
   if (ws <= 1e-20) { oAds[i] = 0.0; oWs[i] = 0.0; oMu[i] = 0.0; return; }
-  var mu: f32 = vs / ws;
+  var mu: f32 = 0.0;
   if (nv > 0u) {
     let half: u32 = nv / 2u;
     var done: bool = false;
@@ -200,7 +202,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let v = rVals[i * K + k];
     if (U.rej_k > 0.0 && abs(v - mu) > thr) { continue; }
     wk = wk + w;
-    vk = vk + v;
+    vk = vk + w * v;
     w2 = w2 + w * w;
   }
   if (wk <= 1e-20) { oOut[i] = 0.0; oCov[i] = 0.0; oNef[i] = 0.0; return; }
@@ -491,7 +493,8 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
         pw[:bh, :W] = wss.reshape(bh, W)
         sa = pa.reshape(Hb, BS, Wb, BS)[:, ::ST, :, ::ST].sum(axis=(1, 3))
         sw = pw.reshape(Hb, BS, Wb, BS)[:, ::ST, :, ::ST].sum(axis=(1, 3))
-        blk = np.where(sw > 1e-20, (1.15 * sa / np.maximum(sw, 1e-20)), 0.0).astype(np.float32).ravel()
+        _kc = float(os.environ.get('DWT_WINSOR_C', '1.15') or 1.15)
+        blk = np.where(sw > 1e-20, (_kc * sa / np.maximum(sw, 1e-20)), 0.0).astype(np.float32).ravel()
         bBlk = dev.create_buffer(size=max(16, blk.size * 4), usage=U.STORAGE | U.COPY_DST | U.COPY_SRC)
         queue.write_buffer(bBlk, 0, blk.tobytes())
 
