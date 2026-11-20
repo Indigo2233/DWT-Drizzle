@@ -3484,7 +3484,8 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                         return _sgs(fs, C, S, dx, dy, th, kk, drz_plan, A, B,
                                     pattern=_CFA['pattern'], channel=_CFA['ch'],
                                     R=_R2, pixfrac=_pf, rej_k=rej_k, log=log, n=n)
-                    raise
+                    raise RuntimeError('wgpu 真 CFA 后端不可用：%s: %s'
+                                       % (type(_e_bk).__name__, _e_bk))
                 from gpu_wgpu import stack_pws as _sg
                 return _sg(fs, C, S, dx, dy, th, kk, drz_plan, A, B,
                            sky=0.0, R=_R2, log=log, n=n)

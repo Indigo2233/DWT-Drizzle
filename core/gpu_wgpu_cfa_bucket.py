@@ -318,7 +318,7 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
     K = int(os.environ.get('DWT_BUCKET_K', K))
     # 桶深只由帧数决定（少了会溢出丢样本）；显存不够时缩短每条带的行数，
     # 而不是降低桶深——这一点在 51 帧实测里差别很大（K=16 溢出 9.35%）。
-    _ = int(os.environ.get('DWT_BUCKET_MB', '768'))
+    _ = int(os.environ.get('DWT_BUCKET_MB', '256'))
     stack = np.zeros((H, W), np.float32)
     cov = np.zeros((H, W), np.float32)
     neff = np.zeros((H, W), np.float32)
@@ -332,7 +332,7 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
         _need = len(idx) * int(h) * int(w) * 4
         if _need <= int(os.environ.get('DWT_FRAME_CACHE_MB', '1200')) * 1024 * 1024:
             _t0 = time.perf_counter()
-            _cache = [np.asarray(fs.frame(int(i)), np.float32) for i in idx]
+            _cache = [np.asarray(fs.frame(int(i)), dtype=np.float32) for i in idx]
             _t_cache = time.perf_counter() - _t0
     except Exception:
         _cache = None
@@ -344,12 +344,17 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
             _rr = _rr[np.ix_(_ys, _xs)]
     else:
         _rr = np.zeros((H, W), np.float32)
-    _rmap = None
     _t0 = time.perf_counter()
-    _rmap = _sbuf(dev, U, H * W)
-    queue.write_buffer(_rmap, 0, np.ascontiguousarray(_rr).tobytes())
+    if R is None:
+        # R 场为空时不要再分配整幅画布的 rmap（6248×4176 的全幅 2× 画布 ≈ 417 MB/进程，
+        # 8 进程并行时会直接把内存打爆：实测 MemoryError）
+        _rmap = _sbuf(dev, U, 4)
+        queue.write_buffer(_rmap, 0, np.zeros(4, np.float32).tobytes())
+    else:
+        _rmap = _sbuf(dev, U, H * W)
+        queue.write_buffer(_rmap, 0, np.ascontiguousarray(_rr).tobytes())
     _t_up += time.perf_counter() - _t0
-    _bud_mb = int(os.environ.get('DWT_BUCKET_MB', '768'))
+    _bud_mb = int(os.environ.get('DWT_BUCKET_MB', '256'))
     _rows_by_mem = max(32, int(_bud_mb * 1024 * 1024 // max(1, W * K * 8)))
     band_rows = int(min(band_rows, _rows_by_mem))
     for y0 in range(0, H, band_rows):
@@ -405,7 +410,7 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
             strips = [np.ascontiguousarray(x[j_lo:j_hi, :]) for x in _cache]
         else:
             strips = [np.ascontiguousarray(
-                np.asarray(fs.frame(int(i)), np.float32)[j_lo:j_hi, :]) for i in idx]
+                np.asarray(fs.frame(int(i)), dtype=np.float32)[j_lo:j_hi, :]) for i in idx]
         _t_read += time.perf_counter() - _t0
         big = np.concatenate([x.ravel() for x in strips]).astype(np.float32)
         _t0 = time.perf_counter()
