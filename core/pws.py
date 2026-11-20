@@ -3114,7 +3114,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         #      合成出来是一堆分开的红绿蓝点）。这里存的必须是**帧块修正之后**的
         #      dx/dy（sh 里是 measure_shifts 的原始值，不含裁剪原点与 master 折算）。
         # ----
-        if _CFA.get('want_share') or _CFA.get('auto_own'):
+        if _CFA.get('pattern') or _CFA.get('want_share') or _CFA.get('auto_own'):
             _geo = _CFA.get('geo')
             if _geo is None:
                 try:
@@ -3446,6 +3446,23 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                                     pattern=_CFA['pattern'], channel=_CFA['ch'],
                                     sky=0.0, R=_R2, rej_k=rej_k, log=log, n=n,
                                     pixfrac=_pf)
+                    try:
+                        # float 原子路径仍是实验性：默认走分桶后端（与 CPU 实测 0.987），
+                        # 需要尝鲜时 DWT_FATOM_ON=1
+                        if os.environ.get('DWT_FATOM_ON', '').strip() != '1':
+                            raise RuntimeError('fatom 未启用（默认分桶；DWT_FATOM_ON=1 开启实验路径）')
+                        from gpu_wgpu_cfa_fatom import stack_cfa_fatom as _sgf
+                        return _sgf(fs, C, S, dx, dy, th, kk, drz_plan, A, B,
+                                    rej_k=rej_k, rej_gate=rej_gate, R=_R2,
+                                    pixfrac=_pf, log=log, T=T, fp=fp,
+                                    pattern=_CFA['pattern'], channel=_CFA['ch'])
+                    except Exception as _e_fa:
+                        if os.environ.get('DWT_WGPU_DEBUG') == '1':
+                            import traceback as _tb
+                            _tb.print_exc()
+                        if os.environ.get('DWT_FATOM_ON', '').strip() == '1':
+                            log('[wgpu] float 原子散射不可用（%s: %s），退回分桶'
+                                % (type(_e_fa).__name__, _e_fa))
                     try:
                         if os.environ.get('DWT_WGPU_BUCKET_OFF', '').strip() == '1':
                             raise RuntimeError('bucket disabled by env')

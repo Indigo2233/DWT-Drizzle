@@ -131,7 +131,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     vs = vs + rVals[i * K + k];
   }
   if (ws <= 1e-20) { rOut[i] = 0.0; rCov[i] = 0.0; rNeff[i] = 0.0; return; }
-  let mu = vs / ws;
+  // 锚点用逐像素中位数（与 CPU 的 _drizzle_band 同口径：an = median(v)）
+  var nv: u32 = 0u;
+  for (var k: u32 = 0u; k < K; k = k + 1u) {
+    if (rWts[i * K + k] > 0.0) { nv = nv + 1u; }
+  }
+  var mu: f32 = 0.0;
+  if (nv > 0u) {
+    let half: u32 = nv / 2u;
+    var chosen: f32 = vs / ws;
+    var done: bool = false;
+    for (var k: u32 = 0u; k < K; k = k + 1u) {
+      if (done) { break; }
+      if (rWts[i * K + k] <= 0.0) { continue; }
+      let vk0 = rVals[i * K + k];
+      var less: u32 = 0u;
+      for (var j: u32 = 0u; j < K; j = j + 1u) {
+        if (rWts[i * K + j] <= 0.0) { continue; }
+        if (rVals[i * K + j] < vk0) { less = less + 1u; }
+      }
+      if (less == half) { chosen = vk0; done = true; }
+    }
+    mu = chosen;
+  }
   var var_: f32 = 0.0;
   for (var k: u32 = 0u; k < K; k = k + 1u) {
     let w = rWts[i * K + k];
