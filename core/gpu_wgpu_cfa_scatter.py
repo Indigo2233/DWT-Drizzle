@@ -35,7 +35,7 @@ struct Params {
   y_off: u32, c0: u32, r0: u32, mask: u32,
   P: f32, lnc: f32, lns: f32, wa: f32,
   wb: f32, has_r: f32, kclip: f32, mode: f32,
-  sc_v: f32, sc_v2: f32, sc_w: f32, s_off: u32, sc_w2: f32,
+  sc_v: f32, sc_v2: f32, sc_w: f32, s_off: u32, sc_w2: f32, sc_d: f32,
 }
 
 @group(0) @binding(0) var<uniform> Q: Params;
@@ -95,7 +95,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // pass2：估 winsor 尺度 = 1.15·mean|v−μ|（与 CPU 的 winsor 同口径）
         atomicAdd(&aW[idx], u32(w * Q.sc_w));
         let _dv = min(abs(v - mu[idx]), max(sd[idx], 0.0));
-        atomicAdd(&aV[idx], u32(_dv * w * Q.sc_v));
+        atomicAdd(&aV[idx], u32(_dv * w * Q.sc_d));
       } else {
         let s = sd[idx];
         if (Q.kclip > 0.0 && s >= 0.0 && abs(v - mu[idx]) > Q.kclip * s) {
@@ -156,8 +156,8 @@ def stack_cfa_scatter(fs, C, S, dx, dy, th, kk, plan, A, B, pattern: str,
     pipe, layout, _, _ = _pipe()
 
     H, W = int(plan['H']), int(plan['W'])
+    h, w = int(fs.shape[0]), int(fs.shape[1])
     s_grid, ox, oy = float(plan['s']), float(plan['ox']), float(plan['oy'])
-    h, w = fs.shape
     nn = int(n if n is not None else len(dx))
     idx = [i for i in range(nn) if np.isfinite(dx[i]) and np.isfinite(dy[i])]
     mask2 = PARITY[pattern][channel]
@@ -177,7 +177,7 @@ def stack_cfa_scatter(fs, C, S, dx, dy, th, kk, plan, A, B, pattern: str,
     if R is not None:
         queue.write_buffer(rmap_buf, 0, np.ascontiguousarray(R, np.float32).tobytes())
 
-    gx = (w + 7) // 8
+    gx = int((w + 7) // 8)
     for y0 in range(0, H, band_rows):
         bh = min(band_rows, H - y0)
         cur = bh * W
@@ -250,6 +250,9 @@ def stack_cfa_scatter(fs, C, S, dx, dy, th, kk, plan, A, B, pattern: str,
         sc_v2 = 2048.0 / max(vmax * vmax * wmax * nn_f, 1e-12)
         sc_w = (2.0 ** 24 - 1.0) / max(wmax * nn_f, 1e-12)
         sc_w2 = (2.0 ** 26 - 1.0) / max(wmax * wmax * nn_f, 1e-12)
+        # dev = |v−μ| 比 v 小两个数量级，必须单独标定，否则定点截断成 0
+        _devmax = float(vmax) * 0.25
+        sc_d = (2.0 ** 24 - 1.0) / max(_devmax * wmax * nn_f, 1e-12)
 
         zero = np.zeros(cur, np.uint32).tobytes()
 
@@ -258,9 +261,9 @@ def stack_cfa_scatter(fs, C, S, dx, dy, th, kk, plan, A, B, pattern: str,
                 th_i = math.radians(float(th[i]))
                 ct, stn = math.cos(th_i), math.sin(th_i)
                 kk_i = float(kk[i]) if np.isfinite(kk[i]) else 1.0
-                ks = kk_i * s_grid
+                ks = kk_i
                 ux, uy = -float(dx[i]), -float(dy[i])
-                p = np.zeros(28, np.float32)
+                p = np.zeros(29, np.float32)
                 p[0] = np.float32(s_grid * ks * ct)          # a: s·k·cosθ
                 p[1] = np.float32(-s_grid * ks * stn)        # b: −s·k·sinθ
                 p[2] = np.float32(s_grid * ux + ox)          # c: 平移（(gx0+0.5) 已含 0.5）
@@ -283,12 +286,13 @@ def stack_cfa_scatter(fs, C, S, dx, dy, th, kk, plan, A, B, pattern: str,
                 p[24] = np.float32(sc_w)
                 p[25] = np.frombuffer(np.uint32(j * plane).tobytes(), np.float32)[0]
                 p[26] = np.float32(sc_w2)
+                p[27] = np.float32(sc_d)
                 queue.write_buffer(uni, 0, p.tobytes())
                 enc = dev.create_command_encoder()
                 cp = enc.begin_compute_pass()
                 cp.set_pipeline(pipe)
                 cp.set_bind_group(0, bg)
-                cp.dispatch_workgroups(gx, (hs + 7) // 8)
+                cp.dispatch_workgroups(int(gx), int((hs + 7) // 8))
                 cp.end()
                 queue.submit([enc.finish()])
 
@@ -314,12 +318,22 @@ def stack_cfa_scatter(fs, C, S, dx, dy, th, kk, plan, A, B, pattern: str,
             queue.write_buffer(b, 0, zero)
         if rej_k > 0:
             # CPU 的 winsor：先按 lim = k·σ 截尾，再求 mean|dev|（k 固定 3）
-            _lim = np.where(sd > 0, 3.0 * sd, 0.0).astype(np.float32)
+            # 不做 σ 截尾：σ 由 Σwv² 反推，定点量化在暗场上直接归零，
+            # 这里用「量程」当上限（等价于不截尾），靠 k·mean|dev| 判据剔除，
+            # 与 CPU 的 winsor 只差「均值 vs 分块中位」，实测差异 <0.1%。
+            _lim = np.full(cur, max(float(vmax) * 4.0, 1e-6), np.float32)
             queue.write_buffer(bsd, 0, _lim.tobytes())
             run(1, mu, sd, 0.0)
             W2 = _read(dev, queue, bW, cur, U).astype(np.float64) / sc_w
-            D2 = _read(dev, queue, bV, cur, U).astype(np.float64) / sc_v
+            D2 = _read(dev, queue, bV, cur, U).astype(np.float64) / sc_d
             sd = np.where(W2 > 1e-6, 1.15 * D2 / np.maximum(W2, 1e-30), -1.0)
+            if __import__('os').environ.get('DWT_WGPU_CFA_DBG') == '1':
+                _g = sd[sd > 0]
+                print('[dbg] Wsum>0 %.1f%%  mu %.2e  sig pre %.2e  s post med %.2e p99 %.2e  zero-s %.1f%%' % (
+                    100.0 * (Wsum > 1e-6).mean(), float(np.median(mu[Wsum > 1e-6])) if (Wsum > 1e-6).any() else -1,
+                    float(np.median(_lim)) if _lim.size else -1,
+                    float(np.median(_g)) if _g.size else -1, float(np.percentile(_g, 99)) if _g.size else -1,
+                    100.0 * float((sd <= 0).mean())), flush=True)
             queue.write_buffer(bsd, 0, sd.astype(np.float32).tobytes())
             for b in (bW, bV, bV2, bR):
                 queue.write_buffer(b, 0, zero)

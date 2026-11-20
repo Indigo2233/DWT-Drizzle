@@ -3446,6 +3446,20 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                                     pattern=_CFA['pattern'], channel=_CFA['ch'],
                                     sky=0.0, R=_R2, rej_k=rej_k, log=log, n=n,
                                     pixfrac=_pf)
+                    try:
+                        if os.environ.get('DWT_WGPU_BUCKET_OFF', '').strip() == '1':
+                            raise RuntimeError('bucket disabled by env')
+                        from gpu_wgpu_cfa_bucket import stack_cfa_bucket as _sgb
+                        return _sgb(fs, C, S, dx, dy, th, kk, drz_plan, A, B,
+                                    rej_k=rej_k, rej_gate=rej_gate, R=_R2,
+                                    pixfrac=_pf, log=log,
+                                    pattern=_CFA['pattern'], channel=_CFA['ch'])
+                    except Exception as _e_bk:
+                        if os.environ.get('DWT_WGPU_DEBUG') == '1':
+                            import traceback as _tb
+                            _tb.print_exc()
+                        log('[wgpu] 分桶后端不可用（%s: %s），退回定点散射'
+                            % (type(_e_bk).__name__, _e_bk))
                     from gpu_wgpu_cfa_scatter import stack_cfa_scatter as _sgs
                     return _sgs(fs, C, S, dx, dy, th, kk, drz_plan, A, B,
                                 pattern=_CFA['pattern'], channel=_CFA['ch'],
@@ -3470,6 +3484,9 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             except Exception as _e_wgpu:
                 if not _use_wgpu:
                     raise
+                if os.environ.get('DWT_WGPU_DEBUG') == '1':
+                    import traceback as _tb
+                    _tb.print_exc()
                 log('[wgpu] 出错，改用 CPU 重算本组：%s: %s'
                     % (type(_e_wgpu).__name__, _e_wgpu))
                 _use_wgpu = False
