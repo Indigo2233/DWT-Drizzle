@@ -101,6 +101,82 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 """
 
+
+# 归约核：每个输出像素读自己的 K 个桶，算 μ/σ/winsor 尺度、剔除、出成品。
+# 这一步不需要原子操作，纯读改写，放在 GPU 上做可以把主机从 7~13s 的统计里解放出来。
+_REDUCE_WGSL = """
+struct RU {
+  n_pix: u32,
+  K: u32,
+  rej_k: f32,
+};
+
+@group(0) @binding(0) var<storage, read> rVals: array<f32>;
+@group(0) @binding(1) var<storage, read> rWts: array<f32>;
+@group(0) @binding(2) var<storage, read_write> rOut: array<f32>;
+@group(0) @binding(3) var<storage, read_write> rCov: array<f32>;
+@group(0) @binding(4) var<storage, read_write> rNeff: array<f32>;
+@group(0) @binding(5) var<uniform> U: RU;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= U.n_pix) { return; }
+  let K = U.K;
+  var ws: f32 = 0.0;
+  var vs: f32 = 0.0;
+  for (var k: u32 = 0u; k < K; k = k + 1u) {
+    let w = rWts[i * K + k];
+    ws = ws + w;
+    vs = vs + rVals[i * K + k];
+  }
+  if (ws <= 1e-20) { rOut[i] = 0.0; rCov[i] = 0.0; rNeff[i] = 0.0; return; }
+  let mu = vs / ws;
+  var var_: f32 = 0.0;
+  for (var k: u32 = 0u; k < K; k = k + 1u) {
+    let w = rWts[i * K + k];
+    let d = rVals[i * K + k] - mu;
+    var_ = var_ + w * d * d;
+  }
+  let sd = sqrt(max(var_ / ws, 0.0));
+  let lim = 3.0 * sd;
+  var ads: f32 = 0.0;
+  for (var k: u32 = 0u; k < K; k = k + 1u) {
+    let w = rWts[i * K + k];
+    let d = abs(rVals[i * K + k] - mu);
+    ads = ads + w * min(d, lim);
+  }
+  let thr = U.rej_k * 1.15 * ads / ws;
+  var wk: f32 = 0.0;
+  var vk: f32 = 0.0;
+  var w2: f32 = 0.0;
+  for (var k: u32 = 0u; k < K; k = k + 1u) {
+    let w = rWts[i * K + k];
+    if (w <= 0.0) { continue; }
+    let v = rVals[i * K + k];
+    if (U.rej_k > 0.0 && abs(v - mu) > thr) { continue; }
+    wk = wk + w;
+    vk = vk + v;
+    w2 = w2 + w * w;
+  }
+  if (wk <= 1e-20) { rOut[i] = 0.0; rCov[i] = 0.0; rNeff[i] = 0.0; return; }
+  rOut[i] = vk / wk;
+  rCov[i] = wk;
+  rNeff[i] = (wk * wk) / max(w2, 1e-20);
+}
+"""
+
+
+def _rpipe(dev):
+    key = 'rpipe'
+    if key in _cache:
+        return _cache[key]
+    mod = dev.create_shader_module(code=_REDUCE_WGSL)
+    pipe = dev.create_compute_pipeline(
+        layout='auto', compute={'module': mod, 'entry_point': 'main'})
+    _cache[key] = pipe
+    return pipe
+
 _cache: Dict[str, object] = {}
 
 
@@ -159,8 +235,12 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
     rej_k = float(rej_k or 0.0)
     # 每像素桶深按帧数自适应：一个输出像素最多被「每帧 ~1 个样本」命中，
     # 再加少量余量给 2×/pixfrac<1 的重叠；同时受显存预算约束。
-    K = 8
-    while K < len(idx) + 4 and K < 32:
+    # 桶深要按「液滴摊到的输出像素数」放大：2× / pixfrac<1 时一个源样本会落进
+    # 最多 4 个输出像素，同一个像素因此可能收到 ~n·(pixfrac·s)² 个样本。
+    _spread = max(1.0, float(pixfrac) * s_grid)
+    _need = int(min(128, max(16, round(len(idx) * _spread * _spread) + 4)))
+    K = 16
+    while K < _need and K < 128:
         K *= 2
     if kslots:
         K = int(kslots)
@@ -316,50 +396,44 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
 
         _t0 = time.perf_counter()
         cnt = _read(dev, queue, aCnt, bh * W, U)
-        # _read 返回的是 uint32 视图，必须 view(float32) 再转 float64，
-        # 否则读回来的是 IEEE754 位模式（整数），全部错位。
-        vals = _read(dev, queue, aVal, bh * W * K, U).view(np.float32)
-        wts = _read(dev, queue, aWt, bh * W * K, U).view(np.float32)
-        _t_back += time.perf_counter() - _t0
-        _t0 = time.perf_counter()
-
-        if __import__('os').environ.get('DWT_BK_RAW') == '1':
-            print('[raw] cnt[:6]', cnt[:6].view(np.uint32))
-            print('[raw] val[:6]', vals[:6])
-            print('[raw] wt [:6]', wts[:6])
         cnt_i = cnt.astype(np.int64)
         spill += int(np.maximum(cnt_i - K, 0).sum())
-        Vm = vals.reshape(bh * W, K)
-        Wm = wts.reshape(bh * W, K)
-        ok = Wm > 0
-        Wsum = Wm.sum(axis=1, dtype=np.float64)
-        Vsum = Vm.sum(axis=1, dtype=np.float64)
-        with np.errstate(invalid='ignore', divide='ignore'):
-            mu = np.where(Wsum > 1e-12, Vsum / np.maximum(Wsum, 1e-30), 0.0)
-            dv = np.abs(Vm - mu[:, None].astype(np.float32)) * ok
-            var = (Wm * dv * dv).sum(axis=1, dtype=np.float64) / np.maximum(Wsum, 1e-30)
-            sd = np.sqrt(np.maximum(var, 0.0))
-            lim = 3.0 * sd
-            devc = np.minimum(dv, lim[:, None].astype(np.float32))
-            s = np.where(Wsum > 1e-12,
-                         1.15 * (Wm * devc).sum(axis=1, dtype=np.float64) / np.maximum(Wsum, 1e-30), 0.0)
-            if rej_k > 0:
-                keep = ok & (np.abs(Vm - mu[:, None].astype(np.float32))
-                         <= (rej_k * s[:, None]).astype(np.float32))
-            else:
-                keep = ok
-            Wk = np.where(keep, Wm, np.float32(0.0))
-            Vk = np.where(keep, Vm, np.float32(0.0))
-            Wk_sum = Wk.sum(axis=1, dtype=np.float64)
-            out = np.where(Wk_sum > 1e-12, Vk.sum(axis=1, dtype=np.float64) / np.maximum(Wk_sum, 1e-30), 0.0)
-            w2 = (Wk * Wk).sum(axis=1, dtype=np.float64)
-        stack[y0:y0 + bh, :] = out.reshape(bh, W).astype(np.float32)
+        _t_back += time.perf_counter() - _t0
+        _t0 = time.perf_counter()
+        # 归约放到 GPU：主机只读回 out/cov/neff 三个小数组（各 bh*W 个 float），
+        # 不再读回 K 倍放大的桶数组，51 帧实测把 1.9s 读回 + 7s 统计降到 0.1s 级。
+        n_pix = int(bh * W)
+        bOut = _sbuf(dev, U, n_pix)
+        bCov = _sbuf(dev, U, n_pix)
+        bNef = _sbuf(dev, U, n_pix)
+        ru = np.zeros(16, np.float32)
+        ru[0:2].view(np.uint32)[:] = np.array([n_pix, K], np.uint32)
+        ru[2] = np.float32(rej_k)
+        bRU = dev.create_buffer(size=64, usage=U.UNIFORM | U.COPY_DST)
+        queue.write_buffer(bRU, 0, ru.tobytes())
+        rpipe = _rpipe(dev)
+        rbg = dev.create_bind_group(layout=rpipe.get_bind_group_layout(0), entries=[
+            {'binding': 0, 'resource': {'buffer': aVal, 'offset': 0, 'size': max(16, n_pix * K * 4)}},
+            {'binding': 1, 'resource': {'buffer': aWt, 'offset': 0, 'size': max(16, n_pix * K * 4)}},
+            {'binding': 2, 'resource': {'buffer': bOut, 'offset': 0, 'size': max(16, n_pix * 4)}},
+            {'binding': 3, 'resource': {'buffer': bCov, 'offset': 0, 'size': max(16, n_pix * 4)}},
+            {'binding': 4, 'resource': {'buffer': bNef, 'offset': 0, 'size': max(16, n_pix * 4)}},
+            {'binding': 5, 'resource': {'buffer': bRU, 'offset': 0, 'size': 64}},
+        ])
+        enc = dev.create_command_encoder()
+        cpr = enc.begin_compute_pass()
+        cpr.set_pipeline(rpipe)
+        cpr.set_bind_group(0, rbg)
+        cpr.dispatch_workgroups(int((n_pix + 63) // 64))
+        cpr.end()
+        queue.submit([enc.finish()])
+        o = _read(dev, queue, bOut, n_pix, U).view(np.float32)
+        c = _read(dev, queue, bCov, n_pix, U).view(np.float32)
+        nf = _read(dev, queue, bNef, n_pix, U).view(np.float32)
+        stack[y0:y0 + bh, :] = o.reshape(bh, W)
+        cov[y0:y0 + bh, :] = c.reshape(bh, W)
+        neff[y0:y0 + bh, :] = nf.reshape(bh, W)
         _t_host += time.perf_counter() - _t0
-        cov[y0:y0 + bh, :] = Wk_sum.reshape(bh, W).astype(np.float32)
-        with np.errstate(invalid='ignore', divide='ignore'):
-            neff[y0:y0 + bh, :] = np.where(Wk_sum > 1e-12,
-                                           (Wk_sum * Wk_sum) / np.maximum(w2, 1e-12), 0.0
-                                           ).reshape(bh, W).astype(np.float32)
 
     if _prof:
         print('[prof] cache %.1fs  read %.1fs  up %.1fs  gpu %.1fs  back %.1fs  host %.1fs'
