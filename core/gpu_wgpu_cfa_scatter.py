@@ -149,6 +149,12 @@ def stack_cfa_scatter(fs, C, S, dx, dy, th, kk, plan, A, B, pattern: str,
                       channel: str = 'G', R=None, pixfrac: float = 1.0,
                       rej_k: float = 0.0, log=None, n=None,
                       band_rows: int = 512):
+    # 定点原子加的动态范围只够「pixfrac×倍率 ≈ 1」——液滴被摊到 2×2 输出像素后，
+    # 权重与偏差的比值超出 u32 定点可表示范围，会出现覆盖空洞。非该工况请用分桶后端。
+    _pd = float(pixfrac) * float(drz_plan.get('s', 1.0))
+    if abs(_pd - 1.0) > 0.02:
+        raise RuntimeError('定点散射后端仅支持 pixfrac×倍率≈1（当前 %.2f），请改用分桶后端' % _pd)
+
     """逐源像素散射（定点原子加）。返回与 stack_drizzle 同结构的字典。"""
     wgpu = _wp()
     U = wgpu.BufferUsage

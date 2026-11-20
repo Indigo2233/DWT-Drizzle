@@ -24,6 +24,7 @@ import math
 from typing import Dict, Optional
 
 import os
+import time
 import numpy as np
 
 try:
@@ -171,6 +172,30 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
     spill = 0
     _mask2 = None
 
+    _prof = os.environ.get('DWT_BUCKET_PROF') == '1'
+    _t_cache = _t_read = _t_up = _t_gpu = _t_back = _t_host = 0.0
+    _cache = None
+    try:
+        _need = len(idx) * int(h) * int(w) * 4
+        if _need <= int(os.environ.get('DWT_FRAME_CACHE_MB', '1200')) * 1024 * 1024:
+            _t0 = time.perf_counter()
+            _cache = [np.asarray(fs.frame(int(i)), np.float32) for i in idx]
+            _t_cache = time.perf_counter() - _t0
+    except Exception:
+        _cache = None
+    if R is not None:
+        _rr = np.asarray(R, np.float32)
+        if _rr.shape != (H, W):
+            _ys = np.linspace(0, _rr.shape[0] - 1, H).astype(np.int32)
+            _xs = np.linspace(0, _rr.shape[1] - 1, W).astype(np.int32)
+            _rr = _rr[np.ix_(_ys, _xs)]
+    else:
+        _rr = np.zeros((H, W), np.float32)
+    _rmap = None
+    _t0 = time.perf_counter()
+    _rmap = _sbuf(dev, U, H * W)
+    queue.write_buffer(_rmap, 0, np.ascontiguousarray(_rr).tobytes())
+    _t_up += time.perf_counter() - _t0
     for y0 in range(0, H, band_rows):
         bh = min(band_rows, H - y0)
         Ylo, Yhi = y0 - 2.0 * pixfrac * s_grid - 4, y0 + bh + 2.0 * pixfrac * s_grid + 4
@@ -204,7 +229,6 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
                                  usage=U.STORAGE | U.COPY_SRC | U.COPY_DST)
         aVal = _sbuf(dev, U, bh * W * K)
         aWt = _sbuf(dev, U, bh * W * K)
-        rmap = _sbuf(dev, U, H * W)
         uni = dev.create_buffer(size=128, usage=U.UNIFORM | U.COPY_DST)
 
         bg = dev.create_bind_group(layout=bgl, entries=[
@@ -216,25 +240,22 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
                                         'size': max(16, bh * W * K * 4)}},
             {'binding': 4, 'resource': {'buffer': aWt, 'offset': 0,
                                         'size': max(16, bh * W * K * 4)}},
-            {'binding': 5, 'resource': {'buffer': rmap, 'offset': 0, 'size': max(16, H * W * 4)}},
+            {'binding': 5, 'resource': {'buffer': _rmap, 'offset': 0, 'size': max(16, H * W * 4)}},
         ])
 
         # 只上传本带需要的数据：每帧 j_lo..j_hi 的连续行
-        strips = []
-        for i in idx:
-            st = np.ascontiguousarray(
-                np.asarray(fs.frame(int(i)), np.float32)[j_lo:j_hi, :])
-            strips.append(st)
+        _t0 = time.perf_counter()
+        if _cache is not None:
+            strips = [np.ascontiguousarray(x[j_lo:j_hi, :]) for x in _cache]
+        else:
+            strips = [np.ascontiguousarray(
+                np.asarray(fs.frame(int(i)), np.float32)[j_lo:j_hi, :]) for i in idx]
+        _t_read += time.perf_counter() - _t0
         big = np.concatenate([x.ravel() for x in strips]).astype(np.float32)
+        _t0 = time.perf_counter()
         queue.write_buffer(src_big, 0, big.tobytes())
+        _t_up += time.perf_counter() - _t0
         del big
-
-        rr = np.zeros((H, W), np.float32) if R is None else np.asarray(R, np.float32)
-        if rr.shape != (H, W):
-            ys = np.linspace(0, rr.shape[0] - 1, H).astype(np.int32)
-            xs = np.linspace(0, rr.shape[1] - 1, W).astype(np.int32)
-            rr = rr[np.ix_(ys, xs)]
-        queue.write_buffer(rmap, 0, np.ascontiguousarray(rr).tobytes())
 
         zero4 = np.zeros(max(1, bh * W), np.uint32).tobytes()
         queue.write_buffer(aCnt, 0, zero4)
@@ -282,13 +303,18 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
             cp.set_bind_group(0, bg)
             cp.dispatch_workgroups(int((w + 7) // 8), int((hs + 7) // 8))
             cp.end()
+            _t0 = time.perf_counter()
             queue.submit([enc.finish()])
+            _t_gpu += time.perf_counter() - _t0
 
+        _t0 = time.perf_counter()
         cnt = _read(dev, queue, aCnt, bh * W, U)
         # _read 返回的是 uint32 视图，必须 view(float32) 再转 float64，
         # 否则读回来的是 IEEE754 位模式（整数），全部错位。
         vals = _read(dev, queue, aVal, bh * W * K, U).view(np.float32).astype(np.float64)
         wts = _read(dev, queue, aWt, bh * W * K, U).view(np.float32).astype(np.float64)
+        _t_back += time.perf_counter() - _t0
+        _t0 = time.perf_counter()
 
         if __import__('os').environ.get('DWT_BK_RAW') == '1':
             print('[raw] cnt[:6]', cnt[:6].view(np.uint32))
@@ -319,12 +345,16 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
             out = np.where(Wk_sum > 1e-12, Vk.sum(axis=1) / np.maximum(Wk_sum, 1e-30), 0.0)
             w2 = (Wk * Wk).sum(axis=1)
         stack[y0:y0 + bh, :] = out.reshape(bh, W).astype(np.float32)
+        _t_host += time.perf_counter() - _t0
         cov[y0:y0 + bh, :] = Wk_sum.reshape(bh, W).astype(np.float32)
         with np.errstate(invalid='ignore', divide='ignore'):
             neff[y0:y0 + bh, :] = np.where(Wk_sum > 1e-12,
                                            (Wk_sum * Wk_sum) / np.maximum(w2, 1e-12), 0.0
                                            ).reshape(bh, W).astype(np.float32)
 
+    if _prof:
+        print('[prof] cache %.1fs  read %.1fs  up %.1fs  gpu %.1fs  back %.1fs  host %.1fs'
+              % (_t_cache, _t_read, _t_up, _t_gpu, _t_back, _t_host), flush=True)
     if log:
         log('[wgpu] 真 CFA：分桶叠加（K=%d，每像素 float 样本，判据与 CPU 一致）' % K)
         if spill:
