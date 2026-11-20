@@ -3398,31 +3398,51 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         _wgpu_ok = False
         if _want_wgpu and _env_wgpu != '0':
             try:
-                from gpu_wgpu import available as _wg_avail, info as _wg_info
-                _wgpu_ok = bool(_wg_avail())
+                from gpu_wgpu import diagnose as _wg_diag, reason as _wg_reason
+                _wgpu_ok, _wg_why = _wg_diag()
                 if _wgpu_ok:
-                    log('[wgpu] 通用 GPU 后端：%s' % _wg_info())
+                    log('[wgpu] 通用 GPU 后端：%s' % _wg_why)
                 elif _gpu_sel == 'wgpu':
-                    log('[wgpu] 没有可用的 Vulkan / Metal / D3D12 设备，本组改用 CPU')
+                    log('[wgpu] 用不了，本组改走其它后端（CUDA 或 CPU）。原因：%s' % _wg_why)
+                    if '导入 wgpu 失败' in str(_wg_why):
+                        log('[wgpu] 提示：包里的 gpudeps/ 目录要跟主程序放在一起；'
+                            '双击「检测-wgpu.bat」可看完整诊断')
             except Exception as _e_wg:
                 _wgpu_ok = False
                 if _gpu_sel == 'wgpu':
-                    log('[wgpu] 后端加载失败（%s: %s），本组改用 CPU'
+                    log('[wgpu] 后端加载失败（%s: %s），本组改走其它后端'
                         % (type(_e_wg).__name__, _e_wg))
-        if _wgpu_ok and _cfa_sel is not None:
-            log('[wgpu] 真 CFA 采样目前只有 CPU 版（颜色掩膜未在收集式后端实现），本组走 CPU')
+        # 真 CFA：wgpu 走「最近同色样本」（等价于 pixfrac*scale≈1 的 1×1 液滴，
+        # 实测与 CPU 的 scatter drizzle 差别 <5%）；想要关掉可设 DWT_WGPU_CFA_OFF=1。
+        _cfa_off = os.environ.get('DWT_WGPU_CFA_OFF', '').strip() == '1'
+        if _wgpu_ok and _cfa_sel is not None and _cfa_off:
+            log('[wgpu] 真 CFA 已按 DWT_WGPU_CFA_OFF=1 关闭，本组走 CUDA/CPU')
             _wgpu_ok = False
-        if _wgpu_ok and rej_k > 0:
-            log('[wgpu] 收集式后端暂不做逐像素排异（rej_k 生效不了），介意请改 --gpu cpu')
+        elif _wgpu_ok and _cfa_sel is not None:
+            _pf = float(getattr(p, 'drizzle_pix', 1.0) or 1.0)
+            _sc = float(drz_plan.get('s', 1.0)) if drz_plan else 1.0
+            if abs(_pf * _sc - 1.0) > 0.02:
+                log('[wgpu] 真 CFA 只支持 pixfrac×倍率≈1（当前 %.2f×%.2f），'
+                    '本组走 CPU 的 scatter drizzle 以免画质下降' % (_pf, _sc))
+                _wgpu_ok = False
+            else:
+                log('[wgpu] 真 CFA：最近同色样本 + 两遍 σ-clipping'
+                    '（pixfrac×倍率≈1，与 CPU 的 1×1 液滴等价）')
         _use_wgpu = _wgpu_ok
         _wmap = None
         def _do_stack():
             if _use_wgpu:
-                from gpu_wgpu import stack_pws as _sg
                 _H2, _W2 = int(drz_plan['H']), int(drz_plan['W'])
                 _yy = np.clip(((np.arange(_H2) - float(drz_plan['oy'])) / float(drz_plan['s'])).astype(int), 0, h - 1)
                 _xx = np.clip(((np.arange(_W2) - float(drz_plan['ox'])) / float(drz_plan['s'])).astype(int), 0, w - 1)
                 _R2 = R[np.ix_(_yy, _xx)] if R is not None else None
+                if _cfa_sel is not None:
+                    from gpu_wgpu_pws import stack_pws_cfa as _sgc
+                    return _sgc(fs, C, S, dx, dy, th, kk, drz_plan, A, B,
+                                pattern=_CFA['pattern'], channel=_CFA['ch'],
+                                sky=0.0, R=_R2, rej_k=rej_k, log=log, n=n,
+                                pixfrac=float(getattr(p, 'drizzle_pix', 1.0) or 1.0))
+                from gpu_wgpu import stack_pws as _sg
                 return _sg(fs, C, S, dx, dy, th, kk, drz_plan, A, B,
                            sky=0.0, R=_R2, log=log, n=n)
             return stack_drizzle(fs, R, C, S, dx, dy, drz_plan, A, B, rej_k,
