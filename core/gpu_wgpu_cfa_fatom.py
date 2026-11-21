@@ -327,7 +327,15 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
         except Exception:
             _maxb = 1 << 31
         _ring = (len(idx) * plane * 4) > int(_maxb * 0.9)
-        bSrc = sbuf(plane if _ring else len(idx) * plane)
+        # 环形模式用两块缓冲轮流：GPU 算第 k 帧（读 buf0）时，队列里第 k+1 帧的拷贝
+        # 可以写 buf1，两者在硬件上重叠；只用一块会让「拷贝→计算」严格串行
+        # （实测窗口内 GPU 占用 P50 只有 22%）。
+        if _ring:
+            bSrcs = [sbuf(plane), sbuf(plane)]
+            bSrc = bSrcs[0]
+        else:
+            bSrcs = [sbuf(len(idx) * plane)]
+            bSrc = bSrcs[0]
         # 帧数据不在这里上传：交给 scatter(0) 逐帧「上传一帧 → 派发一帧」，
         # 让主机的拷贝与 GPU 的计算重叠（全幅 8 帧实测 5.7s → 约 4s）。
 
@@ -361,11 +369,12 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
                     # 叠加 memmap + 常驻画布后仍可能 MemoryError（用户实测踩到）。256 行一块，
                     # 主机峰值只要 6.4 MB。
                     _CH = 256
+                    _buse = bSrcs[k % len(bSrcs)] if _ring else bSrc
                     _base = 0 if _ring else (k * plane * 4)
                     for _r0 in range(int(lo), int(hi), _CH):
                         _r1 = min(int(hi), _r0 + _CH)
                         _st = np.asarray(fs.strip(int(j), int(_r0), int(_r1)), np.float32)
-                        queue.write_buffer(bSrc,
+                        queue.write_buffer(_buse,
                                            _base + (_r0 - int(lo)) * int(w) * 4,
                                            memoryview(np.ascontiguousarray(_st)))
                         del _st
@@ -396,7 +405,7 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
                         p[0]*(w*0.5+0.5) + p[1]*(hs*0.5+0.5) + p[2],
                         p[3]*(w*0.5+0.5) + p[4]*(hs*0.5+0.5) + p[5]), flush=True)
                 bg = dev.create_bind_group(layout=bgl, entries=[
-                    {'binding': 0, 'resource': {'buffer': bSrc, 'offset': 0,
+                    {'binding': 0, 'resource': {'buffer': bSrcs[k % len(bSrcs)], 'offset': 0,
                                  'size': (plane if _ring else len(idx) * plane) * 4}},
                     {'binding': 1, 'resource': {'buffer': bR, 'offset': 0, 'size': rsz}},
                     {'binding': 2, 'resource': {'buffer': bQk, 'offset': 0, 'size': 128}},
