@@ -271,6 +271,17 @@ def _sbuf(dev, U, n):
                              usage=U.STORAGE | U.COPY_SRC | U.COPY_DST)
 
 
+_RB_BYTES = 0
+
+
+def _rd(dev, queue, buf, n, U):
+    global _RB_BYTES
+    try:
+        _RB_BYTES += int(n) * 4
+    except Exception:
+        pass
+    return _read(dev, queue, buf, n, U)
+
 def _read(dev, queue, buf, n, U):
     try:
         from .gpu_wgpu_cfa_scatter import _read as _r
@@ -287,6 +298,12 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
                      R=None, pixfrac=1.0, band_rows=512, kslots=None,
                      T=None, fp=1.0,
                      log=None, pattern=None, channel=None, **kw):
+    import time as _t
+    _t0 = _t.perf_counter()
+    _gpu_s = 0.0
+    _rb_b = 0
+    if log:
+        log('[wgpu][start] ts=%.3f backend=bucket frames=%d scale=%.2f pixfrac=%.2f' % (time.time(), len(np.flatnonzero(np.isfinite(np.asarray(dx)))), float(plan.get('s', 1.0)), float(pixfrac)))
     """返回 dict(stack, cov, neff, ...)，与 drizzle.stack_drizzle 的返回键兼容。"""
     if not available():
         raise RuntimeError('wgpu 不可用')
@@ -412,8 +429,10 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
         if _cache is not None:
             strips = [np.ascontiguousarray(x[j_lo:j_hi, :]) for x in _cache]
         else:
+            # 只取本带需要的行：fs.frame() 会把整帧（6248×4176）算一遍再切片，
+            # 60 帧 × 17 带 = 百余 GB 的主机内存搬运，是 wgpu 路径最大的浪费。
             strips = [np.ascontiguousarray(
-                np.asarray(fs.frame(int(i)), dtype=np.float32)[j_lo:j_hi, :]) for i in idx]
+                fs.strip(int(i), int(j_lo), int(j_hi)), dtype=np.float32) for i in idx]
         _t_read += time.perf_counter() - _t0
         big = np.concatenate([x.ravel() for x in strips]).astype(np.float32)
         _t0 = time.perf_counter()
@@ -474,7 +493,7 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
             _t_gpu += time.perf_counter() - _t0
 
         _t0 = time.perf_counter()
-        cnt = _read(dev, queue, aCnt, bh * W, U)
+        cnt = _rd(dev, queue, aCnt, bh * W, U)
         cnt_i = cnt.astype(np.int64)
         spill += int(np.maximum(cnt_i - K, 0).sum())
         _t_back += time.perf_counter() - _t0
@@ -560,7 +579,7 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
             {'binding': 5, 'resource': {'buffer': bU1, 'offset': 0, 'size': 64}},
         ])
         _run(spipe, bg1, (n_pix + 63) // 64)
-        sdp = _read(dev, queue, bSd, n_pix, U).view(np.float32)
+        sdp = _rd(dev, queue, bSd, n_pix, U).view(np.float32)
 
         # lim = max(2, rej_k) · 块内 σ 均值（CPU 的 _winsor_scale 第一步）
         _mb = _block_mean_small(sdp.reshape(bh, W), bh, W, BS, ST, use_pos=True)
@@ -586,8 +605,8 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
             {'binding': 6, 'resource': {'buffer': bU2, 'offset': 0, 'size': 64}},
         ])
         _run(cpipe, bg2, (n_pix + 63) // 64)
-        ads = _read(dev, queue, bAds, n_pix, U).view(np.float32)
-        wss = _read(dev, queue, bWs, n_pix, U).view(np.float32)
+        ads = _rd(dev, queue, bAds, n_pix, U).view(np.float32)
+        wss = _rd(dev, queue, bWs, n_pix, U).view(np.float32)
 
         # scale = 1.15 · 块内 Σw|dev| / Σw（CPU 的 _winsor_scale 第二步）
         _kc = float(os.environ.get('DWT_WINSOR_C', '1.15') or 1.15)
@@ -617,9 +636,9 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
             {'binding': 7, 'resource': {'buffer': bU3b, 'offset': 0, 'size': 64}},
         ])
         _run(fpipe, bg3, (n_pix + 63) // 64)
-        o = _read(dev, queue, bOut, n_pix, U).view(np.float32)
-        c = _read(dev, queue, bCov, n_pix, U).view(np.float32)
-        nf = _read(dev, queue, bNef, n_pix, U).view(np.float32)
+        o = _rd(dev, queue, bOut, n_pix, U).view(np.float32)
+        c = _rd(dev, queue, bCov, n_pix, U).view(np.float32)
+        nf = _rd(dev, queue, bNef, n_pix, U).view(np.float32)
         stack[y0:y0 + bh, :] = o.reshape(bh, W)
         cov[y0:y0 + bh, :] = c.reshape(bh, W)
         neff[y0:y0 + bh, :] = nf.reshape(bh, W)
@@ -633,6 +652,9 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
         if spill:
             log('[wgpu] 桶溢出 %d 个样本（占 %.2f%%，不影响成品）'
                 % (spill, 100.0 * spill / max(1, int(cov.size) * max(1, len(idx)))))
+    if log:
+        log('[wgpu][done] ts=%.3f backend=bucket wall_s=%.1f readback_mb=%.1f fallbacks=0'
+        % (time.time(), _t.perf_counter() - _t0, (float(_RB_BYTES)) / (1024.0 * 1024.0)))
     return {'stack': stack, 'cov': cov, 'neff': neff,
             'wmax': float(cov.max()), 'rej_rate': 0.0, 'n_used': len(idx),
             'plan': plan, 'backend': 'wgpu-bucket'}

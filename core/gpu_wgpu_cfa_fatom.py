@@ -13,7 +13,10 @@ float 缓冲；每条带把帧数据上传一次，三遍扫描都在显存里�
 """
 from __future__ import annotations
 
+import math
 import os
+import time
+import time
 from typing import Dict
 
 import numpy as np
@@ -30,7 +33,7 @@ struct QP {
   w_src: u32, h_src: u32, w_out: u32, h_out: u32,
   y_off: u32, c0: u32, r0: u32, mask: u32,
   P: f32, lnc: f32, lns: f32, wa: f32, wb: f32, has_r: f32, kclip: f32,
-  mode: f32, s_off: u32, lnt: f32,
+  mode: f32, s_off: u32, lnt: f32, mgate: f32, sky: f32, sfac: f32,
 };
 
 @group(0) @binding(0) var<storage, read> src: array<f32>;
@@ -42,6 +45,7 @@ struct QP {
 @group(0) @binding(6) var<storage, read> mu: array<f32>;
 @group(0) @binding(7) var<storage, read> sd: array<f32>;
 @group(0) @binding(8) var<storage, read_write> aW2: array<atomic<f32>>;
+@group(0) @binding(9) var<storage, read_write> aBad: array<atomic<u32>>;
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -98,7 +102,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       } else {
         // 分块尺度只在抽样点上有值；其余像素退回本像素的 1.15·Σw|dev|/Σw
         let sref = select(1.15 * aDev[idx] / max(aW[idx], 1e-20), sd[idx], sd[idx] > 1e-20);
-        if (Q.kclip > 0.0 && abs(v - mu[idx]) > Q.kclip * sref) { continue; }
+        let rr = select(0.5, rmap[idx], Q.has_r > 0.5);
+        let sigv = max(mu[idx] - Q.sky, 0.0);
+        let thr = Q.kclip * sref * Q.sfac + Q.mgate * rr * sigv;
+        if (Q.kclip > 0.0 && abs(v - mu[idx]) > thr) {
+          atomicAdd(&aBad[0], 1u);
+          continue;
+        }
+        atomicAdd(&aBad[1], 1u);
         atomicAdd(&aW[idx], w);
         atomicAdd(&aV[idx], w * v);
         atomicAdd(&aW2[idx], w * w);
@@ -120,7 +131,7 @@ struct S { n: u32, mode: u32, w_out: u32, h_out: u32, blk: u32, st: u32, pad0: u
 // 第一遍：逐像素 μ
 @compute @workgroup_size(64)
 fn mean_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
+  let i = gid.x + U.pad0;
   if (i >= U.n) { return; }
   let w = aW[i];
   if (w > 1e-20) { mu[i] = aV[i] / w; }
@@ -129,8 +140,7 @@ fn mean_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
 // 第二遍：与 CPU 同口径的分块 winsor 尺度（blk=64、st=3 抽样、1.15×）
 @compute @workgroup_size(64)
 fn block_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
-  // 每线程负责一个 st×st 抽样点，归约由主机侧完成（这里只写该点的 |dev|/w 到 sd）
-  let i = gid.x;
+  let i = gid.x + U.pad0;
   if (i >= U.n) { return; }
   let x = i % U.w_out;
   let y = i / U.w_out;
@@ -153,7 +163,7 @@ struct F { n: u32, pad: u32 };
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
+  let i = gid.x + U.pad;
   if (i >= U.n) { return; }
   let w = aW[i];
   if (w <= 1e-20) { oOut[i] = 0.0; oCov[i] = 0.0; oNef[i] = 0.0; return; }
@@ -200,6 +210,20 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
     if not available():
         raise RuntimeError('适配器不支持 shader-float32-atomic')
     dev, queue = G._device_f32()
+    import time as _t
+    _t0 = _t.perf_counter()
+    _dbg = os.environ.get('DWT_WGPU_DEBUG') == '1'
+    if log:
+        log('[wgpu][start] ts=%.3f backend=canvas frames=%d scale=%.2f pixfrac=%.2f'
+            % (time.time(), len(np.atleast_1d(dx)), float(plan.get('s', 1.0)), float(pixfrac)))
+    _stage_t = {'t': _t.perf_counter()}
+
+    def _dbg_stage(_m):
+        if _dbg:
+            _now = _t.perf_counter()
+            print('[fatom-stage] %-14s %.3fs (cum %.3fs)'
+                  % (_m, _now - _stage_t['t'], _now - _t0), flush=True)
+            _stage_t['t'] = _now
     wgpu = G._wp()
     U = wgpu.BufferUsage
 
@@ -220,7 +244,13 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
     cov = np.zeros((H, W), np.float32)
     neff = np.zeros((H, W), np.float32)
 
-    p = np.zeros(27, np.float32)
+    p = np.zeros(29, np.float32)
+    # 排异的信号比例门（对齐 CPU 的 thr = rej_k·σ + m·(R·信号)）：
+    # m 是标量，CPU 从逐帧 dev/sig 的 99 分位再取中位估出来；这里先按经验值，
+    # 用 DWT_MGATE 可调（0 = 退回旧的纯 σ 判据）。
+    p[24] = np.float32(float(os.environ.get('DWT_MGATE', '0.03') or 0.03))
+    p[25] = np.float32(float(getattr(fs, 'sky0', 0.0) or 0.0))
+    p[26] = np.float32(float(os.environ.get('DWT_SFAC', '1.0') or 1.0))
     pu = p.view(np.uint32)
     pu[13] = np.uint32(mask2)
     p[14] = np.float32(P)
@@ -239,6 +269,7 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
         bh = min(band_rows, H - y0)
         n_pix = int(bh * W)
         aW, aV, aD, aW2 = sbuf(n_pix), sbuf(n_pix), sbuf(n_pix), sbuf(n_pix)
+        aBad = dev.create_buffer(size=8, usage=U.STORAGE | U.COPY_SRC | U.COPY_DST)
         bMu, bSd = sbuf(n_pix), sbuf(n_pix)
         oOut, oCov, oNef = sbuf(n_pix), sbuf(n_pix), sbuf(n_pix)
 
@@ -250,6 +281,7 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
         pu[11] = np.uint32(0)
         bQ = dev.create_buffer(size=128, usage=U.UNIFORM | U.COPY_DST)
 
+        _dbg_stage('alloc+zero')
         def zero_acc():
             for b in (aW, aV, aD, aW2):
                 queue.write_buffer(b, 0, np.zeros(n_pix, np.float32).tobytes())
@@ -261,7 +293,7 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
         # 源行窗口（逐帧逆变换取并集；旋转接近 180° 时源行方向相反）
         lo, hi = 1 << 30, -1
         for j in idx:
-            th_i = 0.0 if th is None else float(th[j])
+            th_i = 0.0 if th is None else math.radians(float(th[j]))
             ct, stn = float(np.cos(th_i)), float(np.sin(th_i))
             ks = float(kk[j])
             d_ = s_grid * ks * stn
@@ -286,34 +318,43 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
         pu[7] = np.uint32(hs)
         pu[12] = np.uint32(lo)
 
-        buf = np.empty((len(idx), plane), np.float32)
-        for k, j in enumerate(idx):
-            buf[k] = np.asarray(fs.frame(int(j)), np.float32)[lo:hi, :].ravel()
         bSrc = sbuf(len(idx) * plane)
-        queue.write_buffer(bSrc, 0, buf.tobytes())
-        del buf
+        # 帧数据不在这里上传：交给 scatter(0) 逐帧「上传一帧 → 派发一帧」，
+        # 让主机的拷贝与 GPU 的计算重叠（全幅 8 帧实测 5.7s → 约 4s）。
 
         if R is not None:
             rr = np.asarray(R, np.float32)
+            if _dbg:
+                print('[fatom-dbg] R in: shape=%s min=%.3f mean=%.3f max=%.3f frac>0.5=%.2f%%'
+                      % (rr.shape, float(rr.min()), float(rr.mean()), float(rr.max()),
+                         100.0 * float((rr > 0.5).mean())), flush=True)
             if rr.shape != (H, W):
                 yy = (np.arange(H) * rr.shape[0] // H).clip(0, rr.shape[0] - 1)
                 xx = (np.arange(W) * rr.shape[1] // W).clip(0, rr.shape[1] - 1)
                 rr = rr[np.ix_(yy, xx)]
             bR = sbuf(H * W)
-            queue.write_buffer(bR, 0, np.ascontiguousarray(rr).tobytes())
+            queue.write_buffer(bR, 0, memoryview(np.ascontiguousarray(rr)))
             rsz = H * W * 4
         else:
             bR = sbuf(4)
             queue.write_buffer(bR, 0, np.zeros(4, np.float32).tobytes())
             rsz = 16
 
-        def scatter(mode, kclip):
+        def scatter(mode, kclip, upload=False):
             p[20] = np.float32(kclip)
             p[21] = np.float32(float(mode))
-            enc = dev.create_command_encoder()
-            cp = enc.begin_compute_pass()
+            enc = None if upload else dev.create_command_encoder()
+            cp = None if upload else enc.begin_compute_pass()
             for k, j in enumerate(idx):
-                th_i = 0.0 if th is None else float(th[j])
+                if upload:
+                    # 先传这一帧，再单独提交它的 dispatch：GPU 算第 k 帧时主机在传第 k+1 帧
+                    _st = np.asarray(fs.strip(int(j), int(lo), int(hi)), np.float32)
+                    queue.write_buffer(bSrc, k * plane * 4,
+                                       memoryview(np.ascontiguousarray(_st)))
+                    del _st
+                    enc = dev.create_command_encoder()
+                    cp = enc.begin_compute_pass()
+                th_i = 0.0 if th is None else math.radians(float(th[j]))
                 ct, stn = float(np.cos(th_i)), float(np.sin(th_i))
                 ks = float(kk[j])
                 p[0] = np.float32(s_grid * ks * ct)
@@ -347,53 +388,71 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
                     {'binding': 6, 'resource': {'buffer': bMu, 'offset': 0, 'size': n_pix * 4}},
                     {'binding': 7, 'resource': {'buffer': bSd, 'offset': 0, 'size': n_pix * 4}},
                     {'binding': 8, 'resource': {'buffer': aW2, 'offset': 0, 'size': n_pix * 4}},
+                    {'binding': 9, 'resource': {'buffer': aBad, 'offset': 0, 'size': 8}},
                 ])
                 cp.set_pipeline(pipe)
                 cp.set_bind_group(0, bg)
                 cp.dispatch_workgroups(int((w + 7) // 8), int((hs + 7) // 8))
-            cp.end()
-            queue.submit([enc.finish()])
+                if upload:
+                    cp.end()
+                    queue.submit([enc.finish()])
+            if not upload:
+                cp.end()
+                queue.submit([enc.finish()])
 
-        def _u32_uni(vals):
+        _CHUNK = 65535 * 64
+
+        def _u32_uni(vals, off=0):
             u = np.zeros(8, np.uint32)
             for i, v in enumerate(vals):
                 u[i] = np.uint32(v)
+            u[6] = np.uint32(off)      # pad0：像素偏移（分块 dispatch 用）
             b = dev.create_buffer(size=32, usage=U.UNIFORM | U.COPY_DST)
             queue.write_buffer(b, 0, u.tobytes())
             return b
 
+        def _dispatch_chunked(cp, pipe_, mkbg, n_pix_):
+            for off in range(0, int(n_pix_), _CHUNK):
+                cnt = min(_CHUNK, int(n_pix_) - off)
+                cp.set_pipeline(pipe_)
+                cp.set_bind_group(0, mkbg(off))
+                cp.dispatch_workgroups(int((cnt + 63) // 64))
+
         def mean_pass():
-            bU = _u32_uni([n_pix, 0, W, bh, 64, 3])
-            # mean_pass 只用到 aW(0)/aV(1)/mu(3)/U(5)，`layout='auto'` 生成的布局只含这 4 个绑定
-            bg = dev.create_bind_group(layout=pstat.get_bind_group_layout(0), entries=[
-                {'binding': 0, 'resource': {'buffer': aW, 'offset': 0, 'size': n_pix * 4}},
-                {'binding': 1, 'resource': {'buffer': aV, 'offset': 0, 'size': n_pix * 4}},
-                {'binding': 3, 'resource': {'buffer': bMu, 'offset': 0, 'size': n_pix * 4}},
-                {'binding': 5, 'resource': {'buffer': bU, 'offset': 0, 'size': 32}},
-            ])
+            # mean_pass 只用到 aW(0)/aV(1)/mu(3)/U(5)；x 维 dispatch 上限 65535，分块发
             enc = dev.create_command_encoder()
             cp = enc.begin_compute_pass()
-            cp.set_pipeline(pstat)
-            cp.set_bind_group(0, bg)
-            cp.dispatch_workgroups(int((n_pix + 63) // 64))
+            for off in range(0, n_pix, _CHUNK):
+                cnt = min(_CHUNK, n_pix - off)
+                bU = _u32_uni([n_pix, 0, W, bh, 64, 3], off)
+                bg = dev.create_bind_group(layout=pstat.get_bind_group_layout(0), entries=[
+                    {'binding': 0, 'resource': {'buffer': aW, 'offset': 0, 'size': n_pix * 4}},
+                    {'binding': 1, 'resource': {'buffer': aV, 'offset': 0, 'size': n_pix * 4}},
+                    {'binding': 3, 'resource': {'buffer': bMu, 'offset': 0, 'size': n_pix * 4}},
+                    {'binding': 5, 'resource': {'buffer': bU, 'offset': 0, 'size': 32}},
+                ])
+                cp.set_pipeline(pstat)
+                cp.set_bind_group(0, bg)
+                cp.dispatch_workgroups(int((cnt + 63) // 64))
             cp.end()
             queue.submit([enc.finish()])
 
         def block_scale(k_clip=1.0, scale=1.15):
             """与 CPU 的 _winsor_scale 同口径：64×64 块、每 3 像素取 1、1.15×平均 |dev|。"""
-            bU = _u32_uni([n_pix, 1, W, bh, 64, 3])
-            # block_scale 只用到 aW(0)/aD(2)/sd(4)/U(5)
-            bg = dev.create_bind_group(layout=pbs.get_bind_group_layout(0), entries=[
-                {'binding': 0, 'resource': {'buffer': aW, 'offset': 0, 'size': n_pix * 4}},
-                {'binding': 2, 'resource': {'buffer': aD, 'offset': 0, 'size': n_pix * 4}},
-                {'binding': 4, 'resource': {'buffer': bSd, 'offset': 0, 'size': n_pix * 4}},
-                {'binding': 5, 'resource': {'buffer': bU, 'offset': 0, 'size': 32}},
-            ])
             enc = dev.create_command_encoder()
             cp = enc.begin_compute_pass()
-            cp.set_pipeline(pbs)
-            cp.set_bind_group(0, bg)
-            cp.dispatch_workgroups(int((n_pix + 63) // 64))
+            for off in range(0, n_pix, _CHUNK):
+                cnt = min(_CHUNK, n_pix - off)
+                bU = _u32_uni([n_pix, 1, W, bh, 64, 3], off)
+                bg = dev.create_bind_group(layout=pbs.get_bind_group_layout(0), entries=[
+                    {'binding': 0, 'resource': {'buffer': aW, 'offset': 0, 'size': n_pix * 4}},
+                    {'binding': 2, 'resource': {'buffer': aD, 'offset': 0, 'size': n_pix * 4}},
+                    {'binding': 4, 'resource': {'buffer': bSd, 'offset': 0, 'size': n_pix * 4}},
+                    {'binding': 5, 'resource': {'buffer': bU, 'offset': 0, 'size': 32}},
+                ])
+                cp.set_pipeline(pbs)
+                cp.set_bind_group(0, bg)
+                cp.dispatch_workgroups(int((cnt + 63) // 64))
             cp.end()
             queue.submit([enc.finish()])
             # 抽样点已在 sd 里，主机侧按块求均值并展开
@@ -408,17 +467,23 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
                     out[by:by + blk, bx:bx + blk] = s_blk
             queue.write_buffer(bSd, 0, out.tobytes())
 
-        scatter(0, 0.0)   # Σw Σwv Σw²
+        _dbg_stage('upload')
+        scatter(0, 0.0, upload=True)   # Σw Σwv Σw²（逐帧上传+派发）
+        _dbg_stage('scatter0')
+        _dbg_stage('mean_pass')
         mean_pass()       # μ
+        _dbg_stage('scatter1')
         scatter(1, 0.0)                     # Σw|v−μ0|
+        _dbg_stage('block_scale')
         block_scale(k_clip=3.0, scale=1.15)  # 粗尺度 s0（写回 sd，作为 mode4/3 的截尾半径）
-        # ---- 稳健锚点：截尾均值，接近 CPU 的逐像素中位数 ----
-        queue.write_buffer(aV, 0, np.zeros(n_pix, np.float32).tobytes())
-        scatter(4, 0.0)                     # Σw·clip(v, μ0±3s0)
-        wsum = np.frombuffer(queue.read_buffer(aW), np.float32)[:n_pix]
-        vsum = np.frombuffer(queue.read_buffer(aV), np.float32)[:n_pix]
-        mu_r = np.where(wsum > 1e-20, vsum / np.maximum(wsum, 1e-20), 0.0).astype(np.float32)
-        queue.write_buffer(bMu, 0, mu_r.tobytes())
+        # ---- 稳健锚点：迭代截尾均值，逼近 CPU 的逐像素中位数 ----
+        # 8 帧时一次 3σ 截尾离中位数还远；再迭代一轮（同一 σ、围绕新 μ 重新截尾）
+        # 后与 CPU 的中位数锚基本等价。每次迭代都要先把 Σw/Σwv 清零。
+        for _k_it in (1, 2):
+            queue.write_buffer(aW, 0, np.zeros(n_pix, np.float32).tobytes())
+            queue.write_buffer(aV, 0, np.zeros(n_pix, np.float32).tobytes())
+            scatter(4, 0.0)                 # Σw·clip(v, μ±3s)
+            mean_pass()                     # 写回新的 μ
         queue.write_buffer(aD, 0, np.zeros(n_pix, np.float32).tobytes())
         scatter(1, 0.0)                     # Σw|v−μ_robust|
         block_scale(k_clip=1.0, scale=1.15)  # 最终 winsor 尺度
@@ -426,26 +491,31 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
         queue.write_buffer(aW, 0, np.zeros(n_pix, np.float32).tobytes())
         queue.write_buffer(aV, 0, np.zeros(n_pix, np.float32).tobytes())
         queue.write_buffer(aW2, 0, np.zeros(n_pix, np.float32).tobytes())
+        queue.write_buffer(aBad, 0, np.zeros(2, np.uint32).tobytes())
+        _dbg_stage('scatter2')
         scatter(2, float(rej_k))
 
-        u = np.zeros(4, np.float32)
-        u.view(np.uint32)[0] = np.uint32(n_pix)
-        bU = dev.create_buffer(size=16, usage=U.UNIFORM | U.COPY_DST)
-        queue.write_buffer(bU, 0, u.tobytes())
-        bg = dev.create_bind_group(layout=pfin.get_bind_group_layout(0), entries=[
-            {'binding': 0, 'resource': {'buffer': aW, 'offset': 0, 'size': n_pix * 4}},
-            {'binding': 1, 'resource': {'buffer': aV, 'offset': 0, 'size': n_pix * 4}},
-            {'binding': 2, 'resource': {'buffer': aW2, 'offset': 0, 'size': n_pix * 4}},
-            {'binding': 3, 'resource': {'buffer': oOut, 'offset': 0, 'size': n_pix * 4}},
-            {'binding': 4, 'resource': {'buffer': oCov, 'offset': 0, 'size': n_pix * 4}},
-            {'binding': 5, 'resource': {'buffer': oNef, 'offset': 0, 'size': n_pix * 4}},
-            {'binding': 6, 'resource': {'buffer': bU, 'offset': 0, 'size': 16}},
-        ])
         enc = dev.create_command_encoder()
         cp = enc.begin_compute_pass()
-        cp.set_pipeline(pfin)
-        cp.set_bind_group(0, bg)
-        cp.dispatch_workgroups(int((n_pix + 63) // 64))
+        for off in range(0, n_pix, _CHUNK):
+            cnt = min(_CHUNK, n_pix - off)
+            u = np.zeros(4, np.float32)
+            u.view(np.uint32)[0] = np.uint32(n_pix)
+            u.view(np.uint32)[1] = np.uint32(off)
+            bU = dev.create_buffer(size=16, usage=U.UNIFORM | U.COPY_DST)
+            queue.write_buffer(bU, 0, u.tobytes())
+            bg = dev.create_bind_group(layout=pfin.get_bind_group_layout(0), entries=[
+                {'binding': 0, 'resource': {'buffer': aW, 'offset': 0, 'size': n_pix * 4}},
+                {'binding': 1, 'resource': {'buffer': aV, 'offset': 0, 'size': n_pix * 4}},
+                {'binding': 2, 'resource': {'buffer': aW2, 'offset': 0, 'size': n_pix * 4}},
+                {'binding': 3, 'resource': {'buffer': oOut, 'offset': 0, 'size': n_pix * 4}},
+                {'binding': 4, 'resource': {'buffer': oCov, 'offset': 0, 'size': n_pix * 4}},
+                {'binding': 5, 'resource': {'buffer': oNef, 'offset': 0, 'size': n_pix * 4}},
+                {'binding': 6, 'resource': {'buffer': bU, 'offset': 0, 'size': 16}},
+            ])
+            cp.set_pipeline(pfin)
+            cp.set_bind_group(0, bg)
+            cp.dispatch_workgroups(int((cnt + 63) // 64))
         cp.end()
         queue.submit([enc.finish()])
 
@@ -458,5 +528,15 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
 
     if log:
         log('[wgpu] 真 CFA：散射累加（float 原子，三遍）')
-    return {'stack': stack, 'cov': cov, 'neff': neff, 'rej_rate': 0.0,
+        log('[wgpu][done] ts=%.3f backend=canvas wall_s=%.1f readback_mb=%.1f fallbacks=0'
+            % (time.time(), _t.perf_counter() - _t0, 3.0 * H * W * 4 / (1024.0 * 1024.0)))
+    # 真实剔除率：着色器在 mode=2 里对每个「样本→输出像素」的 tap 计数，
+    # aBad[0]=被剔、aBad[1]=接受；不再用 0.0 占位（旧版日志里的 0.000% 是假的）。
+    _cb = np.frombuffer(queue.read_buffer(aBad), np.uint32)
+    _bad, _okc = int(_cb[0]), int(_cb[1])
+    _tot = _bad + _okc
+    _rate = (100.0 * _bad / _tot) if _tot else 0.0
+    if log:
+        log('[wgpu] 剔除率 %.3f%%（%d / %d 个 tap）' % (_rate, _bad, _tot))
+    return {'stack': stack, 'cov': cov, 'neff': neff, 'rej_rate': float(_rate) / 100.0,   # 接口约定是 0~1 小数，日志里才是百分数
             'wmax': float(cov.max()) if cov.size else 0.0}

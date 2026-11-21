@@ -25,9 +25,18 @@ R 场处理：strip_weights 的权重是 W_i(p)=C_i^{A·R(p)}·S_i^{B·(1−R(p)
 from __future__ import annotations
 
 import math
+import os
+import sys
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import numpy as np
+
+# 打包后启动脚本只把 pydeps/./core 放进 sys.path，gpudeps/ 不在里面。
+# 这里自己找同级的 gpudeps（放在 pydeps 之前，保证用包里自带的那份 wgpu）。
+_GPUD = Path(__file__).resolve().parent.parent / 'gpudeps'
+if _GPUD.is_dir() and str(_GPUD) not in sys.path:
+    sys.path.insert(0, str(_GPUD))
 
 _WGSL = """
 struct Params {
@@ -110,19 +119,70 @@ def _device():
     return dev, dev.queue
 
 
+_last_reason = ''
+
+
+def diagnose() -> Tuple[bool, str]:
+    """返回 (是否可用, 原因)。原因用于日志与 `检测-wgpu.bat`。"""
+    global _last_reason
+    try:
+        wgpu = _wp()
+    except Exception as e:
+        _last_reason = ('导入 wgpu 失败：%s: %s（gpudeps 目录：%s）'
+                        % (type(e).__name__, e, _GPUD))
+        return False, _last_reason
+    try:
+        ver = getattr(wgpu, '__version__', '?')
+        native = ''
+        try:
+            from wgpu.backends.wgpu_native import _helpers  # noqa: F401
+            import wgpu.backends.wgpu_native as _bn
+            native = str(getattr(_bn, '__file__', ''))
+        except Exception:
+            pass
+        try:
+            dev, _q = _device()
+            a = _cache['adapter'].info
+            _last_reason = ('%s (%s, %s)，wgpu %s'
+                            % (a.get('device'), a.get('backend_type'),
+                               a.get('adapter_type'), ver))
+            return True, _last_reason
+        except Exception as e:
+            backs = ''
+            try:
+                ad = wgpu.gpu.enumerate_adapters_sync()
+                backs = '；枚举到 %d 个适配器：%s' % (
+                    len(ad), ', '.join('%s/%s' % (
+                        (x.info or {}).get('backend_type'), (x.info or {}).get('device'))
+                        for x in ad))
+            except Exception:
+                backs = '；适配器枚举本身也失败'
+            _last_reason = ('找不到可用适配器（wgpu %s%s）%s：%s: %s'
+                            % (ver, ('，' + native) if native else '', backs,
+                               type(e).__name__, e))
+            return False, _last_reason
+    except Exception as e:                                  # 兜底
+        _last_reason = '未知错误：%s: %s' % (type(e).__name__, e)
+        return False, _last_reason
+
+
 def available() -> bool:
     try:
-        _wp()
-        _device()
-        return True
+        ok, _msg = diagnose()
+        return bool(ok)
     except Exception:
         return False
 
 
+def reason() -> str:
+    return _last_reason or '未知（未调用 diagnose）'
+
+
 def info() -> str:
-    _device()
-    a = _cache['adapter'].info
-    return '%s (%s, %s)' % (a.get('device'), a.get('backend_type'), a.get('adapter_type'))
+    ok, msg = diagnose()
+    if not ok:
+        raise RuntimeError(msg)
+    return msg
 
 
 def affine_from(dx: float, dy: float, theta: float, k: float,
@@ -301,7 +361,7 @@ def stack_pws(fs, C, S, dx, dy, th, kk, plan, A, B, sky=0.0, R=None,
     w1 = np.clip(w1 / max(w1.mean(), 1e-30), 1e-6, 1e6)
     get = lambda i: np.asarray(fs.frame(int(i)), np.float32)
     if log:
-        log('[wgpu] %s' % info())
+        log('[wgpu] 设备 %s；本组 %d 帧走 wgpu' % (info(), len(idx)))
         log('[wgpu] 收集式叠加：%d 帧，画布 %d×%d，两遍权重（R=0 / R=1）' % (len(idx), W, H))
     n0, c0 = accumulate_stream(get, idx, aff, (H, W), w0, dev, queue)
     n1, c1 = accumulate_stream(get, idx, aff, (H, W), w1, dev, queue)
@@ -337,3 +397,60 @@ if __name__ == '__main__':
         img, cov = stack_plane(frames, aff, (H, W))
         print('gather %.2fs  cov 中位 %.1f  空像素 %.2f%%' %
               (time.time() - t, np.median(cov), 100 * np.mean(cov == 0)))
+
+
+def has_f32_atomic() -> bool:
+    """适配器是否支持 shader-float32-atomic（真散射累加的前提）。
+
+    wgpu 通过原生扩展把它开出来（Vulkan 的 VK_EXT_shader_atomic_float、Metal 3），
+    WebGPU 规范本身还没有；拿不到时调用方应回退到分桶后端。
+    """
+    try:
+        wgpu = _wp()
+        if 'f32a' in _cache:
+            return bool(_cache['f32a'])
+        adapter = _cache.get('adapter')
+        if adapter is None:
+            adapter = wgpu.gpu.request_adapter_sync(power_preference='high-performance')
+            if adapter is None:
+                _cache['f32a'] = False
+                return False
+            _cache['adapter'] = adapter
+        ok = any(str(f) == 'shader-float32-atomic' for f in adapter.features)
+        _cache['f32a'] = ok
+        return ok
+    except Exception:
+        return False
+
+
+def _device_f32():
+    """带 shader-float32-atomic 的设备；不支持时抛 RuntimeError。"""
+    if 'devf' in _cache:
+        return _cache['devf'], _cache['queuef']
+    if not has_f32_atomic():
+        raise RuntimeError('适配器不支持 shader-float32-atomic')
+    adapter = _cache.get('adapter')
+    # 全幅画布常驻时单个缓冲可达 400+ MB，WebGPU 默认上限只有 128/256 MiB，
+    # 必须显式申请适配器支持的上限，否则 create_bind_group 会报 Validation Error。
+    _lim = {}
+    try:
+        _al = adapter.limits
+        for _k in ('max-storage-buffer-binding-size', 'max_buffer_size'):
+            _v = _al.get(_k) if isinstance(_al, dict) else getattr(
+                _al, _k.replace('-', '_'), None)
+            if _v:
+                _lim[_k] = int(_v)
+    except Exception:
+        pass
+    dev = adapter.request_device_sync(
+        required_features=['shader-float32-atomic'],
+        required_limits=_lim or None)
+    import os as _os
+    if _os.environ.get('DWT_WGPU_DEBUG') == '1':
+        try:
+            dev.on_uncaptured_error(lambda e: print('[wgpu-err] %s: %s'
+                                                    % (getattr(e, 'reason', '?'), e), flush=True))
+        except Exception:
+            pass
+    _cache.update({'devf': dev, 'queuef': dev.queue})
+    return dev, dev.queue

@@ -129,6 +129,10 @@ CAP_WORKERS = 8
 CAP_FWHM = 12
 #   叠加（drizzle 分带）：内存带宽受限，实测 4/6/8/10 进程为 25.7/23.8/24.8/24.4s
 #   （M81 40 帧 1600² ×2，6 核以上机器），6 最划算；仍受"核数−2"约束
+class _Skip(Exception):
+    """内部信号：该 GPU 路径按配置跳过，不是失败，不写日志。"""
+
+
 CAP_DRIZZLE = 32
 
 # 逐帧行固定纹去除（row FPN）：默认开，DWT_NO_ROWFPN=1 关掉做 A/B
@@ -3507,7 +3511,10 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 _H2, _W2 = int(drz_plan['H']), int(drz_plan['W'])
                 _yy = np.clip(((np.arange(_H2) - float(drz_plan['oy'])) / float(drz_plan['s'])).astype(int), 0, h - 1)
                 _xx = np.clip(((np.arange(_W2) - float(drz_plan['ox'])) / float(drz_plan['s'])).astype(int), 0, w - 1)
-                _R2 = R[np.ix_(_yy, _xx)] if R is not None else None
+                # R 已经是输出画布尺寸（build_r_field 在画布网格上构建，stack_drizzle
+                # 也按 (H, W) 校验）。早先按「画布→本机」映射去索引它，s≠1 时取到的是
+                # 画面另一端的数据，导致 A 权重在过渡区系统性偏错（corr 0.985 vs 0.999）。
+                _R2 = R if R is not None else None
                 if _cfa_sel is not None:
                     _pf = float(getattr(p, 'drizzle_pix', 1.0) or 1.0)
                     _pd = _pf * float(drz_plan.get('s', 1.0))
@@ -3520,10 +3527,11 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                                     sky=0.0, R=_R2, rej_k=rej_k, log=log, n=n,
                                     pixfrac=_pf)
                     try:
-                        # float 原子路径仍是实验性：默认走分桶后端（与 CPU 实测 0.987），
-                        # 需要尝鲜时 DWT_FATOM_ON=1
-                        if os.environ.get('DWT_FATOM_ON', '').strip() != '1':
-                            raise RuntimeError('fatom 未启用（默认分桶；DWT_FATOM_ON=1 开启实验路径）')
+                        # 画布常驻路径已在上面的 DWT_CANVAS 分支处理过；这里只保留
+                        # 「关掉画布 + 显式开启」的实验组合，其余情况静默跳过，
+                        # 避免日志里出现误导性的「float 原子散射不可用」。
+                        if os.environ.get('DWT_CANVAS', '1').strip() != '0'                                 or os.environ.get('DWT_FATOM_ON', '').strip() != '1':
+                            raise _Skip('canvas 路径已处理或实验路径未开启')
                         from gpu_wgpu_cfa_fatom import stack_cfa_fatom as _sgf
                         return _sgf(fs, C, S, dx, dy, th, kk, drz_plan, A, B,
                                     rej_k=rej_k, rej_gate=rej_gate, R=_R2,
@@ -3536,8 +3544,9 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                         if os.environ.get('DWT_FATOM_ON', '').strip() == '1':
                             log('[wgpu][fallback] reason=fatom:%s: %s'
                                 % (type(_e_fa).__name__, _e_fa))
-                        log('[wgpu] float 原子散射不可用（%s: %s），退回分桶'
-                                % (type(_e_fa).__name__, _e_fa))
+                        if not isinstance(_e_fa, _Skip):
+                            log('[wgpu] float 原子散射不可用（%s: %s），退回分桶'
+                                    % (type(_e_fa).__name__, _e_fa))
                     try:
                         if os.environ.get('DWT_WGPU_BUCKET_OFF', '').strip() == '1':
                             raise RuntimeError('bucket disabled by env')

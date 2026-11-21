@@ -36,7 +36,7 @@ struct Params {
   y_off: u32, mode: u32, rej_on: u32, mask: u32,
   lnc: f32, lns: f32, kclip: f32, wa: f32,
   wb: f32, has_r: f32, near: f32, taps: f32,
-  a2: f32, b2: f32, c2: f32, d2: f32, e2: f32, f2: f32, pdrop: f32, _p2: f32,
+  a2: f32, b2: f32, c2: f32, d2: f32, e2: f32, f2: f32, pdrop: f32, ofs: f32,
 }
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -82,8 +82,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let py = by + 2.0 * f32(t >> 1u);
         if (px < 0.0 || py < 0.0 || px > f32(P.w_src) - 1.0
             || py > f32(P.h_src) - 1.0) { continue; }
-        let ox = px + 0.5;
-        let oy = py + 0.5;
+        let ox = px + P.ofs;
+        let oy = py + P.ofs;
         let Xc = P.a2 * ox + P.b2 * oy + P.c2;
         let Yc = P.d2 * ox + P.e2 * oy + P.f2;
         let l = max(Xc - 0.5 * Pd, f32(J));
@@ -159,6 +159,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 _cache: Dict[str, object] = {}
 
+# 采样点 → 输出坐标的常数偏移（源像素单位）。CPU 的 _xy_rows 用 (i+0.5, j+0.5)
+# 作中心、affine_from 又把 0.5 从常数项里减掉，两边口径差一个 0.5；实验确定。
+_OFS = [float(__import__('os').environ.get('DWT_WGPU_OFS', '0.5'))]
+
 
 def _pipe():
     if 'pipe' in _cache:
@@ -203,6 +207,7 @@ def _pack(aff, w_src, h_src, W, bh, y_off, mode, rej_on, mask,
     if inv6 is not None:
         p[22:28] = np.asarray(inv6, np.float32)
     p[28] = float(pdrop)
+    p[29] = float(_OFS[0])
     return p
 
 
@@ -316,7 +321,8 @@ def stack_pws_cfa(fs, C, S, dx, dy, th, kk, plan, A, B, pattern: str,
             inv = np.linalg.inv(m3)
             inv6 = [inv[0, 0], inv[0, 1], inv[0, 2],
                     inv[1, 0], inv[1, 1], inv[1, 2]]
-            pd_ = float(pixfrac) * float(plan.get('s', 1.0)) * float(kk[j])
+            # CFA 的同色格点间隔是 2 个源像素，液滴要按 2× 计（与 CPU 的 CFA 路径一致）
+            pd_ = 2.0 * float(pixfrac) * float(plan.get('s', 1.0)) * float(kk[j])
             use_taps = 1.0 if abs(pd_ - 1.0) > 0.02 else 0.0
             p = _pack(a, c1 - c0, r1 - r0, W, bh, y0, mode, rej_on, mk,
                       float(lnc[j]), float(lns[j]), float(rej_k),
