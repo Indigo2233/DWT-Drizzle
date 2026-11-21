@@ -823,7 +823,10 @@ def prepare_frames(frames: List[Path], label: str, crop: int,
     mmpath = None
     arrays: Optional[List[np.ndarray]] = None
     try:
-        mmpath = pick_frames_dir(need, frames_dir or None) / f'pws_frames_{h}x{w}_{n}.dat'
+        # 文件名带 pid：上一次崩溃（或并行候选）留下的 .dat 被占用时，
+        # Windows 会抛 WinError 32 让整个 run 直接失败；换名字即可绕开。
+        mmpath = pick_frames_dir(need, frames_dir or None) / (
+            f'pws_frames_{h}x{w}_{n}_{os.getpid()}.dat')
         mm = np.memmap(str(mmpath), dtype=np.float32, mode='w+', shape=(n, h, w))
     except SystemExit as e:
         log(f'[帧] 没有盘能放下 {need / 2 ** 30:.2f} GiB 的帧文件 → 退回父进程内存'
@@ -911,7 +914,9 @@ def prepare_frames(frames: List[Path], label: str, crop: int,
                     d = _cfa.plane(d, _CFA['pattern'], _CFA['ch'])
                 if _ROWFPN:
                     _strip_rowfpn(d)
-                med = float(np.median(d))
+                _smp = d[::4, ::4]
+                med = float(np.median(_smp))
+                del _smp
                 if fw_stars:
                     try:
                         _v = measure_fwhm_each(d, fw_stars, fwhm_guess=fw_guess)
@@ -1759,7 +1764,11 @@ def _noise_sigma(d: np.ndarray) -> float:
     用相邻行差分的稳健散布估计：大尺度渐变在 d[1:]-d[:-1] 里变成常数，
     被 median 吸收，只剩真实噪声。数值上与整帧 MAD 同量纲（σ）。
     """
-    g = np.diff(d, axis=0)
+    # 全幅 diff 会再开一份 99.5 MB 临时数组；噪声是逐像素统计量，1/4 抽样足够，
+    # 而且能显著降低全幅 8 进程时的峰值内存（用户实测 B 通道 MemoryError 的来源之一）。
+    _s = d[::2, ::2]
+    g = np.diff(_s, axis=0)
+    del _s
     if g.size == 0:
         return float(1.4826 * np.median(np.abs(d - np.median(d))))
     return float(1.4826 * np.median(np.abs(g - np.median(g))) / np.sqrt(2.0))
@@ -1780,7 +1789,12 @@ def _task_read_frame(job):
         d = _cfa.plane(d, cfa_pat, cfa_ch)
     if _ROWFPN:
         _strip_rowfpn(d)
-    med = float(np.median(d))
+    # np.median 内部 flatten→partition 会整帧复制一份（全幅 99.5 MB，8 进程 ×4 = 3.2 GB），
+    # 这是用户那台机器在 B 通道爆 MemoryError 的直接原因。天空中位数用 1/16 抽样足够
+    # （误差 <0.1 ADU），代价 6 MB。
+    _smp = d[::4, ::4]
+    med = float(np.median(_smp))
+    del _smp
     sig = _noise_sigma(d)
     bgm = bggrad.block_medians(d, bggrad.BG_BLOCK) if bg_deg else None
     # 顺手量本帧星点 FWHM（C 权重）：帧已经解压在内存里，比之后从 memmap

@@ -403,6 +403,19 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
         if j_hi - j_lo < 1:
             continue
         hs = j_hi - j_lo
+        # 一条带的「全部帧」要放进一个 storage binding：60 帧全幅 × 512 行会超
+        # maxStorageBufferBindingSize（2.147 GB）→ 直接 GPUValidationError。
+        # 这里按绑定上限反推带高上限，宁可多切几带。
+        try:
+            _maxb = int(dev.limits['max-storage-buffer-binding-size'])
+        except Exception:
+            _maxb = 1 << 31
+        _rows_bind = max(16, int(float(_maxb) * 0.85 / (max(1, len(idx)) * max(1, w) * 4)))
+        if band_rows > _rows_bind:
+            if log:
+                log('[wgpu] 带高按绑定上限收敛：%d → %d 行（%d 帧 × %d 宽；上限 %.2f GB）'
+                    % (band_rows, _rows_bind, len(idx), w, _maxb / 2**30))
+            band_rows = int(_rows_bind)
         plane = hs * w
 
         src_big = _sbuf(dev, U, plane * len(idx))

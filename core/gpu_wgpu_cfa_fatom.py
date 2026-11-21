@@ -318,7 +318,16 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
         pu[7] = np.uint32(hs)
         pu[12] = np.uint32(lo)
 
-        bSrc = sbuf(len(idx) * plane)
+        # 绑定大小受 maxStorageBufferBindingSize 限制（4070 Ti 上是 2.147 GB）。
+        # 60 帧全幅要 6.2 GB，直接建绑定会被 wgpu 拒绝（GPUValidationError in
+        # wgpuDeviceCreateBindGroup，用户实测踩到）。超限时退成「一帧的环形缓冲」：
+        # 每帧覆盖写入 offset 0，s_off 传 0，主机与 GPU 依旧重叠。
+        try:
+            _maxb = int(dev.limits['max-storage-buffer-binding-size'])
+        except Exception:
+            _maxb = 1 << 31
+        _ring = (len(idx) * plane * 4) > int(_maxb * 0.9)
+        bSrc = sbuf(plane if _ring else len(idx) * plane)
         # 帧数据不在这里上传：交给 scatter(0) 逐帧「上传一帧 → 派发一帧」，
         # 让主机的拷贝与 GPU 的计算重叠（全幅 8 帧实测 5.7s → 约 4s）。
 
@@ -347,11 +356,19 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
             cp = None if upload else enc.begin_compute_pass()
             for k, j in enumerate(idx):
                 if upload:
-                    # 先传这一帧，再单独提交它的 dispatch：GPU 算第 k 帧时主机在传第 k+1 帧
-                    _st = np.asarray(fs.strip(int(j), int(lo), int(hi)), np.float32)
-                    queue.write_buffer(bSrc, k * plane * 4,
-                                       memoryview(np.ascontiguousarray(_st)))
-                    del _st
+                    # 先传这一帧，再单独提交它的 dispatch：GPU 算第 k 帧时主机在传第 k+1 帧。
+                    # 按行分块上传——全幅一帧 strip 是 99.5 MB，一次性 asarray 在 32 GB 机器上
+                    # 叠加 memmap + 常驻画布后仍可能 MemoryError（用户实测踩到）。256 行一块，
+                    # 主机峰值只要 6.4 MB。
+                    _CH = 256
+                    _base = 0 if _ring else (k * plane * 4)
+                    for _r0 in range(int(lo), int(hi), _CH):
+                        _r1 = min(int(hi), _r0 + _CH)
+                        _st = np.asarray(fs.strip(int(j), int(_r0), int(_r1)), np.float32)
+                        queue.write_buffer(bSrc,
+                                           _base + (_r0 - int(lo)) * int(w) * 4,
+                                           memoryview(np.ascontiguousarray(_st)))
+                        del _st
                     enc = dev.create_command_encoder()
                     cp = enc.begin_compute_pass()
                 th_i = 0.0 if th is None else math.radians(float(th[j]))
@@ -363,7 +380,7 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
                 p[3] = np.float32(s_grid * ks * stn)
                 p[4] = np.float32(s_grid * ks * ct)
                 p[5] = np.float32(s_grid * -float(dy[j]) + oy)
-                pu[22] = np.uint32(k * plane)
+                pu[22] = np.uint32(0 if _ring else k * plane)
                 if C is not None:
                     p[15] = np.float32(np.log(max(float(C[int(j)]), 1e-6)))
                 if S is not None:
@@ -379,7 +396,8 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
                         p[0]*(w*0.5+0.5) + p[1]*(hs*0.5+0.5) + p[2],
                         p[3]*(w*0.5+0.5) + p[4]*(hs*0.5+0.5) + p[5]), flush=True)
                 bg = dev.create_bind_group(layout=bgl, entries=[
-                    {'binding': 0, 'resource': {'buffer': bSrc, 'offset': 0, 'size': len(idx) * plane * 4}},
+                    {'binding': 0, 'resource': {'buffer': bSrc, 'offset': 0,
+                                 'size': (plane if _ring else len(idx) * plane) * 4}},
                     {'binding': 1, 'resource': {'buffer': bR, 'offset': 0, 'size': rsz}},
                     {'binding': 2, 'resource': {'buffer': bQk, 'offset': 0, 'size': 128}},
                     {'binding': 3, 'resource': {'buffer': aW, 'offset': 0, 'size': n_pix * 4}},
