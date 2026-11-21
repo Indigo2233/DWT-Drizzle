@@ -105,6 +105,7 @@ TRAIL_AP = 3.7             # 测拖线用的二阶矩口径 = 该倍数 × σ_ps
 TRAIL_QUANTILE = 90.0      # 自动外扩取"逐帧拖线长度"的该百分位：瞄准最糊的那几帧
                            #   （漏进星点分区的正是它们；取中位会被大量好帧稀释）
 R_FLOOR = 0.0        # R 的全局下限：R_eff = R_FLOOR + (1−R_FLOOR)·R
+_RDEC = max(1, int(__import__('os').environ.get('DWT_RDEC', '2') or 2))  # R 场降采样倍率（1=全分辨率，2≈4× 提速）
                      #   用于抑制星周亮度平台（"亮—暗—亮"伪影环）。环的幅度取决于
                      #   两区有效 PSF 之差：加全局下限使空白天区也保留部分清晰度偏好，
                      #   糊帧在全图被压低 → 两区 PSF 差缩小 → 环变浅。代价是空白天区
@@ -117,7 +118,8 @@ REJ_MAX_FRAC = 1 / 3  # 剔除比例上限：超额被剔帧数 > 该比例 × �
 FLUX_R = 7.0         # 测吞吐的定孔径半径（原生像素）
 FLUX_POW = 2.0       # 吞吐项的默认指数（PI 的 PSF Signal Weight 同阶）
 N_STAR = 120         # 固定星表星数（测 C_i 用；中位数在 100 颗以上已稳定）
-REF_SHARP_N = 8      # 参考像 = 最锐的这么多帧的等权中位（默认 k=8）
+REF_SHARP_N = max(1, int(__import__('os').environ.get('DWT_REF_K', '8') or 8))
+                    # 参考像 = 最锐的这么多帧的等权中位（默认 k=8，DWT_REF_K 可覆盖）
 
 # 各阶段的并行进程上限（实际进程数还受"核数−1"与内存预算约束，见 plan_workers）
 #   叠加：每进程持一条条带的临时量，内存随进程数倍增 → 上限保守
@@ -642,7 +644,10 @@ class FrameSet:
         if m is None:
             return d
         if self.mm is None:                 # 兜底后端：arrays 是共享容器，不能就地改
-            return np.asarray(d - m, np.float32)
+            # 注意：bg_model 可能返回 float64，直接 d - m 会先开一份 float64 全幅
+            # 临时数组（6248×4176 = 208 MB），多进程叠加时足以把内存打爆。
+            m32 = np.asarray(m, np.float32)
+            return np.subtract(d, m32, dtype=np.float32)
         d -= m
         return d
 
@@ -656,7 +661,8 @@ class FrameSet:
         if m is None:
             return d
         if self.mm is None:
-            return np.asarray(d - m, np.float32)
+            m32 = np.asarray(m, np.float32)   # 同 frame()：避免 float64 临时数组
+            return np.subtract(d, m32, dtype=np.float32)
         d -= m
         return d
 
@@ -860,7 +866,7 @@ def prepare_frames(frames: List[Path], label: str, crop: int,
     #   + median 内部副本（np.median 对浮点数组会先复制一份）。
     ini_rw, ini_rw_args = fs.writer
     nw = 0 if (not fs.parallelable or _no_parallel()) \
-        else plan_workers(fh * fw * 4 * 3, '读帧')
+        else plan_workers(fh * fw * 4 * 4 + (512 << 20), '读帧')
     try:
         if nw > 1:
             fs.metas = [None] * n
@@ -1410,12 +1416,33 @@ def _grow_support_adaptive(R: np.ndarray, grow_px: float, peak: np.ndarray,
     return np.clip(out, 0.0, 1.0)
 
 
+class _HalfFS:
+    """把帧集按 2×2 盒式降采样暴露出去（参考像在 1/2 网格重建用）"""
+
+    def __init__(self, fs):
+        self._fs = fs
+        h, w = fs.shape
+        self.shape = (int(h // 2), int(w // 2))
+
+    def _dn(self, a):
+        a = np.asarray(a, np.float32)
+        h2, w2 = a.shape[0] // 2 * 2, a.shape[1] // 2 * 2
+        a = a[:h2, :w2].reshape(h2 // 2, 2, w2 // 2, 2)
+        return a.mean(axis=(1, 3))
+
+    def frame(self, i):
+        return self._dn(self._fs.frame(int(i)))
+
+    def strip(self, i, j0, j1):
+        return self._dn(self._fs.strip(int(i), int(j0) * 2, int(j1) * 2))
+
+
 def build_r_field(sref: np.ndarray, sigma_psf: float,
                   win_mult: float = R_WIN_MULT, r_floor: float = R_FLOOR,
                   env_win_mult: float = ENV_WIN_MULT, env_eps: float = ENV_EPS,
                   env_p: float = ENV_P, star_grow: float = STAR_GROW,
                   r_blur: float = 0.0, r_mode: str = 'max',
-                  r_win: float = 0.0, r_k: float = 3.0
+                  r_win: float = 0.0, r_k: float = 3.0, dec: int = 1
                   ) -> Tuple[np.ndarray, Dict]:
     """分区权重 R ∈ [0,1]：此处是"细节型"还是"朦胧型"
 
@@ -1432,6 +1459,17 @@ def build_r_field(sref: np.ndarray, sigma_psf: float,
       σ_psf 与 win 均由测得的 FWHM 得到 → 换目标不改数值也不改含义。
       T 现在只用于报表诊断（info 里的 T_p50…），不参与 R 的计算。
     """
+    # 降采样计算开关：R 是平滑的支撑掩膜（过渡沿 ~σ_psf/2），在 1/dec 网格上算
+    # 再双线性放大，边缘量化误差 <1 px，省 4~16× 时间（dec=2 时约 4×）。
+    _H0, _W0 = int(sref.shape[0]), int(sref.shape[1])
+    if dec and int(dec) > 1 and _H0 > 64 and _W0 > 64:
+        _d = int(dec)
+        sref = np.ascontiguousarray(sref[::_d, ::_d])
+        sigma_psf = float(sigma_psf) / _d
+        grow_src = True
+    else:
+        _d = 0
+        grow_src = False
     win = int(max(3, round(float(sigma_psf) * win_mult)))
     win |= 1                                        # 奇数窗，中心对齐
     gy, gx = np.gradient(sref.astype(np.float64))
@@ -1464,6 +1502,9 @@ def build_r_field(sref: np.ndarray, sigma_psf: float,
     if r_floor and r_floor > 0:
         f = min(float(r_floor), 0.95)
         R = f + (1.0 - f) * R
+    if _d > 1:
+        R = ndimage.zoom(R, _d, order=1)[: _H0, : _W0]
+        R = np.clip(R, 0.0, 1.0)
     R = R.astype(np.float32)
     info = {
         'sigma_psf': float(sigma_psf), 'win': int(win), 'sig_hp': float(sig_hp),
@@ -3222,23 +3263,46 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             if len(_dzn):
                 log(f'[drizzle] 径向畸变 d2 {np.min(_dzn):+.4f}~{np.max(_dzn):+.4f}')
         _emit('R 场', 0.35, '重建参考像')
-        sref = stack_sharp_reference(_reg, idx, dx, dy, drz_plan, drz_p,
-                                     theta=th, scale=kk, dist=_dist)
+        # 参考像在 1/2 网格上重建：R 场是平滑掩膜（过渡沿 ~5.7px @2× 网格，
+        # 半网格仍有 ~2.8px），半网格足以定出支撑边界，散射量降到 1/4。
+        _ref_half = int(os.environ.get('DWT_REFHALF', '0') or 1)
+        _pl2 = None
+        if _ref_half and int(drz_plan['W']) >= 1024 and int(drz_plan['H']) >= 1024:
+            _pl2 = dict(drz_plan)
+            _pl2['s'] = float(drz_plan['s']) / 2.0
+            _pl2['ox'] = float(drz_plan['ox']) / 2.0
+            _pl2['oy'] = float(drz_plan['oy']) / 2.0
+            _pl2['W'] = max(8, int(drz_plan['W']) // 2)
+            _pl2['H'] = max(8, int(drz_plan['H']) // 2)
+            # 帧先 2×2 盒式降采样再走同一条参考像代码：液滴边长仍是
+            # pixfrac·s'（s'=s/2），对应的天区尺码与全分辨率一致，不会抹平。
+            sref = stack_sharp_reference(_HalfFS(_reg), idx, dx / 2.0, dy / 2.0, _pl2, drz_p,
+                                         theta=th, scale=kk, dist=_dist)
+        else:
+            sref = stack_sharp_reference(_reg, idx, dx, dy, drz_plan, drz_p,
+                                         theta=th, scale=kk, dist=_dist)
         # R 场的 σ_psf 必须用"参考像自己"的 FWHM：参考像取的是最锐 k 帧，
         # 比全帧中位锐得多（实测 4.23px vs 2.6px）。用中位值会把窗和包络放大
         # 1.6 倍，细节区的 R 被压到 0.07%，分区加权等于没开。
         sigma_rf = float(sigma_psf) * drz_s
         try:
-            _ho = max(16, int(round(16 * drz_s)))
-            _so = max(29, int(round(29 * drz_s)))
+            _sm = 0.5 if _pl2 is not None else 1.0
+            _plm = _pl2 if _pl2 is not None else drz_plan
+            _ho = max(16, int(round(16 * drz_s * _sm)))
+            _so = max(29, int(round(29 * drz_s * _sm)))
             _so = _so | 1
-            _st = _seed_map(drz_plan, drz_s)
-            _fr = float(measure_fwhm(sref, _st, fwhm_guess=6.0 * drz_s,
+            _st = _seed_map(_plm, drz_s * _sm)
+            _fr = float(measure_fwhm(sref, _st, fwhm_guess=6.0 * drz_s * _sm,
                                      half=_ho, fit_shape=_so))
         except Exception:
             _fr = float('nan')
+        if _pl2 is not None:
+            # 半网格上量的 FWHM 要换算回输出网格：×2；σ 再换回半网格给 R 场用：/2
+            _fr = _fr * 2.0 if np.isfinite(_fr) else _fr
         if np.isfinite(_fr) and 2.0 * drz_s < _fr < 40.0 * drz_s:
             sigma_rf = _fr / 2.3548
+            if _pl2 is not None:
+                sigma_rf = sigma_rf / 2.0
             log(f'[drizzle] 参考像自量 FWHM {_fr:.2f}px（输出网格）→ R 场 σ_psf '
                 f'{sigma_rf:.2f}px（中位帧折算值本应是 {float(sigma_psf) * drz_s:.2f}px）')
         grow_rf = float(star_grow)
@@ -3249,7 +3313,8 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                                  r_blur=float(getattr(p, 'r_blur', 0.0) or 0.0),
                                  r_mode=str(getattr(p, 'r_mode', 'max') or 'max'),
                                  r_win=float(getattr(p, 'r_win', 0.0) or 0.0),
-                                 r_k=float(getattr(p, 'r_k', 3.0) or 3.0))
+                                 r_k=float(getattr(p, 'r_k', 3.0) or 3.0),
+                                 dec=_RDEC)
         log(f'[drizzle] 输出网格 {drz_plan["W"]}×{drz_plan["H"]}'
             f'（本机 ×{drz_s:g}，pixfrac {drz_p:g}）  '
             f'σ_psf {float(sigma_psf):.2f}→{sigma_rf:.2f}px  '
@@ -3260,7 +3325,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         R, rinfo = build_r_field(sref, sigma_psf, r_floor=r_floor,
                                  env_win_mult=env_win_mult,
                                  env_eps=env_eps, env_p=env_p,
-                                 star_grow=star_grow)
+                                 star_grow=star_grow, dec=_RDEC)
     if drz_on:
         log(f'[R] 参考像 = 最锐 {k} 帧逐帧落点后取中位（drizzle 网格）')
     else:
@@ -3277,6 +3342,14 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         f'P99 {rinfo["T_p99"]:.2f}  最大 {rinfo["T_max"]:.1f}')
     log(f'[R] 分区权重 R 均值 {rinfo["R_mean"]:.3f}  '
         f'R>0.5 占 {rinfo["R_gt50"]:.2%}  R>0.9 占 {rinfo["R_gt90"]:.2%}')
+    if _pl2 is not None:
+        # 半网格的 R 放大回输出网格（双线性；R 是平滑掩膜，边缘量化 <1px）
+        R = np.clip(ndimage.zoom(R, 2, order=1)[: int(drz_plan['H']), : int(drz_plan['W'])],
+                    0.0, 1.0).astype(np.float32)
+        rinfo['R_mean'] = float(R.mean())
+        rinfo['R_gt50'] = float((R > 0.5).mean())
+        rinfo['R_gt90'] = float((R > 0.9).mean())
+        log(f'[R] 参考像在 1/2 网格重建（散射量 1/4），R 已放大回 {R.shape[1]}×{R.shape[0]}')
     del sref
     _emit('R 场', 1.0, f'R>0.5 占 {rinfo["R_gt50"]:.2%}')
 
@@ -3461,11 +3534,33 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                             import traceback as _tb
                             _tb.print_exc()
                         if os.environ.get('DWT_FATOM_ON', '').strip() == '1':
-                            log('[wgpu] float 原子散射不可用（%s: %s），退回分桶'
+                            log('[wgpu][fallback] reason=fatom:%s: %s'
+                                % (type(_e_fa).__name__, _e_fa))
+                        log('[wgpu] float 原子散射不可用（%s: %s），退回分桶'
                                 % (type(_e_fa).__name__, _e_fa))
                     try:
                         if os.environ.get('DWT_WGPU_BUCKET_OFF', '').strip() == '1':
                             raise RuntimeError('bucket disabled by env')
+                        _canv = os.environ.get('DWT_CANVAS', '1').strip()
+                        if _canv != '0':
+                            try:
+                                from gpu_wgpu_cfa_fatom import (
+                                    stack_cfa_fatom as _sgg, available as _fa_ok)
+                                _Hc, _Wc = int(drz_plan['H']), int(drz_plan['W'])
+                                _need_mb = _Hc * _Wc * 4.0 * 10 / (1024.0 * 1024.0)
+                                if _fa_ok() and (_canv == '1' or _need_mb <= 6000.0):
+                                    return _sgg(fs, C, S, dx, dy, th, kk, drz_plan,
+                                                A, B, rej_k=rej_k, rej_gate=rej_gate,
+                                                R=_R2, pixfrac=_pf, band_rows=_Hc,
+                                                log=log, T=T, fp=fp,
+                                                pattern=_CFA['pattern'],
+                                                channel=_CFA['ch'])
+                            except Exception as _e_cv:
+                                if os.environ.get('DWT_WGPU_DEBUG') == '1':
+                                    import traceback as _tb
+                                    _tb.print_exc()
+                                log('[wgpu][fallback] reason=canvas:%s: %s'
+                                    % (type(_e_cv).__name__, _e_cv))
                         from gpu_wgpu_cfa_bucket import stack_cfa_bucket as _sgb
                         return _sgb(fs, C, S, dx, dy, th, kk, drz_plan, A, B,
                                     rej_k=rej_k, rej_gate=rej_gate, R=_R2,
@@ -3476,6 +3571,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                         if os.environ.get('DWT_WGPU_DEBUG') == '1':
                             import traceback as _tb
                             _tb.print_exc()
+                        log('[wgpu][fallback] reason=bucket:%s' % _emsg)
                         log('[wgpu] 分桶后端不可用（%s），退回 CPU 重算本组' % _emsg)
                         if os.environ.get('DWT_WGPU_CFA_SCATTER', '').strip() == '1':
                             from gpu_wgpu_cfa_scatter import stack_cfa_scatter as _sgs
@@ -3490,7 +3586,11 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             # 全幅 2× 的画布是 ~417 MB/进程，8 进程光输出缓冲就 3.3 GB。
             try:
                 _cv_mb = float(drz_plan['W'] * drz_plan['H'] * 4) / (1024.0 * 1024.0)
-                _cap = max(1, int(2048.0 // max(1.0, _cv_mb * 2.0)))
+                # 每进程要持有整幅输出（num/cov 两份 + 临时），按 2.2 倍画布估；
+                # 上限用「当前可用内存的 60%」，而不是写死 2048 MB——
+                # 后者在 32 GB 机器上会把手指数从 8 压到 2，白丢 4 倍速度。
+                _bud_mb = min(8192.0, max(512.0, _avail_bytes() / 2**20 * 0.60))
+                _cap = max(1, int(_bud_mb // max(1.0, _cv_mb * 2.2)))
                 _nw = max(1, min(int(_drizzle_workers()), _cap))
                 if _nw < int(_drizzle_workers()):
                     log('[drizzle] 画布 %.0f MB，并行进程从 %d 降到 %d（避免内存打爆）'

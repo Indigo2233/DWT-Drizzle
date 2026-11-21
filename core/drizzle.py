@@ -1955,6 +1955,124 @@ def _band_work_par(r):
     return _drizzle_band(ctx, r[0], r[1])
 
 
+def _sharp_ref_fast(fs, idx, dx, dy, plan, pixfrac, theta=None, scale=None, dist=None):
+    """最锐 k 帧：按各自几何用双线性仿射重采样到输出网格，取逐像素中位"""
+    H, W = int(plan['H']), int(plan['W'])
+    s0, ox, oy = float(plan['s']), float(plan['ox']), float(plan['oy'])
+    idx = [int(i) for i in idx if np.isfinite(dx[int(i)]) and np.isfinite(dy[int(i)])]
+    if not idx:
+        return np.zeros((H, W), np.float32)
+    # 输出网格坐标（浮点）
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    Xo = (xx + 0.5 - ox) / s0
+    Yo = (yy + 0.5 - oy) / s0
+    acc = np.empty((len(idx), H, W), np.float32)
+    for q, i in enumerate(idx):
+        th = math.radians(0.0 if theta is None else float(theta[i]))
+        kk = 1.0 if scale is None else float(scale[i])
+        if not np.isfinite(kk) or kk <= 0:
+            kk = 1.0
+        ct, st = math.cos(th), math.sin(th)
+        ux, uy = -float(dx[i]), -float(dy[i])
+        # 正变换：X = kk*(ct*x - st*y) + ux ; Y = kk*(st*x + ct*y) + uy
+        # 反解：x = ((X-ux)*ct + (Y-uy)*st)/kk ; y = (-(X-ux)*st + (Y-uy)*ct)/kk
+        a = ct / kk
+        b = st / kk
+        c = -st / kk
+        d = ct / kk
+        e = -(a * ux + b * uy) - 0.5
+        f = -(c * ux + d * uy) - 0.5
+        img = np.asarray(fs.frame(i), np.float32)
+        acc[q] = ndimage.affine_transform(img, np.array([[a, b], [c, d]], np.float64),
+                                          offset=np.array([e, f], np.float64),
+                                          output_shape=(H, W), order=1, mode='constant',
+                                          cval=np.nan, prefilter=False)
+    out = np.nanmedian(acc, axis=0).astype(np.float32)
+    out[~np.isfinite(out)] = 0.0
+    return out
+
+
+def _sharp_ref_shift(fs, idx, dx, dy, plan, pixfrac):
+    """小旋转情形下的快速参考像：帧域整数移位对齐 → 中位 → 一次仿射上画布
+
+    参考像只用于定 R 的支撑轮廓（过渡沿 ~5.7px），0.5px 的整数移位误差
+    不足以改变支撑边界；换来的是把「66 带 × k 帧散射」换成「k 次 roll + 一次中位」。
+    只在 |θ| < 0.5° 且 |k−1| < 0.005 时启用，否则退回散射路径。
+    """
+    H, W = int(plan['H']), int(plan['W'])
+    s0, ox, oy = float(plan['s']), float(plan['ox']), float(plan['oy'])
+    h, w = fs.shape
+    idx = [int(i) for i in idx if np.isfinite(dx[int(i)]) and np.isfinite(dy[int(i)])]
+    if not idx:
+        return np.zeros((H, W), np.float32)
+    acc = np.empty((len(idx), h, w), np.float32)
+    for q, i in enumerate(idx):
+        img = np.asarray(fs.frame(i), np.float32)
+        if os.environ.get('DWT_REF_SUB', '0') == '1':
+            acc[q] = ndimage.shift(img, (-float(dy[i]), -float(dx[i])), order=1,
+                                   mode='constant', cval=np.nan, prefilter=False)
+        else:
+            # 整数回卷：不引入插值模糊（实测参考像 6.50px，亚像素版反而 6.87px），
+            # 代价是 ≤0.5px 的残留错位，对 R 的支撑轮廓（过渡 5.7px）不构成影响。
+            sx = -int(round(float(dx[i])))
+            sy = -int(round(float(dy[i])))
+            acc[q] = np.roll(np.roll(img, sy, axis=0), sx, axis=1)
+    med = np.nanmedian(acc, axis=0).astype(np.float32)
+    med[~np.isfinite(med)] = 0.0
+    del acc
+    # 帧域 → 画布：x' = s*x + ox，y' = s*y + oy（整体只差一个平移+缩放）
+    M = np.array([[1.0 / s0, 0.0], [0.0, 1.0 / s0]], np.float64)
+    off = np.array([(0.0 + 0.5 - oy) / s0 - 0.5, (0.0 + 0.5 - ox) / s0 - 0.5], np.float64)
+    out = ndimage.affine_transform(med, M, offset=off, output_shape=(H, W), order=1,
+                                   mode='constant', cval=0.0, prefilter=False)
+    return out.astype(np.float32)
+
+
+def _sharp_ref_banded(fs, idx, dx, dy, plan, pixfrac, band_h=128, theta=None, scale=None):
+    """最锐 k 帧按带仿射重采样（双线性）→ 带内逐像素中位（参考像用）"""
+    H, W = int(plan['H']), int(plan['W'])
+    s0, ox, oy = float(plan['s']), float(plan['ox']), float(plan['oy'])
+    h, w = fs.shape
+    idx = [int(i) for i in idx if np.isfinite(dx[int(i)]) and np.isfinite(dy[int(i)])]
+    if not idx:
+        return np.zeros((H, W), np.float32)
+    out = np.zeros((H, W), np.float32)
+    for Y0 in range(0, H, band_h):
+        Y1 = min(H, Y0 + band_h)
+        bh = Y1 - Y0
+        acc = np.full((len(idx), bh, W), np.nan, np.float32)
+        for q, i in enumerate(idx):
+            th = math.radians(0.0 if theta is None else float(theta[i]))
+            kk = 1.0 if scale is None else float(scale[i])
+            if not np.isfinite(kk) or kk <= 0:
+                kk = 1.0
+            ct, st = math.cos(th), math.sin(th)
+            ux, uy = -float(dx[i]), -float(dy[i])
+            # 输出画布 (X,Y) → 帧坐标 (x,y)
+            a = ct / (s0 * kk)
+            b = st / (s0 * kk)
+            c = -st / (s0 * kk)
+            d = ct / (s0 * kk)
+            e = ((ct * (-ux) + st * (-uy)) / kk
+                 + (ct * (0.5 - ox) + st * (0.5 - oy)) / (s0 * kk))
+            f = ((-st * (-ux) + ct * (-uy)) / kk
+                 + (-st * (0.5 - ox) + ct * (0.5 - oy)) / (s0 * kk))
+            # 本带在帧里的行范围（含余量），用于只读需要的行
+            j0 = max(0, int(math.floor(min(c * 0 + d * Y0, c * W + d * Y0) + f)) - 3)
+            j1 = min(h, int(math.ceil(max(c * 0 + d * Y1, c * W + d * Y1) + f)) + 3)
+            if j1 <= j0:
+                continue
+            strip = np.asarray(fs.strip(i, j0, j1), np.float32)
+            m = np.array([[a, b], [c, d]], np.float64)
+            off = np.array([f - j0, e], np.float64)
+            acc[q] = ndimage.affine_transform(strip, m, offset=off, output_shape=(bh, W),
+                                              order=1, mode='constant', cval=np.nan,
+                                              prefilter=False)
+        out[Y0:Y1] = np.nanmedian(acc, axis=0)
+    out[~np.isfinite(out)] = 0.0
+    return out
+
+
 def stack_sharp_reference(fs, idx: Sequence[int], dx: np.ndarray, dy: np.ndarray,
                           plan: Dict, pixfrac: float,
                           band_h: int = 128, rot=None, theta=None,
@@ -1966,6 +2084,22 @@ def stack_sharp_reference(fs, idx: Sequence[int], dx: np.ndarray, dy: np.ndarray
     更宽的星点，R 场会跟着把"锐"判错）。已在共同网格上的输入则在几何上
     退化为"中位 + 一个 drop 宽的方框模糊"，对 R 这种平滑量无影响。
     """
+    # ---- 按带仿射重采样（双线性）后带内取中位 ----
+    # 与散射路径等价（同一几何），但每帧只对「本带需要的行」做一次仿射采样，
+    # 且带内中位的缓存局部性远好于整幅 median。
+    if os.environ.get('DWT_REF_SHIFT', '1') == '1':
+        _th = np.nan_to_num(np.abs(np.asarray(theta, float))) if theta is not None else np.zeros(1)
+        _kk = np.abs(np.asarray(scale, float) - 1.0) if scale is not None else np.zeros(1)
+        if float(np.max(_th)) < 0.5 and float(np.nanmax(_kk)) < 0.005:
+            try:
+                return _sharp_ref_shift(fs, idx, dx, dy, plan, pixfrac)
+            except Exception:
+                pass
+    if os.environ.get('DWT_REF_BAND', '0') == '1':
+        try:
+            return _sharp_ref_banded(fs, idx, dx, dy, plan, pixfrac, band_h, theta, scale)
+        except Exception:
+            pass
     H, W = int(plan['H']), int(plan['W'])
     h, w = fs.shape
     s = plan['s']
@@ -2007,5 +2141,12 @@ def stack_sharp_reference(fs, idx: Sequence[int], dx: np.ndarray, dy: np.ndarray
             my = _axis_matrix(j1 - j0, bh, s, dy[i], pixfrac,
                               plan['oy'] - Y0 + j0 * s)
             buf[q] = my @ (mx[q] @ _native_band(fs, i, j0, j1, rot).T).T
-        out[Y0:Y1] = np.median(buf, axis=0)
+        if os.environ.get('DWT_REF_TRIM', '0') == '1':
+            _m = np.nanmean(buf, axis=0)
+            _sd = np.nanstd(buf, axis=0)
+            _bad = np.abs(buf - _m) > (3.0 * np.maximum(_sd, 1e-30))
+            buf2 = np.where(_bad, np.nan, buf)
+            out[Y0:Y1] = np.nanmean(buf2, axis=0).astype(np.float32)
+        else:
+            out[Y0:Y1] = np.median(buf, axis=0)
     return out

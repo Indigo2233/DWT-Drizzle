@@ -64,7 +64,16 @@ def _dilate_mean(img: np.ndarray, sel: np.ndarray) -> Tuple[np.ndarray, np.ndarr
 
 
 def _conv(a: np.ndarray, k: np.ndarray) -> np.ndarray:
-    """3×3 卷积（边界用 edge 复制），不依赖 scipy。"""
+    """3×3 卷积（边界用 edge 复制）。
+
+    全 1 核走 9 次切片相加（向量化，比逐像素 Python 循环快 1~2 个数量级）；
+    其它核保留通用实现。
+    """
+    if k.shape == (3, 3) and bool(np.all(k == 1.0)):
+        p = np.pad(a, 1, mode='edge')
+        return (p[:-2, :-2] + p[:-2, 1:-1] + p[:-2, 2:]
+                + p[1:-1, :-2] + p[1:-1, 1:-1] + p[1:-1, 2:]
+                + p[2:, :-2] + p[2:, 1:-1] + p[2:, 2:])
     p = np.pad(a, 1, mode='edge')
     out = np.zeros_like(a, dtype=np.float32)
     h, w = a.shape
