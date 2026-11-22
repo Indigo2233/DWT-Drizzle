@@ -76,7 +76,8 @@ class PwsParams:
     cfa_weights: str = 'auto'       # auto|shared|own：彩机权重是否逐通道各算
     cfa_ref: str = ''               # 彩机参考目录（WBPP debayered），空=自动扫描
     cfa_raw: str = 'auto'           # auto|on|off：真 CFA（不插值，按颜色投样本）
-    cfa_align: str = 'auto'         # auto|shared|own：彩机三通道对齐方式
+    cfa_align: str = 'auto'
+    cfa_grid: str = 'shared'   # shared=三通道共用画布；own=各通道自己定画布         # auto|shared|own：彩机三通道对齐方式
 
     # ---- CFA Drizzle（Bayer drizzle）：不解马赛克，按颜色分平面叠加 ----
     cfa_drizzle: bool = False
@@ -299,6 +300,11 @@ PARAMS: Tuple[Param, ...] = (
           'WBPP 的 debayered 目录，留空自动扫描',
           '用于估通道色差偏移（比在成品上估更干净）。叠加本身仍然只用原始 CFA 帧，'
           '不会退化成插值路线。留空时自动找素材同级的 debayered 目录。'),
+    Param('cfa_grid', '彩机画布', 'choice', '高级',
+          '共用画布 = 三通道像素级对齐（推荐）；逐通道画布 = 各通道按自己的配准定画布',
+          '逐通道画布下三通道画布尺寸/原点可能差 1~2 像素，本版不做 RGB 合成，'
+          '需要合色请回「共用画布」或到 PI 里对齐后合成。',
+          choices=(('共用画布（推荐）', 'shared'), ('逐通道画布', 'own'))),
     Param('cfa_align', '彩机对齐方式', 'choice', '高级',
           '三通道共用一套几何（快、像素级对齐），还是各通道独立配准（吸收色差）',
           'own 与 PI 的 WBPP 一致：每个通道在自己的图层上配准，色差偏移会在配准里'

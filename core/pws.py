@@ -2418,6 +2418,8 @@ def _run(p: PwsParams) -> Dict:
     _wshare = str(getattr(p, 'cfa_weights', 'shared') or 'shared').lower() == 'shared'
     # 逐通道独立配准（PI 的做法）：只关掉「几何复用」，权重仍可共用
     _align_own = str(getattr(p, 'cfa_align', 'shared') or 'shared').strip().lower() == 'own'
+    # 逐通道画布：关掉「画布强制统一」，各通道用自己的配准结果定画布
+    _grid_own = str(getattr(p, 'cfa_grid', 'shared') or 'shared').strip().lower() == 'own'
     _gshare = bool(_wshare) and not _align_own
     _share = _wshare
     # shared：G 先跑（绿像素最多、星点测量最稳），R/B 复用它量到的 C/S/T
@@ -2535,7 +2537,11 @@ def _run(p: PwsParams) -> Dict:
                 except Exception as _e:
                     _merge_cfa_rgb._ref_dir = None
                     log(f'[参考] 扫描彩机参考目录失败（跳过）：{_e}')
-                _merge_cfa_rgb(out_dir, stem, log)
+                if _grid_own:
+                    log('[CFA] 逐通道画布：三通道各自定画布，本次不做 RGB 合成'
+                        '（需要合色请在 PI 里对齐后合成，或改回「共用画布」）')
+                else:
+                    _merge_cfa_rgb(out_dir, stem, log)
             except Exception as e:
                 log(f'[CFA] RGB 合成失败（不影响三个单通道成品）：{e}')
         _CFA['ch'], _CFA['pattern'] = None, None
@@ -3273,7 +3279,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         # 整条通道平移了 1 像素（RGB 边缘出彩边）。这里保留各自的 dx/dy，但把
         # 画布换成首通道的，并把差异折进平移量：s*(u+ox) 不变。
         if (_CFA.get('pattern') and _CFA.get('auto_own') and not _CFA.get('want_share')
-                and _CFA.get('geo') and drz_plan):
+                and not _grid_own and _CFA.get('geo') and drz_plan):
             _gp = _CFA['geo'].get('plan') or {}
             if _gp and abs(float(_gp.get('s', 0)) - float(drz_plan['s'])) < 1e-9:
                 _sc = float(drz_plan['s']) or 1.0
