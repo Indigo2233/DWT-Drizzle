@@ -2950,6 +2950,14 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     cov_map = None
     drz_s = float(getattr(p, 'drizzle_scale', 2.0) or 1.0)
     drz_p = float(getattr(p, 'drizzle_pix', 1.0) or 1.0)
+    # 取消 drizzle 的本意是「不出 2× 网格」，不是「不做配准」。旧代码直接走
+    # 未配准的等权叠加（帧间位移没补），20 帧实测成品 FWHM 14.4px（单帧 4.3）
+    # —— 等于把整晚的漂移糊进去了。这里改成：1× 网格 + pixfrac 1，仍做配准。
+    if (not drz_on) and (not bool(int(getattr(p, 'aligned', 0) or 0))):
+        log('[叠加] 未启用 drizzle 放大：按 1× 网格（pixfrac 1）配准后叠加')
+        drz_on = True
+        drz_s = 1.0
+        drz_p = 1.0
     # 彩机 CFA：R/B 只有 1/4 像素有真值、G 只有 1/2。Siril 官方建议 CFA drizzle
     # 用 scale=1、pixfrac=1；再上采样等于要 4 倍的帧数，否则信噪比直接掉一半。
     # 实测（M81 12 帧、G 通道）：scale1/pix1 → 原生 FWHM 3.04px、N_eff 7.5；
@@ -3424,6 +3432,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         f'P99 {rinfo["T_p99"]:.2f}  最大 {rinfo["T_max"]:.1f}')
     log(f'[R] 分区权重 R 均值 {rinfo["R_mean"]:.3f}  '
         f'R>0.5 占 {rinfo["R_gt50"]:.2%}  R>0.9 占 {rinfo["R_gt90"]:.2%}')
+    _pl2 = locals().get('_pl2', None)   # 只有 drizzle 分支会定义它；非 drizzle 时在这里补上
     if _pl2 is not None:
         # 半网格的 R 放大回输出网格（双线性；R 是平滑掩膜，边缘量化 <1px）
         R = np.clip(ndimage.zoom(R, 2, order=1)[: int(drz_plan['H']), : int(drz_plan['W'])],
@@ -3859,8 +3868,14 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 '暗星上发散（彩机的蓝通道常见）。图本身没问题，以目视/外部工具为准。')
     else:
         f_out = measure_fwhm(Stk, stars)
-        log(f'[输出] 成品星点 FWHM {f_out:.2f}px（单帧中位 {fmed:.2f}px，'
-            f'改善 {100 * (1 - f_out / fmed):.1f}%）')
+        if np.isfinite(f_out) and np.isfinite(fmed) and fmed > 0:
+            log(f'[输出] 成品星点 FWHM {f_out:.2f}px（单帧中位 {fmed:.2f}px，'
+                f'改善 {100 * (1 - f_out / fmed):.1f}%）')
+        else:
+            # 帧数很少（如 --limit 2）或通道太暗时高斯拟合会不收敛，
+            # 以前这里直接格式化 nan，日志里出现 "nanpx"；改成明确说明。
+            log('[输出] 成品星点 FWHM 量不出来（帧数太少或该通道太暗，高斯拟合不收敛）；'
+                '图本身正常，以目视/外部工具为准')
 
     res = {
         'n': n, 'shape': Stk.shape, 'fwhms': fwhms, 'C': C, 'S': S, 'sigma': sig_out,
