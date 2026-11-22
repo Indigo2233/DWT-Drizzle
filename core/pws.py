@@ -3621,6 +3621,17 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                                     stack_cfa_fatom as _sgg, available as _fa_ok)
                                 _Hc, _Wc = int(drz_plan['H']), int(drz_plan['W'])
                                 _need_mb = _Hc * _Wc * 4.0 * 10 / (1024.0 * 1024.0)
+                                # 帧数 × 一帧条带超过单绑定上限时，画布后端要开环形缓冲，
+                                # 那条路径在 51 帧全幅上产出周期性重复（实测），先禁用：
+                                # 让分桶后端（已验证）接手，宁可慢也不能出错图。
+                                _plane_mb = float(fs.shape[0]) * float(fs.shape[1]) * 4.0 / (1024.0 * 1024.0)
+                                _ring_need = len(dx) * _plane_mb
+                                _limit_mb = 2047.0 * 0.9
+                                if _ring_need > _limit_mb and os.environ.get('DWT_CANVAS_RING', '0').strip() != '1':
+                                    log('[wgpu] 画布后端需要环形缓冲（%d 帧 × %.0f MB > %.0f MB），'
+                                        '改走分桶后端以避免已知的画质问题'
+                                        % (len(dx), _plane_mb, _limit_mb))
+                                    raise _Skip('canvas ring disabled')
                                 if _fa_ok() and (_canv == '1' or _need_mb <= 6000.0):
                                     return _sgg(fs, C, S, dx, dy, th, kk, drz_plan,
                                                 A, B, rej_k=rej_k, rej_gate=rej_gate,
