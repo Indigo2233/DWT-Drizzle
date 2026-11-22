@@ -1583,7 +1583,8 @@ def build_r_field(sref: np.ndarray, sigma_psf: float,
 # ---------------------------------------------------------------------------
 
 def strip_weights(C: np.ndarray, S: np.ndarray, R: np.ndarray,
-                  A: float, B: float, T=None, fp: float = 0.0) -> np.ndarray:
+                  A: float, B: float, T=None, fp: float = 0.0,
+                  beta: float = 0.0) -> np.ndarray:
     """W[i,r] = C_i^(A·R_r) · S_i^(B·(1−R_r))，并逐像素归一使 mean_i(W) = 1
 
     融合式的形状选择依据（式 6、式 7）：
@@ -1598,7 +1599,8 @@ def strip_weights(C: np.ndarray, S: np.ndarray, R: np.ndarray,
     """
     n = len(C)
     a = (A * R)[None, ...]
-    b = (B * (1.0 - R))[None, ...]
+    # beta·R：细节区也保留一部分噪声惩罚（beta=0 即原行为：R=1 只看清晰度）
+    b = (B * (1.0 - R) + float(beta) * R)[None, ...]
     lc = np.log(np.maximum(C, 1e-12)).reshape(n, *([1] * R.ndim))
     ls = np.log(np.maximum(S, 1e-12)).reshape(n, *([1] * R.ndim))
     if T is not None and fp:
@@ -1773,7 +1775,8 @@ def _task_trail(job) -> Tuple[int, float, float]:
 def _task_strip(job):
     """一条带的权重 + 排异 + 加权平均（与串行的三段调用完全同序同式）"""
     y0, y1, Rr, C, S, A, B, rej_k, sky0, rej_gate, T, fp = job
-    W = strip_weights(C, S, Rr, A, B, T=T, fp=fp)
+    _beta = float(getattr(p, 'detail_snr', 0.0) or 0.0)
+    W = strip_weights(C, S, Rr, A, B, T=T, fp=fp, beta=_beta)
     mm, off = _MEM['mm'], _MEM['off']
     D = np.stack([mm[i, y0:y1] - np.float32(off[i]) for i in range(len(C))])
     s, ne, rr = stack_strip(D, W, Rr, sky0, rej_k=rej_k, rej_max_frac=rej_gate)
@@ -3638,6 +3641,9 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                         if os.environ.get('DWT_WGPU_BUCKET_OFF', '').strip() == '1':
                             raise RuntimeError('bucket disabled by env')
                         _canv = os.environ.get('DWT_CANVAS', '1').strip()
+                        # 细节区噪声权重 beta（--detail-snr）：GPU 内核从环境读
+                        os.environ['DWT_DETAIL_SNR'] = str(
+                            float(getattr(p, 'detail_snr', 0.0) or 0.0))
                         if _canv != '0':
                             try:
                                 from gpu_wgpu_cfa_fatom import (
@@ -3715,7 +3721,8 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                                 native_shape=fs.shape, log=log, emit=_emit,
                                 cancel=_check_cancel,
                                 sharp_w=float(getattr(p, 'sharp_w', 0.0) or 0.0),
-                                cfa_sel=_cfa_sel, wmap=_wmap)
+                                cfa_sel=_cfa_sel, wmap=_wmap,
+                                beta=float(getattr(p, 'detail_snr', 0.0) or 0.0))
         try:
             try:
                 r_d = _do_stack()
@@ -3782,7 +3789,8 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 for k, y0 in enumerate(range(0, h, strip)):
                     _check_cancel()
                     y1 = min(h, y0 + strip)
-                    W = strip_weights(C, S, R[y0:y1], A, B, T=T, fp=fp)
+                    _beta = float(getattr(p, 'detail_snr', 0.0) or 0.0)
+                    W = strip_weights(C, S, R[y0:y1], A, B, T=T, fp=fp, beta=_beta)
                     D = fs.stack_strips(y0, y1)
                     s, ne, rr = stack_strip(D, W, R[y0:y1], fs.sky0, rej_k=rej_k,
                                             rej_max_frac=rej_gate)

@@ -33,7 +33,7 @@ struct QP {
   w_src: u32, h_src: u32, w_out: u32, h_out: u32,
   y_off: u32, c0: u32, r0: u32, mask: u32,
   P: f32, lnc: f32, lns: f32, wa: f32, wb: f32, has_r: f32, kclip: f32,
-  mode: f32, s_off: u32, lnt: f32, mgate: f32, sky: f32, sfac: f32,
+  mode: f32, s_off: u32, lnt: f32, mgate: f32, sky: f32, sfac: f32, beta: f32,
 };
 
 @group(0) @binding(0) var<storage, read> src: array<f32>;
@@ -83,7 +83,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (wy <= 0.0) { continue; }
       let idx = u32(gy) * Q.w_out + u32(kx);
       let rr = select(0.5, rmap[(u32(gy) + Q.y_off) * Q.w_out + u32(kx)], Q.has_r > 0.5);
-      let wgt = exp(Q.wa * rr * Q.lnc + Q.wb * (1.0 - rr) * Q.lns);
+      let wgt = exp(Q.wa * rr * Q.lnc + (Q.wb * (1.0 - rr) + Q.beta * rr) * Q.lns);
       let w = wgt * wx * wy / (Q.P * Q.P) * exp(Q.lnt);
 
       if (mode == 0) {
@@ -244,13 +244,14 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
     cov = np.zeros((H, W), np.float32)
     neff = np.zeros((H, W), np.float32)
 
-    p = np.zeros(29, np.float32)
+    p = np.zeros(30, np.float32)
     # 排异的信号比例门（对齐 CPU 的 thr = rej_k·σ + m·(R·信号)）：
     # m 是标量，CPU 从逐帧 dev/sig 的 99 分位再取中位估出来；这里先按经验值，
     # 用 DWT_MGATE 可调（0 = 退回旧的纯 σ 判据）。
     p[24] = np.float32(float(os.environ.get('DWT_MGATE', '0.03') or 0.03))
     p[25] = np.float32(float(getattr(fs, 'sky0', 0.0) or 0.0))
     p[26] = np.float32(float(os.environ.get('DWT_SFAC', '1.0') or 1.0))
+    p[27] = np.float32(float(os.environ.get('DWT_DETAIL_SNR', '0') or 0))
     pu = p.view(np.uint32)
     pu[13] = np.uint32(mask2)
     p[14] = np.float32(P)

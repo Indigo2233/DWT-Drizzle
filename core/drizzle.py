@@ -1727,12 +1727,14 @@ def _drizzle_band(ctx, Y0: int, Y1: int) -> Dict:
     # ---- 带权合成：Σ W·(v·c) / Σ W·c，等效帧数用同一个 wc 累加 ----
     lc = np.log(np.maximum(C, 1e-12)).astype(np.float32)
     ls = np.log(np.maximum(S, 1e-12)).astype(np.float32)
+    _be = float(ctx.get('beta', 0.0) or 0.0)
     nr = np.zeros((bh, W), np.float32)
     dr = np.zeros((bh, W), np.float32)
     d2 = np.zeros((bh, W), np.float32)
     mxw = np.zeros((bh, W), np.float32)
     for k, i in enumerate(idx):
-        e = A * R * lc[i] + B * (1.0 - R) * ls[i] + sw * lc[i]
+        # beta·R：细节区也保留噪声惩罚（beta=0 即原行为，R=1 只看清晰度）
+        e = A * R * lc[i] + (B * (1.0 - R) + _be * R) * ls[i] + sw * lc[i]
         if lt_all is not None:
             e = e + fp * float(lt_all[i])
         wgt = np.exp(e).astype(np.float32)
@@ -1770,7 +1772,7 @@ def stack_drizzle(fs, R_out: np.ndarray, C: np.ndarray, S: np.ndarray,
                   sharp_w: float = 0.0, T=None, fp: float = 0.0,
                   rej_mode: str = 'winsor', cfa_sel=None,
                   kernel: str = 'box', psf_target: float = 50.0,
-                  fwhms=None, wmap=None) -> Dict:
+                  fwhms=None, wmap=None, beta: float = 0.0) -> Dict:
     """按输出行分带：每带对全部帧做 drizzle → 排异 → 带权合成
 
     与 stack_strip 的区别（统计上等价、几何上更细）：
@@ -1845,6 +1847,7 @@ def stack_drizzle(fs, R_out: np.ndarray, C: np.ndarray, S: np.ndarray,
            'plan': plan, 'A': A, 'B': B, 'rej_k': rej_k, 'rej_gate': rej_gate,
            'sky': sky, 'pixfrac': pixfrac, 'rot': rot, 'theta': theta,
            'sharp_w': float(sharp_w),
+           'beta': float(beta),
            'scale': scale, 'native_shape': (h, w), 'n': len(idx), 'W': W,
            's': float(plan['s']),
            'P': max(1e-6, float(pixfrac) * float(plan['s'])),
