@@ -208,6 +208,8 @@ def _argv_common(c) -> list:
         argv += ["--cfa-weights", c["cfa_weights"]]
     if c.get("cfa_grid", "shared") != "shared":
         argv += ["--cfa-grid", c["cfa_grid"]]
+    if c.get("cfa_align", "auto") != "auto":
+        argv += ["--cfa-align", c["cfa_align"]]
     if int(c.get("ref_k", 0) or 0) > 0:
         argv += ["--ref-k", str(int(c["ref_k"]))]
     if c.get("cfa_ref"):
@@ -566,12 +568,19 @@ class App(tk.Tk):
         arow(18, "参考像帧数", _sp_refk,
              "0=自动（G 用 8，R/B 用 16）：R/B 采样少，帧数给小了 σ_psf 会估糊")
         self.v_cfag = tk.StringVar()
+        self.v_cfaa = tk.StringVar(value='自动判断')
         _cb_cfag = ttk.Combobox(
             adv, state="readonly", width=12, textvariable=self.v_cfag,
             values=["共用画布", "逐通道画布"])
         _cb_cfag.grid(row=16, column=1, sticky="w", padx=4, pady=2)
         arow(16, "彩机画布", _cb_cfag,
              "共用画布：三通道像素级对齐（推荐）；逐通道：各通道按自己的配准定画布")
+        _cb_cfaa = ttk.Combobox(
+            adv, state="readonly", width=12, textvariable=self.v_cfaa,
+            values=["自动判断", "共用几何", "逐通道独立"])
+        _cb_cfaa.grid(row=17, column=3, sticky="w", padx=4, pady=2)
+        arow(17, "彩机对齐", _cb_cfaa,
+             "共用几何：三通道共用一次配准（快，约省 90 s/通道）；逐通道独立：能补色差但慢；自动：首帧色差 >0.15px 时切逐通道")
         arow(17, "并行进程", ttk.Spinbox(adv, from_=0, to=32, increment=1, width=6,
                                     textvariable=self.v_jobs),
              "0 = 自动（核数一半、最多 8）；内存带宽紧张时调小更稳（实测 6 最好，11 反而慢）")
@@ -761,6 +770,8 @@ class App(tk.Tk):
         self.v_refk.set(str(c.get("ref_k", 0)))
         self.v_cfag.set({"shared": "共用画布", "own": "逐通道画布"}.get(
             str(c.get("cfa_grid", "shared")), "共用画布"))
+        self.v_cfaa.set({"shared": "共用几何", "own": "逐通道独立"}.get(
+            str(c.get("cfa_align", "auto")), "自动判断"))
         self.v_cfaw.set({"shared": "共用", "own": "逐通道"}.get(
             c.get("cfa_weights", "shared"), "共用"))
         self.v_cfaraw.set({"auto": "自动", "on": "强制开",
@@ -818,6 +829,9 @@ class App(tk.Tk):
                         "混合（G 真 CFA + R/B 插值）": "hybrid"}.get(
                             self.v_cfaraw.get(), "auto"),
             "ref_k": int(self.v_refk.get().strip() or 0),
+            "cfa_align": {"自动判断": "auto", "共用几何": "shared",
+                          "逐通道独立": "own"}.get(
+                self.v_cfaa.get(), "auto"),
             "cfa_grid": {"共用画布": "shared", "逐通道画布": "own"}.get(
                 self.v_cfag.get().strip(), "shared"),
             "cfa": {"关": "off", "自动识别": "auto"}.get(self.v_cfa.get().strip(),
@@ -1101,7 +1115,7 @@ class App(tk.Tk):
         """关于：方法与原文出处（PWS，D.Cikey）"""
         messagebox.showinfo(
             "关于 DWT · Drizzle",
-            "DWT · Drizzle 2.7.45-C\n\n" + LICENSE_TEXT)
+            "DWT · Drizzle 2.7.46-C\n\n" + LICENSE_TEXT)
 
     def show_help(self):
         """打开内置使用说明（不依赖浏览器 / 外部程序）"""

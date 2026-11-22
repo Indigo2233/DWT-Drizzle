@@ -1726,6 +1726,27 @@ _META_KEYS = ('name', 'path', 'exptime', 'date_obs', 'object', 'filter',
               'bg', 'noise', 'sharpness', 'fwhm', 'n_used', 'n_stars')
 
 
+_SIG_CACHE: Dict[str, bytes] = {}
+
+
+def _paths_sig(photo_dir: Path, paths: List[Path]) -> bytes:
+    """帧清单指纹（名字/大小/修改时间）—— 按目录缓存一次
+
+    每块、每通道、每遍都会调用 `_cache_file`，原来每次都对全部帧 `stat()`
+    一遍：60 帧 × 42 带 ≈ 2500 次系统调用（实测 20 帧就有 1.7 万次，9 s）。
+    帧清单在一次运行里不会变，缓存住即可。
+    """
+    key = f'{photo_dir}|{len(paths)}|{paths[0].name}|{paths[-1].name}'
+    hit = _SIG_CACHE.get(key)
+    if hit is not None:
+        return hit
+    h = hashlib.sha1()
+    h.update(_paths_sig(photo_dir, paths))
+    sig = h.digest()
+    _SIG_CACHE[key] = sig
+    return sig
+
+
 def _cache_file(photo_dir: Path, paths: List[Path], block: int, crop_px,
                 key_extra: str, cache_dir: Optional[Path]) -> Path:
     """缓存文件名 = 目录名 + 帧清单指纹（名字/大小/修改时间）+ 参数指纹
