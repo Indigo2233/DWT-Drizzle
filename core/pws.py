@@ -3286,7 +3286,8 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         # 整条通道平移了 1 像素（RGB 边缘出彩边）。这里保留各自的 dx/dy，但把
         # 画布换成首通道的，并把差异折进平移量：s*(u+ox) 不变。
         if (_CFA.get('pattern') and _CFA.get('auto_own') and not _CFA.get('want_share')
-                and not _grid_own and _CFA.get('geo') and drz_plan):
+                and str(getattr(p, 'cfa_grid', 'shared') or 'shared').strip().lower() != 'own'
+                and _CFA.get('geo') and drz_plan):
             _gp = _CFA['geo'].get('plan') or {}
             if _gp and abs(float(_gp.get('s', 0)) - float(drz_plan['s'])) < 1e-9:
                 _sc = float(drz_plan['s']) or 1.0
