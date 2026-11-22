@@ -222,6 +222,8 @@ def _argv_common(c) -> list:
         argv += ["--kernel", c["kernel"], "--psf-target", str(c.get("psf_target") or "50")]
     if str(c.get("two_pass", "0")) == "1":
         argv += ["--two-pass", "1"]
+    if float(c.get("detail_snr", "0") or 0) > 0:
+        argv += ["--detail-snr", str(c.get("detail_snr"))]
     return argv
 
 
@@ -604,6 +606,11 @@ class App(tk.Tk):
         arow(22, "PSF 目标", ttk.Spinbox(adv, from_=1, to=99, increment=5, width=6,
                                      textvariable=self.v_psf),
              "PSF 匹配时的目标锐度百分位：50＝中位（噪声降约 50%），35＝折中，80＝更糊更干净")
+        self.v_moon = tk.BooleanVar(value=False)
+        arow(24, "满月帧补偿",
+             tk.Checkbutton(adv, text="细节区也按 1/σ² 加权（β=1）",
+                            variable=self.v_moon),
+             "满月帧超过总帧数的 1/3、或满月那晚明显更锐时再勾；否则保持不勾")
         self.v_twopass = tk.StringVar()
         arow(23, "两遍加权", ttk.Combobox(
             adv, state="readonly", width=16, textvariable=self.v_twopass,
@@ -766,6 +773,7 @@ class App(tk.Tk):
             c.get("kernel", "box"), "方框（快）"))
         self.v_psf.set(str(c.get("psf_target", "50")))
         self.v_twopass.set("开" if int(c.get("two_pass", "0") or 0) else "关（推荐）")
+        self.v_moon.set(float(c.get("detail_snr", "0") or 0) >= 0.5)
         self.v_xdrz.set(c.get("xdrz", ""))
         self.v_match.set(c.get("match", ""))
         self._pick_saved = (c.get("pick") or "")
@@ -830,6 +838,7 @@ class App(tk.Tk):
                 self.v_kernel.get().strip(), "box"),
             "psf_target": self.v_psf.get().strip() or "50",
             "two_pass": "1" if self.v_twopass.get().strip() == "开" else "0",
+            "detail_snr": "1" if bool(self.v_moon.get()) else "0",
         }
 
     def _sync_drz(self):
@@ -1092,7 +1101,7 @@ class App(tk.Tk):
         """关于：方法与原文出处（PWS，D.Cikey）"""
         messagebox.showinfo(
             "关于 DWT · Drizzle",
-            "DWT · Drizzle 2.7.39-C\n\n" + LICENSE_TEXT)
+            "DWT · Drizzle 2.7.40-C\n\n" + LICENSE_TEXT)
 
     def show_help(self):
         """打开内置使用说明（不依赖浏览器 / 外部程序）"""
