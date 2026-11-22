@@ -2870,7 +2870,14 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
 
     # ---- 阶段 B：R 场 ----
     _emit('R 场', 0.0, '建参考像')
-    k = max(1, min(REF_SHARP_N, n))
+    # 参考像帧数：G 用 8 就够；R/B 只有 1/4 的采样，参考像本身噪声大，
+    # 量出来的 σ_psf 会被抬高（→ R 场过度平滑 → 成品发虚）。给它们加一倍帧数，
+    # 实测 60 帧全幅 B：k=8 → 1.630px，k=16 → 1.600px（WBPP 1.609）。
+    _refn = int(getattr(p, 'ref_k', 0) or 0)
+    if _refn <= 0:
+        _ch = str(_CFA.get('ch') or '')
+        _refn = 8 if _ch in ('', 'G') else 16
+    k = max(1, min(_refn, n))
     idx = np.argsort(np.nan_to_num(fwhms, nan=1e9))[:k]
 
     if star_grow_pct > 0:

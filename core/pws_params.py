@@ -77,7 +77,8 @@ class PwsParams:
     cfa_ref: str = ''               # 彩机参考目录（WBPP debayered），空=自动扫描
     cfa_raw: str = 'auto'           # auto|on|off：真 CFA（不插值，按颜色投样本）
     cfa_align: str = 'auto'
-    cfa_grid: str = 'shared'   # shared=三通道共用画布；own=各通道自己定画布         # auto|shared|own：彩机三通道对齐方式
+    cfa_grid: str = 'shared'
+    ref_k: int = 0   # shared=三通道共用画布；own=各通道自己定画布         # auto|shared|own：彩机三通道对齐方式
 
     # ---- CFA Drizzle（Bayer drizzle）：不解马赛克，按颜色分平面叠加 ----
     cfa_drizzle: bool = False
@@ -300,6 +301,9 @@ PARAMS: Tuple[Param, ...] = (
           'WBPP 的 debayered 目录，留空自动扫描',
           '用于估通道色差偏移（比在成品上估更干净）。叠加本身仍然只用原始 CFA 帧，'
           '不会退化成插值路线。留空时自动找素材同级的 debayered 目录。'),
+    Param('ref_k', '参考像帧数', 'int', '高级', '建 R 场参考像用的最锐帧数（0=自动：G 用 8，R/B 用 16）',
+          '参考像越干净，σ_psf 量得越准；R/B 采样少，帧数给小了会把 PSF 估糊、成品发虚。',
+          lo=0, hi=64, step=1),
     Param('cfa_grid', '彩机画布', 'choice', '高级',
           '共用画布 = 三通道像素级对齐（推荐）；逐通道画布 = 各通道按自己的配准定画布',
           '逐通道画布下三通道画布尺寸/原点可能差 1~2 像素，本版不做 RGB 合成，'

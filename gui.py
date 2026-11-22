@@ -208,6 +208,8 @@ def _argv_common(c) -> list:
         argv += ["--cfa-weights", c["cfa_weights"]]
     if c.get("cfa_grid", "shared") != "shared":
         argv += ["--cfa-grid", c["cfa_grid"]]
+    if int(c.get("ref_k", 0) or 0) > 0:
+        argv += ["--ref-k", str(int(c["ref_k"]))]
     if c.get("cfa_ref"):
         argv += ["--cfa-ref", c["cfa_ref"]]
     if c.get("cfa_raw", "auto") != "auto":
@@ -556,6 +558,11 @@ class App(tk.Tk):
             values=["自动", "共用", "逐通道"]),
              "共用＝三通道用同一套 C/S/T（与 PI 一致、更快）；逐通道＝各算各的")
         self.v_jobs = tk.StringVar()
+        self.v_refk = tk.StringVar()
+        _sp_refk = ttk.Spinbox(adv, from_=0, to=64, increment=1, width=6, textvariable=self.v_refk)
+        _sp_refk.grid(row=18, column=1, sticky="w", padx=4, pady=2)
+        arow(18, "参考像帧数", _sp_refk,
+             "0=自动（G 用 8，R/B 用 16）：R/B 采样少，帧数给小了 σ_psf 会估糊")
         self.v_cfag = tk.StringVar()
         _cb_cfag = ttk.Combobox(
             adv, state="readonly", width=12, textvariable=self.v_cfag,
@@ -744,6 +751,7 @@ class App(tk.Tk):
         self.v_cfad.set({"bilinear": "双线性", "superpixel": "2×2 合并"}.get(
             c.get("cfa_debayer", "bilinear"), "双线性"))
         self.v_jobs.set(str(c.get("jobs", "0")))
+        self.v_refk.set(str(c.get("ref_k", 0)))
         self.v_cfag.set({"shared": "共用画布", "own": "逐通道画布"}.get(
             str(c.get("cfa_grid", "shared")), "共用画布"))
         self.v_cfaw.set({"shared": "共用", "own": "逐通道"}.get(
@@ -801,6 +809,7 @@ class App(tk.Tk):
                         "强制关（走插值）": "off",
                         "混合（G 真 CFA + R/B 插值）": "hybrid"}.get(
                             self.v_cfaraw.get(), "auto"),
+            "ref_k": int(self.v_refk.get().strip() or 0),
             "cfa_grid": {"共用画布": "shared", "逐通道画布": "own"}.get(
                 self.v_cfag.get().strip(), "shared"),
             "cfa": {"关": "off", "自动识别": "auto"}.get(self.v_cfa.get().strip(),
@@ -1083,7 +1092,7 @@ class App(tk.Tk):
         """关于：方法与原文出处（PWS，D.Cikey）"""
         messagebox.showinfo(
             "关于 DWT · Drizzle",
-            "DWT · Drizzle 2.7.35-C\n\n" + LICENSE_TEXT)
+            "DWT · Drizzle 2.7.36-C\n\n" + LICENSE_TEXT)
 
     def show_help(self):
         """打开内置使用说明（不依赖浏览器 / 外部程序）"""
