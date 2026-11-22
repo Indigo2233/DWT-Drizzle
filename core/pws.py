@@ -1991,9 +1991,9 @@ def save_linear_xisf(path: Path, arr: np.ndarray, metas: List[Dict], mode_text: 
     # bounds 写真实数据范围：写死 0:1 会让 PixInsight 把 ADU 量级的成品
     # （天空几百、星点几万）当成「已归一化」的图像，超出 1 的全按饱和显示，
     # 一打开就是一片白。
-    _bv = a[np.isfinite(a)]
-    if _bv.size:
-        _b0, _b1 = float(_bv.min()), float(_bv.max())
+    # 用 nanmin/nanmax 而不是 a[np.isfinite(a)]：后者会给全幅再复制一份（417 MB）。
+    if np.isfinite(a).any():
+        _b0 = float(np.nanmin(a)); _b1 = float(np.nanmax(a))
     else:
         _b0, _b1 = 0.0, 1.0
     img.bounds = (_b0, _b1) if _b1 > _b0 else (0.0, 1.0)

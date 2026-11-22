@@ -947,11 +947,14 @@ class XISFWriter:
         image_data_list = []
         for idx, image in enumerate(self.images):
             if image.data is not None:
-                data_bytes = image.data.tobytes()
+                # 不 tobytes()：那会给整幅图再复制一份（全幅 float32 是 417 MB），
+                # 直接给 memoryview 让写盘按块摄取。字节内容与 tobytes() 完全一致。
+                _a = np.ascontiguousarray(image.data)
+                data_bytes = memoryview(_a).cast('B')
                 if compression and compression.startswith('zlib'):
-                    compressed_data = zlib.compress(data_bytes)
+                    compressed_data = zlib.compress(data_bytes.tobytes())
                     image_data_list.append(compressed_data)
-                    image.compression = f"zlib:{len(data_bytes)}"
+                    image.compression = f"zlib:{_a.nbytes}"
                 else:
                     image_data_list.append(data_bytes)
             else:
