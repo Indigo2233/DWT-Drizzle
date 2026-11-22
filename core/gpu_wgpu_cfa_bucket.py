@@ -39,7 +39,7 @@ struct Params {
   y_off: u32, c0: u32, r0: u32, mask: u32,
   P: f32, lnc: f32, lns: f32, wa: f32,
   wb: f32, has_r: f32, kslot: u32, s_off: u32,
-  lnt: f32,
+  lnt: f32, beta: f32,
 }
 
 @group(0) @binding(0) var<uniform> Q: Params;
@@ -87,7 +87,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (wy <= 0.0) { continue; }
       let idx = u32(gy) * Q.w_out + u32(kx);
       let R = select(0.5, rmap[(u32(gy) + Q.y_off) * Q.w_out + u32(kx)], Q.has_r > 0.5);
-      let wgt = exp(Q.wa * R * Q.lnc + Q.wb * (1.0 - R) * Q.lns);
+      let wgt = exp(Q.wa * R * Q.lnc +
+                    (Q.wb * (1.0 - R) + Q.beta * R) * Q.lns);
       // CPU 的 _scatter_band 用 1/P² 归一（液滴面积），这里同口径；
       // 不同帧 kk 略有差异时这一步会改变相对权重。
       let w = wgt * wx * wy / (Q.P * Q.P) * exp(Q.lnt);
@@ -474,7 +475,7 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
             kk_i = float(kk[i]) if np.isfinite(kk[i]) else 1.0
             ks = kk_i
             ux, uy = -float(dx[i]), -float(dy[i])
-            p = np.zeros(28, np.float32)
+            p = np.zeros(29, np.float32)
             p[0] = np.float32(s_grid * ks * ct)
             p[1] = np.float32(-s_grid * ks * stn)
             p[2] = np.float32(s_grid * ux + ox)
@@ -494,6 +495,7 @@ def stack_cfa_bucket(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
             _pu[21] = np.uint32(j * plane)
             _tv = float(T[j]) if T is not None else 1.0
             p[22] = np.float32(float(fp) * math.log(max(_tv, 1e-6)))
+            p[23] = np.float32(float(os.environ.get('DWT_DETAIL_SNR', '0') or 0))
             queue.write_buffer(uni, 0, p.tobytes())
             enc = dev.create_command_encoder()
             cp = enc.begin_compute_pass()
