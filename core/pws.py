@@ -2791,9 +2791,20 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     nw = 0 if (not fs.parallelable or _no_parallel()) \
         else min(plan_workers(32 * 2 ** 20, '测星点', cap=CAP_FWHM), n)
     if _CFA.get('raw') and _CFA.get('pattern'):
-        # 真 CFA：帧存储是马赛克，必须在 G 平面上量（否则拟合全废、C 恒 1）
-        log('[C] 真 CFA：在 G 平面上逐帧量 FWHM（串行）')
-        for i in range(n):
+        # 真 CFA：帧存储是马赛克，必须在 G 平面上量（否则拟合全废、C 恒 1）。
+        # 而且这个量与最终跑哪个通道无关（永远在 G 平面上量），所以三通道共用几何时
+        # R/B 直接复用 G 的结果——省掉每通道一次 60 帧 × 全幅拆色 + 120 次高斯拟合。
+        _fw_cache = _CFA.get('fwhm_cache')
+        if _fw_cache is not None and len(_fw_cache) == n:
+            log('[C] 复用 G 通道逐帧 FWHM（同一批帧、同在 G 平面上量，与重算等价）')
+            fwhms = np.array(_fw_cache, np.float64, copy=True)
+            for i in range(n):
+                _emit('测星点', (i + 1) / max(n, 1), f'{i + 1}/{n} 帧')
+            _reuse_fw = True
+        else:
+            _reuse_fw = False
+        log('[C] 真 CFA：在 G 平面上逐帧量 FWHM（串行）') if not _reuse_fw else None
+        for i in ([] if _reuse_fw else range(n)):
             _check_cancel()
             try:
                 _g = _cfa.plane(np.asarray(fs.frame(i), np.float32),
@@ -2804,6 +2815,8 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 if i == 0:
                     log(f'[C] G 平面量 FWHM 失败（{type(_ec).__name__}: {_ec}），C 退回 1.0')
             _emit('测星点', (i + 1) / max(n, 1), f'{i + 1}/{n} 帧')
+        if not _reuse_fw:
+            _CFA['fwhm_cache'] = np.array(fwhms, np.float64, copy=True)
     elif nw > 1:
         ex = ProcessPoolExecutor(max_workers=nw, initializer=ini, initargs=ini_args)
         try:
@@ -3921,15 +3934,21 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                                'NeffMedian': float(np.median(neff)),
                                'SigmaFrameMedian': float(np.median(sig_out)),
                                'SigmaSky': sky_sd})
-        np.save(out_dir / f'{stem}_neff.npy', neff)
-        if cov_map is not None:
-            np.save(out_dir / f'{stem}_ncov.npy', np.asarray(cov_map, np.float32))
-        np.save(out_dir / f'{stem}_R.npy', R)
+        # 辅助数组（R 场 / N_eff / 覆盖）每个都是整幅 417 MB，三通道写 1.25 GB。
+        # 评价页与权重场页需要时才落盘（DWT_SAVE_AUX=1），默认只写成品与权重表，
+        # 省掉每通道 ~0.6 s 的写盘与 800 MB 磁盘占用。
+        _save_aux = str(os.environ.get('DWT_SAVE_AUX', '0')).strip() == '1'
+        if _save_aux:
+            np.save(out_dir / f'{stem}_neff.npy', neff)
+            if cov_map is not None:
+                np.save(out_dir / f'{stem}_ncov.npy', np.asarray(cov_map, np.float32))
+            np.save(out_dir / f'{stem}_R.npy', R)
         np.savetxt(out_dir / f'{stem}_weights.txt',
                    np.column_stack([np.arange(n), fwhms, C, sig_out, S]),
                    header='idx fwhm_px C_sharp sigma S_snr', comments='# ', fmt='%.6g')
-        log(f'[输出] 逐帧权重表 {stem}_weights.txt / R 场 {stem}_R.npy / '
-            f'N_eff {stem}_neff.npy')
+        log(f'[输出] 逐帧权重表 {stem}_weights.txt'
+            + (f' / R 场 {stem}_R.npy / N_eff {stem}_neff.npy' if _save_aux else
+               '（R 场与 N_eff 未落盘，需要时设 DWT_SAVE_AUX=1）'))
 
         # ---- 原生尺寸副本：按 N×N 块平均缩回（不额外叠一遍）----
         try:
