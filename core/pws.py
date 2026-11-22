@@ -2374,6 +2374,30 @@ def _merge_cfa_rgb(out_dir, stem: str, log) -> None:
     with contextlib.redirect_stdout(io.StringIO()):
         write_xisf(str(out), img, compression=None)
     log(f'[CFA] 合成彩色 {out.name}  {w}×{h}×3（三个单通道文件也保留）')
+    # ---- 自动预览：和「重新合成 RGB」用同一套定标（中位 ± MAD、asinh）----
+    if str(os.environ.get('DWT_RGB_PREVIEW', '1')).strip().lower() not in (
+            '0', 'off', 'false', 'no'):
+        try:
+            from maps_page import _to_png
+            _lo = np.zeros(3, np.float32)
+            _hi = np.zeros(3, np.float32)
+            for _c in range(3):
+                _v = a[..., _c]
+                _m = float(np.nanmedian(_v))
+                _d = float(np.nanmedian(np.abs(_v - _m))) * 1.4826
+                _lo[_c] = max(0.0, _m - 2.8 * _d)
+                _hi[_c] = _m + 60.0 * _d
+            _x = np.clip((a - _lo) / np.maximum(_hi - _lo, 1e-12), 0.0, 1.0)
+            _x = np.arcsinh(_x * 18.0) / np.arcsinh(18.0)
+            _u8 = np.nan_to_num(_x * 255.0).astype(np.uint8)
+            _sg = max(1, int(np.ceil(max(h, w) / 1200.0)))
+            _u8 = _u8[::_sg, ::_sg]
+            _pv = src / f'{stem}_RGB_preview.png'
+            _pv.write_bytes(_to_png(_u8))
+            log('[CFA] 预览图 %s  %d×%d（抽样 %d）'
+                % (_pv.name, _u8.shape[1], _u8.shape[0], _sg))
+        except Exception as _ep:
+            log('[CFA] 预览图生成失败（不影响成品）：%s' % _ep)
 
 
 def _clean_stale_frames(max_age_h: float = 2.0) -> int:
