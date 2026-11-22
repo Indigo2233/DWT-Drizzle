@@ -3627,11 +3627,12 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                                 _plane_mb = float(fs.shape[0]) * float(fs.shape[1]) * 4.0 / (1024.0 * 1024.0)
                                 _ring_need = len(dx) * _plane_mb
                                 _limit_mb = 2047.0 * 0.9
-                                if _ring_need > _limit_mb and os.environ.get('DWT_CANVAS_RING', '0').strip() != '1':
-                                    log('[wgpu] 画布后端需要环形缓冲（%d 帧 × %.0f MB > %.0f MB），'
-                                        '改走分桶后端以避免已知的画质问题'
-                                        % (len(dx), _plane_mb, _limit_mb))
-                                    raise _Skip('canvas ring disabled')
+                                # 2.7.34-C：环形缓冲已修对（每趟重新上传，见 gpu_wgpu_cfa_fatom.py），
+                                # 帧数超过单绑定上限也能走画布后端；DWT_CANVAS_RING=0 可强制回分桶。
+                                if _ring_need > _limit_mb and os.environ.get('DWT_CANVAS_RING', '1').strip() == '0':
+                                    log('[wgpu] 画布环形缓冲被 DWT_CANVAS_RING=0 关闭（%d 帧 × %.0f MB > %.0f MB），'
+                                        '改走分桶后端' % (len(dx), _plane_mb, _limit_mb))
+                                    raise _Skip('canvas ring disabled by env')
                                 if _fa_ok() and (_canv == '1' or _need_mb <= 6000.0):
                                     return _sgg(fs, C, S, dx, dy, th, kk, drz_plan,
                                                 A, B, rej_k=rej_k, rej_gate=rej_gate,

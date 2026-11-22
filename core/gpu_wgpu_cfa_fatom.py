@@ -357,7 +357,14 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
             queue.write_buffer(bR, 0, np.zeros(4, np.float32).tobytes())
             rsz = 16
 
+        # 环形模式下源缓冲只能容纳 1~2 帧，任何一趟要读 src 的 pass 都必须
+        # 重新把逐帧数据传进来（否则那一趟只看到最后两帧，成品会周期性重复）。
+        # 代价是每趟多搬一次帧数据（全幅 60 帧约 6 GB/趟），比走分桶快得多。
+        _acc_passes = [0]
+
         def scatter(mode, kclip, upload=False):
+            if _ring and not upload:
+                upload = True          # 环形：每一趟都重新上传，保证看得到全部帧
             p[20] = np.float32(kclip)
             p[21] = np.float32(float(mode))
             enc = None if upload else dev.create_command_encoder()
