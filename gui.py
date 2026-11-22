@@ -392,6 +392,8 @@ class App(tk.Tk):
                    command=lambda: self._check_all(True)).pack(side="left", padx=(6, 0))
         ttk.Button(bar2, text="全不选", width=6,
                    command=lambda: self._check_all(False)).pack(side="left", padx=(4, 0))
+        ttk.Button(bar2, text="重新合成 RGB…", width=14,
+                   command=self._recompose_rgb).pack(side="left", padx=(12, 0))
         self.lab_ch = tk.Label(bar2, text="先扫描，再在下面选要叠的通道（不选 = 全部）",
                                bg=BG, fg="#6b7280", font=FONT_S)
         self.lab_ch.pack(side="left", padx=10)
@@ -1088,6 +1090,67 @@ class App(tk.Tk):
                 self._auto_paths.pop(key, None)
                 self._log_line("[界面] 没找到%s，已清空（原来自动填的）：%s" % (hint, cur))
 
+    def _recompose_rgb(self):
+        """选 R/G/B 三个成品重新合成 RGB（不做白平衡；可选按天空对齐）。"""
+        out_dir = self.v_out.get().strip() or str(HERE)
+        picks = []
+        for ch in ("R", "G", "B"):
+            f = filedialog.askopenfilename(
+                title="选择 %s 通道成品（PWS_*_%s.xisf）" % (ch, ch),
+                initialdir=out_dir,
+                filetypes=[("XISF", "*.xisf"), ("所有文件", "*.*")])
+            if not f:
+                return
+            picks.append(f)
+        tag = self.v_tag.get().strip() or "RGB"
+        default = str(Path(out_dir) / ("PWS_%s_RGB.xisf" % tag))
+        out = filedialog.asksaveasfilename(
+            title="RGB 保存为", initialdir=out_dir, initialfile=Path(default).name,
+            defaultextension=".xisf", filetypes=[("XISF", "*.xisf")])
+        if not out:
+            return
+        sky = messagebox.askyesno(
+            "白平衡", "要把 R/B 的天空亮度对齐到 G 吗？\n\n"
+                     "选「否」= 完全保持原始比例（默认，不做白平衡）")
+        script = HERE / "recompose_rgb.py"
+        if not script.exists():
+            messagebox.showerror("缺少脚本", "包里找不到 recompose_rgb.py")
+            return
+        argv = [sys.executable, str(script),
+                "--r", picks[0], "--g", picks[1], "--b", picks[2], "--out", out]
+        if sky:
+            argv.append("--sky-match")
+        argv += ["--preview", str(Path(out).with_suffix(".png"))]
+        self._log_line("[合成] R=%s" % picks[0])
+        self._log_line("[合成] G=%s" % picks[1])
+        self._log_line("[合成] B=%s" % picks[2])
+        self._log_line("[合成] 输出 %s（白平衡：%s）" % (out, "按天空对齐" if sky else "不做"))
+
+        def _run():
+            try:
+                env = dict(os.environ)
+                env["PYTHONPATH"] = os.pathsep.join(
+                    [str(HERE / "pydeps"), str(HERE), str(HERE / "core"),
+                     str(HERE / "gpudeps")])
+                pr = subprocess.Popen(argv, cwd=str(HERE), env=env,
+                                      stdout=subprocess.PIPE,
+                                      stderr=subprocess.STDOUT)
+                for raw in pr.stdout:
+                    try:
+                        line = raw.decode("gbk")
+                    except Exception:
+                        line = raw.decode("utf-8", "replace")
+                    line = line.rstrip()
+                    if line:
+                        self.after(0, self._log_line, "[合成] " + line)
+                code = pr.wait()
+                self.after(0, self._log_line,
+                           "[合成] 完成（退出码 %d）：%s" % (code, out))
+            except Exception as e:
+                self.after(0, self._log_line, "[合成] 失败：%s: %s" % (type(e).__name__, e))
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def _open_out(self):
         p = self.v_out.get().strip()
         if p and Path(p).exists():
@@ -1165,7 +1228,7 @@ class App(tk.Tk):
         """关于：方法与原文出处（PWS，D.Cikey）"""
         messagebox.showinfo(
             "关于 DWT · Drizzle",
-            "DWT · Drizzle 2.7.48-C\n\n" + LICENSE_TEXT)
+            "DWT · Drizzle 2.7.49-C\n\n" + LICENSE_TEXT)
 
     def show_help(self):
         """打开内置使用说明（不依赖浏览器 / 外部程序）"""

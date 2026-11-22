@@ -2376,6 +2376,36 @@ def _merge_cfa_rgb(out_dir, stem: str, log) -> None:
     log(f'[CFA] 合成彩色 {out.name}  {w}×{h}×3（三个单通道文件也保留）')
 
 
+def _clean_stale_frames(max_age_h: float = 2.0) -> int:
+    """删掉 core/_DWT_frames 里超过 max_age_h 小时的旧文件（崩溃残留）。
+
+    正常结束时 FrameSet.close() 会自己清理；但中途被杀掉或断电就会留下
+    几十 GB 的 .dat，跑几次就把盘塞满，所以启动时兜一次底。
+    """
+    import time
+    try:
+        base = Path(__file__).resolve().parent / "_DWT_frames"
+        if not base.is_dir():
+            return 0
+        cutoff = time.time() - max_age_h * 3600.0
+        n = 0
+        for f in base.iterdir():
+            try:
+                if f.is_file() and f.stat().st_mtime < cutoff:
+                    f.unlink()
+                    n += 1
+            except Exception:
+                continue
+        try:
+            if not any(base.iterdir()):
+                base.rmdir()
+        except Exception:
+            pass
+        return n
+    except Exception:
+        return 0
+
+
 def _detail_beta(p) -> float:
     """满月帧补偿（--detail-snr）只在真 CFA 时生效，黑白流程必须为零。"""
     if not _CFA.get("pattern"):
@@ -2526,6 +2556,9 @@ def _run(p: PwsParams) -> Dict:
         # 因此 auto = 共用；真要逐通道，手动填 --cfa-weights own。
         log('[CFA] 权重 auto：真 CFA 下逐通道 FWHM 估计被噪声主导（实测排序相关≈0.3），'
             '逐通道权重只会放大噪声且多花两遍测量 → 使用共用权重；要强制逐通道请填 own')
+    _stale = _clean_stale_frames()
+    if _stale:
+        log('[清理] 删掉 %d 个过期的临时帧缓存（>2 小时）' % _stale)
     # ---- 磁盘预检：cfa_pat 已定，知道要出几个平面了 ----
     try:
         _p0 = next(iter(groups.values()))[0]
