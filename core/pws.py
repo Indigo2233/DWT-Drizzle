@@ -133,6 +133,8 @@ class _Skip(Exception):
     """内部信号：该 GPU 路径按配置跳过，不是失败，不写日志。"""
 
 
+_FS_CACHE: dict = {}
+
 CAP_DRIZZLE = 32
 
 # 逐帧行固定纹去除（row FPN）：默认开，DWT_NO_ROWFPN=1 关掉做 A/B
@@ -721,6 +723,10 @@ class FrameSet:
             盘都放不下、退回父进程内存 list 时，它记的是进程自己的占用。
         """
         return self.n * self.shape[0] * self.shape[1] * 4 if self.resident else 0
+
+    #: 三通道共用同一份帧存储时置 True：通道结束时只 flush，不释放/不删文件，
+    #: 由 _run 在最后一个通道跑完后统一 close()（见 _run 末尾）。
+    _shared = False
 
     def close(self, keep: bool = False) -> None:
         if self.mm is not None:
@@ -2548,6 +2554,14 @@ def _run(p: PwsParams) -> Dict:
             except Exception as e:
                 log(f'[CFA] RGB 合成失败（不影响三个单通道成品）：{e}')
         _CFA['ch'], _CFA['pattern'] = None, None
+        # 三通道共用缓存到这里才真正释放（含删 memmap 临时文件）
+        for _f in list(_FS_CACHE.values()):
+            try:
+                _f._shared = False
+                _f.close(keep=keep_frames)
+            except Exception:
+                pass
+        _FS_CACHE.clear()
     _set_group(0, 1, '')
     _fit_line = fit_warn_line()
     if _fit_line:
@@ -2668,10 +2682,30 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
 
     # ---- 阶段 0：读帧 + 帧级归一（自动选驻留 / memmap）----
     center = resolve_center(frames, crop, parse_center(p.center))
-    fs = prepare_frames(frames, ';'.join(str(s) for s in sources), crop, center,
-                        limit, frames_dir, keep_frames=keep_frames,
-                        bgdeg=int(getattr(p, 'bgdeg', 1) or 0),
-                        bg_r=int(getattr(p, 'bg_r', 0) or 0))
+    # 三通道共用几何时，读帧 / 减背景 / 量天空这十几秒只需做一次。
+    # 同一个 run 内按（帧列表、裁剪、中心、上限、背景模型）缓存；帧数据只读
+    # （拆色在 _PlaneFS 里按需做），复用不会污染任何通道。
+    _ck = (tuple(str(f) for f in frames), int(crop), tuple(center or ()),
+           int(limit or 0), int(getattr(p, 'bgdeg', 1) or 0),
+           int(getattr(p, 'bg_r', 0) or 0), bool(keep_frames))
+    _hit = _FS_CACHE.get(_ck)
+    if _hit is not None and _hit.arrays is not None or (
+            _hit is not None and _hit.mm is not None):
+        fs = _hit
+        fs._shared = True
+        log('[读帧] 复用本组已读入的 %d 帧（三通道共用同一批帧，免重复读盘）' % fs.n)
+        try:
+            _emit('读帧', 1.0, '%d/%d 帧（复用）' % (fs.n, fs.n))
+        except Exception:
+            pass
+    else:
+        fs = prepare_frames(frames, ';'.join(str(s) for s in sources), crop, center,
+                            limit, frames_dir, keep_frames=keep_frames,
+                            bgdeg=int(getattr(p, 'bgdeg', 1) or 0),
+                            bg_r=int(getattr(p, 'bg_r', 0) or 0))
+        if _CFA.get('pattern'):
+            fs._shared = True
+        _FS_CACHE[_ck] = fs
     n = len(fs)
     # ---- 彩机对齐方式 auto：在 G 通道这遍（第一个通道）量一次色差 ----
     if (_CFA.get('pattern') and _CFA.get('ch') == 'G'
@@ -3754,7 +3788,8 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 if _wmap is not None:
                     r_d = _do_stack()
         finally:
-            fs.close(keep=keep_frames)
+            if not getattr(fs, '_shared', False):
+                fs.close(keep=keep_frames)
         Stk = r_d['stack']
         neff = r_d['neff']
         cov_map = r_d.get('ncov')
@@ -3816,8 +3851,9 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                     del W, D, s, ne, rr
                     _emit('叠加', (k + 1) / n_strip, f'{k + 1}/{n_strip} 条带')
         finally:
-            # 正常跑完与中途终止都要清理临时帧文件
-            fs.close(keep=keep_frames)
+            # 正常跑完与中途终止都要清理临时帧文件（三通道共享时由 _run 收尾统一关）
+            if not getattr(fs, '_shared', False):
+                fs.close(keep=keep_frames)
     # 条带全部落位后一次回乘（串行/并行在此汇合，只乘一次；元素级乘法与切分无关）
     Stk *= np.float32(scale_out)
     log(f'[量纲] 成品回乘 ×{scale_out:g}（曝光中位 {t_med:g}s / 归一基准 {EXPTIME_REF:g}s），'
