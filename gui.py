@@ -19,6 +19,11 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 try:
+    import ui_round
+except Exception:      # 缺文件时退回原生控件
+    ui_round = None
+
+try:
     import help_page as _hp
 except Exception:
     _hp = None
@@ -61,18 +66,45 @@ _CFG_HOME = (Path.home() / "Library" / "Application Support"
              else Path(os.environ.get("APPDATA", str(Path.home()))))
 CFG = _CFG_HOME / "DWT_Drizzle" / "settings.json"
 
-BG = "#eef1f5"
+BG = "#f5f5f7"
 CARD = "#ffffff"
-BORDER = "#d8dee6"
-ACCENT = "#0f766e"
-ACCENT_D = "#0b5c56"
-FG = "#1f2937"
+BORDER = "#e3e3e8"
+ACCENT = "#0071e3"
+ACCENT_D = "#0059b3"
+FG = "#1d1d1f"
+FG2 = "#6e6e73"   # 次级文字
 
 import sys as _sys
 _FONT_FAMILY = ("PingFang SC" if _sys.platform == "darwin"
                 else "Microsoft YaHei UI" if _sys.platform.startswith("win")
                 else "Noto Sans CJK SC")
-FONT = (_FONT_FAMILY, 10)
+def _ui_scale(root) -> float:
+    """按屏幕 DPI 给字号/间距做缩放（96 dpi = 1.0）。"""
+    try:
+        dpi = float(root.winfo_fpixels("1i"))
+    except Exception:
+        dpi = 96.0
+    sc = max(0.85, min(2.0, dpi / 96.0))
+    try:
+        root.tk.call("tk", "scaling", dpi / 72.0)
+    except Exception:
+        pass
+    return sc
+
+
+_UI = [1.0]          # 运行时缩放系数（_build_style 里写入）
+
+
+def _f(size):
+    """字号按 DPI 缩放（返回整数磅值）。"""
+    return max(8, int(round(size * _UI[0])))
+
+
+def _px(n):
+    return max(1, int(round(n * _UI[0])))
+
+
+FONT = (_FONT_FAMILY, _f(10))
 FONT_S = (_FONT_FAMILY, 9)
 
 # 界面布局清单：把分组名从一张表挪到另一张，就换到另一个标签页（改这一处即可）
@@ -264,40 +296,73 @@ class App(tk.Tk):
             style.theme_use("clam")
         except Exception:
             pass
-        style.configure(".", font=FONT, background=BG)
+        _UI[0] = _ui_scale(self)
+        global FONT, FONT_S, FONT_B, FONT_T
+        FONT = (_FONT_FAMILY, _f(10))
+        FONT_S = (_FONT_FAMILY, _f(9))
+        FONT_B = (_FONT_FAMILY, _f(10), "bold")
+        FONT_T = (_FONT_FAMILY, _f(15), "bold")
+
+        style.configure(".", font=FONT, background=BG, foreground=FG)
         style.configure("TFrame", background=BG)
+        style.configure("Card.TFrame", background=CARD)
         style.configure("TLabel", background=BG, foreground=FG)
-        style.configure("TCheckbutton", background=BG, foreground=FG)
-        style.configure("TRadiobutton", background=BG, foreground=FG)
+        style.configure("Card.TLabel", background=CARD, foreground=FG)
+        style.configure("Hint.TLabel", background=CARD, foreground=FG2,
+                        font=FONT_S)
+        style.configure("TCheckbutton", background=CARD, foreground=FG,
+                        focusthickness=0, padding=(0, _px(2)))
+        style.map("TCheckbutton", background=[("active", CARD)])
+        style.configure("TRadiobutton", background=CARD, foreground=FG,
+                        focusthickness=0)
+        style.map("TRadiobutton", background=[("active", CARD)])
+        # 卡片：白底、无边框、留出内边距（圆润感来自留白与圆角标题条）
         style.configure("TLabelframe", background=CARD, bordercolor=BORDER,
+                        lightcolor=BORDER, darkcolor=BORDER,
                         relief="solid", borderwidth=1)
-        style.configure("TLabelframe.Label", background=BG, foreground=ACCENT_D,
-                        font=FONT_B)
-        style.configure("TNotebook", background=BG, borderwidth=0)
-        style.configure("TNotebook.Tab", padding=(16, 7), font=FONT,
-                        background="#e5e7eb", foreground="#374151")
+        style.configure("TLabelframe.Label", background=CARD, foreground=FG2,
+                        font=FONT_S)
+        style.configure("TNotebook", background=BG, borderwidth=0,
+                        tabmargins=(_px(2), _px(6), _px(2), 0))
+        style.configure("TNotebook.Tab", padding=(_px(18), _px(8)), font=FONT,
+                        background=BG, foreground=FG2, borderwidth=0)
         style.map("TNotebook.Tab",
-                  background=[("selected", CARD)], foreground=[("selected", ACCENT_D)])
-        style.configure("TButton", padding=(12, 6), background="#ffffff",
-                        bordercolor=BORDER, focusthickness=1, font=FONT)
+                  background=[("selected", CARD)],
+                  foreground=[("selected", FG)],
+                  expand=[("selected", (0, 0, 0, 0))])
+        style.configure("TButton", padding=(_px(14), _px(8)), background=CARD,
+                        bordercolor=BORDER, focusthickness=0, font=FONT,
+                        relief="flat")
         style.map("TButton",
-                  background=[("active", "#eef2f7"), ("pressed", "#e2e8f0")])
-        style.configure("Run.TButton", font=FONT_B, padding=(18, 8),
-                        background=ACCENT, foreground="#ffffff", bordercolor=ACCENT)
+                  background=[("active", "#f0f0f3"), ("pressed", "#e8e8ed")])
+        style.configure("Run.TButton", font=FONT_B, padding=(_px(22), _px(10)),
+                        background=ACCENT, foreground="#ffffff", bordercolor=ACCENT,
+                        relief="flat")
         style.map("Run.TButton",
                   background=[("active", ACCENT_D), ("pressed", ACCENT_D),
-                              ("disabled", "#b9c6c4")],
-                  foreground=[("disabled", "#f1f5f9")])
-        style.configure("TEntry", padding=4, fieldbackground="#ffffff")
-        style.configure("TSpinbox", padding=3, fieldbackground="#ffffff")
-        style.configure("TCombobox", padding=3)
-        style.configure("TScrollbar", background="#dbe2ea", troughcolor=BG,
-                        bordercolor=BG, arrowcolor="#64748b")
+                              ("disabled", "#c7c7cc")],
+                  foreground=[("disabled", "#ffffff")])
+        style.configure("Stop.TButton", font=FONT_B, padding=(_px(18), _px(10)),
+                        background="#ffffff", foreground="#ff3b30",
+                        bordercolor=BORDER, relief="flat")
+        style.map("Stop.TButton",
+                  background=[("active", "#fff1f0"), ("pressed", "#ffe4e1")])
+        style.configure("TEntry", padding=_px(6), fieldbackground="#ffffff",
+                        bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER,
+                        relief="flat")
+        style.configure("TSpinbox", padding=_px(5), fieldbackground="#ffffff",
+                        bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER,
+                        relief="flat")
+        style.configure("TCombobox", padding=_px(5), fieldbackground="#ffffff",
+                        bordercolor=BORDER, relief="flat")
+        style.map("TCombobox", fieldbackground=[("readonly", "#ffffff")])
+        style.configure("TScrollbar", background="#d9d9de", troughcolor=BG,
+                        bordercolor=BG, arrowcolor="#8e8e93", relief="flat")
 
     def _build_ui(self):
         # 顶栏
-        top = tk.Frame(self, bg="#171e29", height=64)
-        top.pack(fill="x")
+        top = tk.Frame(self, bg="#ffffff", height=_px(72))
+        top.pack(fill="x", pady=(0, _px(10)))
         top.pack_propagate(False)
         tk.Label(top, text="DWT", bg="#171e29", fg="#2dd4bf",
                  font=(_FONT_FAMILY, 18, "bold")).pack(side="left", padx=(20, 8))
@@ -416,7 +481,7 @@ class App(tk.Tk):
 
         # 参数
         g = ttk.Labelframe(body, text=" 叠加参数 ", padding=10)
-        g.pack(fill="x", pady=(10, 0))
+        g.pack(fill="x", pady=(_px(2), _px(10)))
         self.v_A = tk.StringVar()
         self.v_rejk = tk.StringVar()
         self.v_nstar = tk.StringVar()
@@ -438,7 +503,7 @@ class App(tk.Tk):
 
         # Drizzle
         d = ttk.Labelframe(body_dz, text=" Drizzle ", padding=10)
-        d.pack(fill="x", pady=(10, 0))
+        d.pack(fill="x", pady=(_px(2), _px(10)))
         self.v_drz = tk.BooleanVar()
         self.v_scale = tk.StringVar()
         self.v_pix = tk.StringVar()
@@ -636,11 +701,22 @@ class App(tk.Tk):
 
         # 操作（固定在窗口底部，两个标签页都能点到）
         bar = self.bar
-        self.btn_run = ttk.Button(bar, text="▶  开始叠加", style="Run.TButton",
-                                  command=self.start)
-        self.btn_run.pack(side="left")
-        self.btn_stop = ttk.Button(bar, text="■ 停止", command=self.stop, state="disabled")
-        self.btn_stop.pack(side="left")
+        if ui_round is not None:
+            self.btn_run = ui_round.RoundButton(
+                bar, "开始叠加", command=self.start, kind='primary',
+                font=(_FONT_FAMILY, _f(10), "bold"), pad_x=_px(24), pad_y=_px(10))
+            self.btn_run.pack(side="left")
+            self.btn_stop = ui_round.RoundButton(
+                bar, "停止", command=self.stop, kind='danger',
+                font=(_FONT_FAMILY, _f(10), "bold"), pad_x=_px(18), pad_y=_px(10))
+            self.btn_stop.pack(side="left", padx=(_px(8), 0))
+        else:
+            self.btn_run = ttk.Button(bar, text="开始叠加", style="Run.TButton",
+                                      command=self.start)
+            self.btn_run.pack(side="left")
+            self.btn_stop = ttk.Button(bar, text="停止", command=self.stop,
+                                       state="disabled")
+            self.btn_stop.pack(side="left")
         ttk.Button(bar, text="存为默认", width=10, command=self.save_default).pack(
             side="left", padx=(16, 0))
         ttk.Button(bar, text="查看权重场", width=12,
@@ -1228,7 +1304,7 @@ class App(tk.Tk):
         """关于：方法与原文出处（PWS，D.Cikey）"""
         messagebox.showinfo(
             "关于 DWT · Drizzle",
-            "DWT · Drizzle 2.7.52-C\n\n" + LICENSE_TEXT)
+            "DWT · Drizzle 2.7.52-D\n\n" + LICENSE_TEXT)
 
     def show_help(self):
         """打开内置使用说明（不依赖浏览器 / 外部程序）"""
