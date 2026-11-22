@@ -431,7 +431,7 @@ class App(tk.Tk):
                 row=1, column=col * 2, columnspan=2, sticky="w")
 
         cell(g, 0, "清晰度 A", self.v_A, 8,
-             "彩机建议 10（等效帧数更高、噪声低）；黑白建议 20（更锐）；14 折中")
+             "彩机建议 6（等效帧数更高、噪声低）；黑白建议 20（更锐）；14 折中")
         cell(g, 1, "排异 κ", self.v_rejk, 8, "3.5σ，越大越保守")
         cell(g, 2, "星点数", self.v_nstar, 8, "120，视场大可以加")
         cell(g, 3, "限帧", self.v_limit, 8, "只用前 N 帧；0 = 全部")
@@ -1228,7 +1228,7 @@ class App(tk.Tk):
         """关于：方法与原文出处（PWS，D.Cikey）"""
         messagebox.showinfo(
             "关于 DWT · Drizzle",
-            "DWT · Drizzle 2.7.50-C\n\n" + LICENSE_TEXT)
+            "DWT · Drizzle 2.7.51-C\n\n" + LICENSE_TEXT)
 
     def show_help(self):
         """打开内置使用说明（不依赖浏览器 / 外部程序）"""
@@ -1330,7 +1330,7 @@ class App(tk.Tk):
         try:
             if self.v_cfa.get().strip() in ("", "关"):
                 return
-            self._log("[界面] 提示：彩机建议清晰度 A=10（等效帧数更高、噪声更低）；"
+            self._log("[界面] 提示：彩机建议清晰度 A=6（等效帧数更高、噪声更低）；"
                       "黑白建议 A=20。当前值不会被自动修改。")
         except Exception:
             pass
