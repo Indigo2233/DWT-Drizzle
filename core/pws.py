@@ -2695,11 +2695,13 @@ def _run(p: PwsParams) -> Dict:
                 except Exception as _e:
                     _merge_cfa_rgb._ref_dir = None
                     log(f'[参考] 扫描彩机参考目录失败（跳过）：{_e}')
+                # 无论画布模式如何都尝试合成：逐通道模式下三张画布可能差一两个像素，
+                # 合并函数会按最小画布裁齐并给出提示（实测差 1~2 px，裁掉即可，
+                # 不合成反而让用户以为功能没生效）。
                 if _grid_own:
-                    log('[CFA] 逐通道画布：三通道各自定画布，本次不做 RGB 合成'
-                        '（需要合色请在 PI 里对齐后合成，或改回「共用画布」）')
-                else:
-                    _merge_cfa_rgb(out_dir, stem, log)
+                    log('[CFA] 逐通道画布：按最小画布裁齐后合成 RGB'
+                        '（像素级对齐仍以各通道自己的配准为准）')
+                _merge_cfa_rgb(out_dir, stem, log)
             except Exception as e:
                 log(f'[CFA] RGB 合成失败（不影响三个单通道成品）：{e}')
         _CFA['ch'], _CFA['pattern'] = None, None
