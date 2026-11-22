@@ -1806,7 +1806,9 @@ def _task_trail(job) -> Tuple[int, float, float]:
 def _task_strip(job):
     """一条带的权重 + 排异 + 加权平均（与串行的三段调用完全同序同式）"""
     y0, y1, Rr, C, S, A, B, rej_k, sky0, rej_gate, T, fp = job
-    _beta = float(getattr(p, 'detail_snr', 0.0) or 0.0)
+    # 满月补偿只对真 CFA 有效：黑白流程必须与之前完全一致
+    _beta = (float(getattr(p, 'detail_snr', 0.0) or 0.0)
+             if _CFA.get('pattern') else 0.0)
     W = strip_weights(C, S, Rr, A, B, T=T, fp=fp, beta=_beta)
     mm, off = _MEM['mm'], _MEM['off']
     D = np.stack([mm[i, y0:y1] - np.float32(off[i]) for i in range(len(C))])
@@ -2376,6 +2378,52 @@ def _merge_cfa_rgb(out_dir, stem: str, log) -> None:
     log(f'[CFA] 合成彩色 {out.name}  {w}×{h}×3（三个单通道文件也保留）')
 
 
+def _check_disk_space(frames, out_dir, scale: float, log) -> None:
+    """跑之前先看盘：memmap 帧 + 画布 + 三个单通道 + RGB + 辅助数组。
+
+    经验值：60 帧全幅 2× 约要 6.2 GB（memmap）+ 1.3 GB×3（单通道）
+    + 1.3 GB（RGB）+ 0.9 GB（辅助）≈ 11 GB。这里按「帧 + 6×画布」估，
+    再留 15% 余量；不够就直接报错，避免跑到一半写爆盘。
+    """
+    try:
+        import shutil
+        f0 = frames[0]
+        if isinstance(f0, (tuple, list)):
+            f0 = f0[0]
+        one = float(Path(str(f0)).stat().st_size)
+        n = len(frames)
+        px = 0.0
+        try:
+            from .xisf_io import read_frame as _rf
+        except Exception:
+            _rf = None
+        if _rf is not None:
+            try:
+                _img, _meta = _rf(str(f0))
+                _shp = tuple(getattr(_img, "shape", ()))[:2]
+                if len(_shp) == 2:
+                    px = float(_shp[0] * _shp[1])
+                del _img
+            except Exception:
+                px = 0.0
+        if px <= 0:
+            px = max(1.0, one / 4.0)
+        need = n * one + 6.0 * px * max(1.0, float(scale)) ** 2 * 4.0
+        need *= 1.15
+        free = float(shutil.disk_usage(str(out_dir)).free)
+        if free < need:
+            raise SystemExit(
+                "磁盘空间不足：%s 还剩 %.1f GB，这次大约需要 %.1f GB。"
+                % (out_dir, free / 2 ** 30, need / 2 ** 30)
+                + chr(10) + "请清理后再跑，或把输出目录换到空间更大的盘。")
+        log("[磁盘] %s 可用 %.1f GB，预计需要 %.1f GB"
+            % (out_dir, free / 2 ** 30, need / 2 ** 30))
+    except SystemExit:
+        raise
+    except Exception as _e:
+        log("[磁盘] 空间检查跳过（%s: %s）" % (type(_e).__name__, _e))
+
+
 def run(p: PwsParams, on_log=None, on_progress=None, should_cancel=None) -> Dict:
     """PWS 引擎的对外唯一入口（界面与命令行都调它）
 
@@ -2404,6 +2452,8 @@ def _run(p: PwsParams) -> Dict:
         raise SystemExit('请选择输出目录（不放在素材目录里，避免成品被当成帧）')
     out_dir = Path(p.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+    _check_disk_space(frames, out_dir,
+                      float(getattr(p, 'drizzle_scale', 1.0) or 1.0), log)
 
     _emit('读帧', 0.0, '读头分组')
     groups = group_frames_by_filter(frames)
@@ -2479,6 +2529,10 @@ def _run(p: PwsParams) -> Dict:
         log('[CFA] 权重 auto：真 CFA 下逐通道 FWHM 估计被噪声主导（实测排序相关≈0.3），'
             '逐通道权重只会放大噪声且多花两遍测量 → 使用共用权重；要强制逐通道请填 own')
     _CFA['share'] = None
+    if not cfa_pat:
+        # 上一组若是彩机，这些环境变量会残留；黑白流程不能被它们影响
+        for _k in ('DWT_DETAIL_SNR', 'DWT_CFA_CHANNELS', 'DWT_CFA_K', 'DWT_CFA_RAW'):
+            os.environ.pop(_k, None)
     _CFA['want_share'] = bool(cfa_pat and _gshare)
     _CFA['want_wshare'] = bool(cfa_pat and _wshare)
     _CFA['want_wshare'] = bool(cfa_pat and _wshare)
@@ -3887,7 +3941,8 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 for k, y0 in enumerate(range(0, h, strip)):
                     _check_cancel()
                     y1 = min(h, y0 + strip)
-                    _beta = float(getattr(p, 'detail_snr', 0.0) or 0.0)
+                    _beta = (float(getattr(p, 'detail_snr', 0.0) or 0.0)
+                             if _CFA.get('pattern') else 0.0)
                     W = strip_weights(C, S, R[y0:y1], A, B, T=T, fp=fp, beta=_beta)
                     D = fs.stack_strips(y0, y1)
                     s, ne, rr = stack_strip(D, W, R[y0:y1], fs.sky0, rej_k=rej_k,

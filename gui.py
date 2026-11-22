@@ -569,6 +569,12 @@ class App(tk.Tk):
              "0=自动（G 用 8，R/B 用 16）：R/B 采样少，帧数给小了 σ_psf 会估糊")
         self.v_cfag = tk.StringVar()
         self.v_cfaa = tk.StringVar(value='自动判断')
+        self._auto_paths = {}          # 记录上次自动填的路径，手工改过就不再覆盖
+        try:
+        # 手动输入 / 粘贴路径时也重新搜（防抖）
+            self._photos_trace = self.v_photos.trace_add("write", self._schedule_autofill)
+        except Exception:
+            self._photos_trace = None
         _cb_cfag = ttk.Combobox(
             adv, state="readonly", width=12, textvariable=self.v_cfag,
             values=["共用画布", "逐通道画布"])
@@ -1018,25 +1024,69 @@ class App(tk.Tk):
             return None
         return "break"
 
-    def _autofill_related(self):
-        """选好 calibrated 后，自动找同一 WBPP 输出目录下的 registered（放 .xdrz）。"""
+    def _schedule_autofill(self, *_a):
+        try:
+            if getattr(self, "_af_job", None):
+                self.after_cancel(self._af_job)
+        except Exception:
+            pass
+
+        def _run():
+            self._af_job = None
+            self._autofill_related()
+
+        try:
+            self._af_job = self.after(500, _run)
+        except Exception:
+            self._af_job = None
+
+    def _autofill_related(self, _evt=None):
+        """选了亮场主路径后，自动找同级的 registered（几何目录）与 debayered（彩机参考）。
+
+        每次改主路径都会重新找一遍；只要对应输入框还是「空」或「上次自动填的值」，
+        就跟着刷新（手工改过的不会被覆盖）。
+        """
         src = self.v_photos.get().strip()
         if not src:
             return
         p = Path(src)
-        cands = []
-        if p.name.lower().startswith("calibrat"):
-            cands.append(p.parent / "registered")
-        cands.extend([p.parent / "registered", p / "registered"])
-        for c in cands:
-            try:
-                if c.is_dir() and next(c.rglob("*.xdrz"), None) is not None:
-                    if not self.v_xdrz.get().strip():
-                        self.v_xdrz.set(str(c))
-                        self._log_line("[界面] 已自动识别并填入几何目录：%s" % c)
-                    return
-            except Exception:
-                continue
+        roots = []
+        if p.name.lower().startswith(("calibrat", "light")):
+            roots.append(p.parent)
+        roots.append(p.parent)
+        roots.append(p)
+        for var, key, names, hint in (
+            (self.v_xdrz, "xdrz", ("registered",),
+             "几何目录"),
+            (self.v_cfa_ref, "cfa_ref", ("debayered", "Debayered"),
+             "彩机参考目录"),
+        ):
+            found = None
+            for root in roots:
+                for nm in names:
+                    cands = [root / nm, root / (nm.lower())]
+                    for c in cands:
+                        try:
+                            if c.is_dir() and any(c.iterdir()):
+                                found = c
+                                break
+                        except Exception:
+                            continue
+                    if found is not None:
+                        break
+                if found is not None:
+                    break
+            cur = var.get().strip()
+            prev = self._auto_paths.get(key, "")
+            if found is not None:
+                if cur == "" or cur == prev:
+                    var.set(str(found))
+                    self._auto_paths[key] = str(found)
+                    self._log_line("[界面] 已自动识别并填入%s：%s" % (hint, found))
+            elif cur and cur == prev:
+                var.set("")
+                self._auto_paths.pop(key, None)
+                self._log_line("[界面] 没找到%s，已清空（原来自动填的）：%s" % (hint, cur))
 
     def _open_out(self):
         p = self.v_out.get().strip()
@@ -1115,7 +1165,7 @@ class App(tk.Tk):
         """关于：方法与原文出处（PWS，D.Cikey）"""
         messagebox.showinfo(
             "关于 DWT · Drizzle",
-            "DWT · Drizzle 2.7.46-C\n\n" + LICENSE_TEXT)
+            "DWT · Drizzle 2.7.47-C\n\n" + LICENSE_TEXT)
 
     def show_help(self):
         """打开内置使用说明（不依赖浏览器 / 外部程序）"""
