@@ -132,18 +132,19 @@ def main():
     print('GPU 占用    均值 %.1f%%  P50 %.1f%%  P90 %.1f%%  峰值 %.0f%%' % (avg, q(util, .5), q(util, .9), util[-1]), flush=True)
     print('显存带宽    均值 %.1f%%  P90 %.1f%%' % (sum(memu) / n, q(memu, .9)), flush=True)
     print('显存占用    %.0f MiB（峰值）' % max(s[3] for s in win), flush=True)
+    if samples:
+        tot = (samples[-1][0] - samples[0][0]) or 1e-9
+        busy = sum(t[1] / 100.0 * 0.1 for t in samples)
+        print('整进程      %.1f s，其中 GPU 忙碌约 %.1f s（%.1f%%；含 R 场/叠加等所有 GPU 段）'
+              % (tot, busy, 100.0 * busy / tot), flush=True)
 
-    # 判据说明：这一阶段是「读 6.2 GB 帧 → 算 15 帧卷积/散射 → 读回 1.2 GB」，
-    # GPU 在等待磁盘/PCIe 时必然空闲，所以窗口均值天然被摊薄（实测 P50 17~22%）。
-    # 真正能判定「GPU 有没有在干活」的是峰值与 P90：只要 P90 到 100%，说明
-    # 计算阶段 GPU 是满负荷的；再配合 fallbacks=0 与叠加段墙钟，就足以排除
-    # 「其实退回 CPU 了」这种情况。
     ok = (q(util, .9) >= a.min_p90) and fallbacks == 0 and backend == 'canvas'
     print('', flush=True)
     print('GPU-PROBE: %s' % ('PASS' if ok else 'FAIL'), flush=True)
     if not ok:
-        print('  判据：P90 ≥ %.0f%%、backend=canvas、fallbacks=0（均值仅供参照）' % a.min_p90, flush=True)
+        print('  判据：P90 ≥ %.0f%%、backend=canvas、fallbacks=0' % a.min_p90, flush=True)
     return 0 if ok else 1
+
 
 if __name__ == '__main__':
     sys.exit(main())
