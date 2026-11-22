@@ -1750,6 +1750,31 @@ def _worker_open(path: str, n: int, h: int, w: int, off: np.ndarray) -> None:
     _MEM['off'] = off
 
 
+def _task_fwhm_cfa(job) -> Tuple[int, float, int, int]:
+    """真 CFA：子进程里拼 G 平面再量 FWHM —— 与串行的 fs.frame() 逐元素等价。
+
+    串行版这段是 60 帧 × (整帧拆色 + 69 次二维高斯拟合)，实测 ~45 s；
+    分到多进程后拟合按核数摊薄。**背景梯度必须一起带过来**：只减常数偏置会
+    让星点附近的天空略微倾斜，C 会偏 2%（试过，FWHM 差 0.46 px），所以这里
+    照 fs.frame() 的做法减掉 bggrad 的平面模型。
+    """
+    i, stars, pat, bgcoef, bgdeg, bgshape, bgrcoef = job
+    n0, c0 = _FIT_STAT['n'], _FIT_STAT['conv']
+    img = np.asarray(_MEM['mm'][i], np.float32) - np.float32(_MEM['off'][i])
+    if bgcoef is not None and bgdeg > 0:
+        try:
+            from . import bggrad as _bgg
+        except ImportError:                     # 子进程里没有包上下文
+            import bggrad as _bgg
+        m = _bgg.model_strip(bgcoef, bgdeg, 0, bgshape[0], bgshape[1],
+                             bgshape[0], rcoef=bgrcoef)
+        if m is not None:
+            img -= np.asarray(m, np.float32)
+    g = _cfa.plane(img, pat, 'G')
+    v = measure_fwhm(g, stars)
+    return int(i), v, 0.0, _FIT_STAT['n'] - n0, _FIT_STAT['conv'] - c0
+
+
 def _task_fwhm(job) -> Tuple[int, float, int, int]:
     """一帧的星点 FWHM 中位（帧号一并返回，父进程按下标落位）
 
@@ -2837,8 +2862,33 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             _reuse_fw = True
         else:
             _reuse_fw = False
-        log('[C] 真 CFA：在 G 平面上逐帧量 FWHM（串行）') if not _reuse_fw else None
-        for i in ([] if _reuse_fw else range(n)):
+        if not _reuse_fw and fs.parallelable and not _no_parallel():
+            _nw_c = min(plan_workers(900 * 2 ** 20, '测星点', cap=CAP_FWHM), n)
+        else:
+            _nw_c = 1
+        if _nw_c > 1 and not _reuse_fw:
+            log('[C] 真 CFA：在 G 平面上逐帧量 FWHM（%d 进程并行）' % _nw_c)
+            _ini, _iargs = fs.reader
+            _bgc = getattr(fs, 'bgcoef', None)
+            _bgd = int(getattr(fs, 'bgdeg', 0) or 0)
+            _bgs = tuple(getattr(fs, 'bgshape', fs.shape))
+            _bgrc = getattr(fs, 'bgrcoef', None)
+            ex = ProcessPoolExecutor(max_workers=_nw_c,
+                                     initializer=_ini, initargs=_iargs)
+            try:
+                _jobs = ((i, _cs, _CFA['pattern'],
+                          None if _bgc is None else _bgc[i], _bgd, _bgs,
+                          None if _bgrc is None else _bgrc[i]) for i in range(n))
+                for _i, _v, _fx, _dn, _dc in ex.map(_task_fwhm_cfa, _jobs, chunksize=1):
+                    _check_cancel()
+                    fwhms[_i] = _v
+                    _FIT_STAT['n'] += _dn
+                    _FIT_STAT['conv'] += _dc
+                    _emit('测星点', (_i + 1) / max(n, 1), f'{_i + 1}/{n} 帧')
+            finally:
+                ex.shutdown(wait=True, cancel_futures=True)
+        log('[C] 真 CFA：在 G 平面上逐帧量 FWHM（串行）') if (not _reuse_fw and _nw_c <= 1) else None
+        for i in ([] if (_reuse_fw or _nw_c > 1) else range(n)):
             _check_cancel()
             try:
                 _g = _cfa.plane(np.asarray(fs.frame(i), np.float32),
