@@ -872,7 +872,8 @@ def prepare_frames(frames: List[Path], label: str, crop: int,
             f'（该组数据将串行）：{e}')
         mmpath, mm, resident = None, None, True
         arrays = []
-    log(f'[帧] 形状 ({h},{w})  曝光归一到 {EXPTIME_REF:g}s  需 {need / 2 ** 30:.2f} GiB  '
+    log(f'[帧] 形状 ({h},{w})  内部曝光归一到 {EXPTIME_REF:g}s（读帧时按 基准/曝光 缩放，'
+        f'导出前再乘回，成品量纲与素材一致）  需 {need / 2 ** 30:.2f} GiB  '
         f'可用 {avail / 2 ** 30:.1f} GiB → '
         f'{"父进程内存（串行）" if mm is None else "memmap 流式（并行）"}')
 

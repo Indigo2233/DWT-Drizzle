@@ -27,7 +27,8 @@ import struct            # read_filter_hint：XISF 固定头的 header_length �
 import hashlib           # 缓存指纹
 import json              # 缓存里的标量元数据
 import math              # 截尾因子解析式（erf）
-import os                # 自动决定并行进程数
+import os
+import numpy as np                # 自动决定并行进程数
 import tempfile          # 缓存默认目录
 import time              # 阶段耗时日志
 from concurrent.futures import ProcessPoolExecutor, as_completed  # 逐帧并行
@@ -40,7 +41,12 @@ from scipy import ndimage
 from scipy.spatial import cKDTree
 
 FITS_SUFFIXES = {'.fits', '.fit', '.fts'}
-EXPTIME_REF = 300.0  # 曝光归一化基准（秒）
+# 曝光归一化基准（秒）。这是**内部**计算用的统一量纲：读帧时每帧乘以
+# EXPTIME_REF/t_i，让不同曝光长度的帧在权重、排异里可以直接比较；
+# 导出前会再乘回 "曝光中位/EXPTIME_REF"（core/pws.py 的 [量纲] 一行），
+# 所以成品量纲始终与素材一致，这个 300 不会改变你的像素值。
+# 想换内部基准（一般没必要）可设环境变量 DWT_EXPTIME_REF。
+EXPTIME_REF = float(os.environ.get('DWT_EXPTIME_REF', '') or 300.0)
 
 # 倍频程档表：(σa, σb, decim)；档中心尺度(px) = sqrt(σa·σb)×2.3548，
 # 即 5 / 10 / 20 / 40 / 80 / 113 / 226 px。113 与 226 两档用于覆盖
