@@ -3312,6 +3312,20 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     cov_map = None
     drz_s = float(getattr(p, 'drizzle_scale', 2.0) or 1.0)
     drz_p = float(getattr(p, 'drizzle_pix', 1.0) or 1.0)
+    # 2× 网格 + pixfrac 0.8：液滴边长 1.6 输出像素，盖不满 2 像素的格子，会留下
+    #   0.4px 的规则缝隙；帧数多、抖得散时被填平，帧数少（<10）时就显成周期网点。
+    #   默认值就是 0.8，用户多半没动过 → 在 2× 上自动提到 1.0，并说明原因。
+    if (drz_s >= 1.95 and drz_p < 1.0 and drz_p >= 0.7
+            and not os.environ.get('DWT_PIXFRAC_KEEP')):
+        log(f'[drizzle] 2× 输出：pixfrac {drz_p:g} → 1.0（{drz_p:g} 的液滴在 2× 网格上'
+            f'留缝隙，帧数少时会出现周期性网点；想保留请设 DWT_PIXFRAC_KEEP=1）')
+        drz_p = 1.0
+        # CFA 的 wgpu 分支直接从 p.drizzle_pix 读，这里同步回去，避免「日志说 1.0、
+        #   实际仍按 0.8 投液滴」的两套口径。
+        try:
+            setattr(p, 'drizzle_pix', drz_p)
+        except Exception:
+            pass
     # 取消 drizzle 的本意是「不出 2× 网格」，不是「不做配准」。旧代码直接走
     # 未配准的等权叠加（帧间位移没补），20 帧实测成品 FWHM 14.4px（单帧 4.3）
     # —— 等于把整晚的漂移糊进去了。这里改成：1× 网格 + pixfrac 1，仍做配准。

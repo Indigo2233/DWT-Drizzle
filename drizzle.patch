@@ -2454,7 +2454,7 @@
      idx = np.argsort(np.nan_to_num(fwhms, nan=1e9))[:k]
  
      if star_grow_pct > 0:
-@@ -1586,88 +3266,959 @@
+@@ -1586,88 +3266,973 @@
      else:
          log('[拖线] 星点锐帧扩展已关闭（0%）')
  
@@ -2513,6 +2513,20 @@
 +    cov_map = None
 +    drz_s = float(getattr(p, 'drizzle_scale', 2.0) or 1.0)
 +    drz_p = float(getattr(p, 'drizzle_pix', 1.0) or 1.0)
++    # 2× 网格 + pixfrac 0.8：液滴边长 1.6 输出像素，盖不满 2 像素的格子，会留下
++    #   0.4px 的规则缝隙；帧数多、抖得散时被填平，帧数少（<10）时就显成周期网点。
++    #   默认值就是 0.8，用户多半没动过 → 在 2× 上自动提到 1.0，并说明原因。
++    if (drz_s >= 1.95 and drz_p < 1.0 and drz_p >= 0.7
++            and not os.environ.get('DWT_PIXFRAC_KEEP')):
++        log(f'[drizzle] 2× 输出：pixfrac {drz_p:g} → 1.0（{drz_p:g} 的液滴在 2× 网格上'
++            f'留缝隙，帧数少时会出现周期性网点；想保留请设 DWT_PIXFRAC_KEEP=1）')
++        drz_p = 1.0
++        # CFA 的 wgpu 分支直接从 p.drizzle_pix 读，这里同步回去，避免「日志说 1.0、
++        #   实际仍按 0.8 投液滴」的两套口径。
++        try:
++            setattr(p, 'drizzle_pix', drz_p)
++        except Exception:
++            pass
 +    # 取消 drizzle 的本意是「不出 2× 网格」，不是「不做配准」。旧代码直接走
 +    # 未配准的等权叠加（帧间位移没补），20 帧实测成品 FWHM 14.4px（单帧 4.3）
 +    # —— 等于把整晚的漂移糊进去了。这里改成：1× 网格 + pixfrac 1，仍做配准。
@@ -3472,7 +3486,7 @@
      log(f'[W] 单帧最大权重（条带均值）{np.mean(wmax):.3f}  '
          f'等权份额 = {1.0:.3f} → 最大独占约 {np.mean(wmax):.1f}× 份额')
      log(f'[叠加] 完成 {time.perf_counter() - t2:.1f}s  排异剔除率 {rej_rate:.3%}')
-@@ -1688,11 +4239,56 @@
+@@ -1688,11 +4253,56 @@
          log(f'[读数] {name:<18} 占 {msk.mean():6.2%}  N_eff 中位 '
              f'{np.median(neff[msk]):5.2f}  σ {sd:.4e}')
  
@@ -3532,7 +3546,7 @@
  
      res = {
          'n': n, 'shape': Stk.shape, 'fwhms': fwhms, 'C': C, 'S': S, 'sigma': sig_out,
-@@ -1700,27 +4296,133 @@
+@@ -1700,27 +4310,133 @@
          'R_info': rinfo, 'neff': neff, 'rej_rate': float(rej_rate),
          'A': A, 'B': B, 'rej_k': rej_k, 'stars': stars,
          'metas': metas, 'skies': skies, 'scale_out': float(scale_out),
@@ -3670,7 +3684,7 @@
  
      log(f'[时] 总计 {time.perf_counter() - t_start:.1f}s')
      _emit('输出', 1.0, '完成')
-@@ -1750,13 +4452,23 @@
+@@ -1750,13 +4466,23 @@
                              choices=[v for _, v in prm.choices], help=text)
          else:
              ap.add_argument(flag, default=default, help=text)
@@ -3694,7 +3708,7 @@
      try:
          run(p)
      except Cancelled:
-@@ -1764,5 +4476,82 @@
+@@ -1764,5 +4490,82 @@
      return 0
  
  
@@ -4383,7 +4397,7 @@
 +    return bool(detect_pattern(meta))
 --- a/core/drizzle.py
 +++ b/core/drizzle.py
-@@ -0,0 +1,2174 @@
+@@ -0,0 +1,2185 @@
 +"""Drizzle 重采样层（PWS 的几何层）
 +
 +把 PWS 阶段 C 的"唯一一次加权平均（式 12）"换成**带权 drizzle 累积**，从而在
@@ -4806,6 +4820,17 @@
 +    # 命中率上限就是 参考星数/本帧星数，按本帧归一属于结构性误杀。
 +    base = min(len(s_i), len(s_ref))
 +    if hit / float(max(base, 1)) >= frac_min:
++        return True, hit, int(len(s_i))
++    # 稀疏星场兜底：全场只检出几十颗星时，35% 的比例门限在绝对数上很苛刻
++    #   （80 颗要 28 颗，实测好帧常是 20~26 颗）。绝对命中数够多 + 残差亚像素，
++    #   比比例更能说明"这是同一个天区"。随机命中 20 颗且中位残差 <1.5px 的概率极低。
++    try:
++        _dd = np.asarray(d, np.float64)
++        _dd = _dd[np.isfinite(_dd)]
++        _med = float(np.median(_dd)) if _dd.size else 99.0
++    except Exception:
++        _med = 99.0
++    if base <= 200 and hit >= 20 and _med <= 0.6 * float(rad):
 +        return True, hit, int(len(s_i))
 +    # 二次判据：视场边缘的旋转/尺度残差会让好帧在 2.5px 半径下只剩两三成命中。
 +    # 放宽半径再验一次，避免把「够好但边缘略偏」的帧当坏帧剔除。
@@ -12929,7 +12954,7 @@
 +        """关于：方法与原文出处（PWS，D.Cikey）"""
 +        messagebox.showinfo(
 +            "关于 DWT · Drizzle",
-+            "DWT · Drizzle 2.7.66-D\n\n" + LICENSE_TEXT)
++            "DWT · Drizzle 2.7.67-D\n\n" + LICENSE_TEXT)
 +
 +    def show_help(self):
 +        """打开内置使用说明（不依赖浏览器 / 外部程序）"""

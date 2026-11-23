@@ -421,6 +421,17 @@ def _verify_all(s_ref, s_i, th, k, u, frac_min=None, rad=2.5):
     base = min(len(s_i), len(s_ref))
     if hit / float(max(base, 1)) >= frac_min:
         return True, hit, int(len(s_i))
+    # 稀疏星场兜底：全场只检出几十颗星时，35% 的比例门限在绝对数上很苛刻
+    #   （80 颗要 28 颗，实测好帧常是 20~26 颗）。绝对命中数够多 + 残差亚像素，
+    #   比比例更能说明"这是同一个天区"。随机命中 20 颗且中位残差 <1.5px 的概率极低。
+    try:
+        _dd = np.asarray(d, np.float64)
+        _dd = _dd[np.isfinite(_dd)]
+        _med = float(np.median(_dd)) if _dd.size else 99.0
+    except Exception:
+        _med = 99.0
+    if base <= 200 and hit >= 20 and _med <= 0.6 * float(rad):
+        return True, hit, int(len(s_i))
     # 二次判据：视场边缘的旋转/尺度残差会让好帧在 2.5px 半径下只剩两三成命中。
     # 放宽半径再验一次，避免把「够好但边缘略偏」的帧当坏帧剔除。
     try:
