@@ -2281,7 +2281,7 @@
      idx = np.argsort(np.nan_to_num(fwhms, nan=1e9))[:k]
  
      if star_grow_pct > 0:
-@@ -1586,88 +3131,942 @@
+@@ -1586,88 +3131,953 @@
      else:
          log('[拖线] 星点锐帧扩展已关闭（0%）')
  
@@ -2562,6 +2562,7 @@
 +                log('[T] 可用的星点流量太少，吞吐权重关闭')
 +        drz_plan = plan_output(fs.shape, dx, dy, drz_s, theta=th, k=kk)
 +        _frame_ref = str(getattr(p, 'frame', '') or '').strip()
++        _inv_grid = 1.0          # 参考栅格相对原生像素的放大倍数（无参考图时为 1）
 +        if _frame_ref and matchref is not None:
 +            try:
 +                _refv = np.asarray(
@@ -2597,6 +2598,7 @@
 +                if _fi and _fi.get('k'):
 +                    _km, _thm = float(_fi['k']), float(_fi['theta'])
 +                    _inv = 1.0 / _km        # matchref 的 k 与 _xy_rows 的 k 互为倒数
++                    _inv_grid = float(_inv)
 +                    _um = np.asarray(_fi['u'], np.float64)
 +                    if _c0 != (0, 0):
 +                        # u_master = k·R·c0 + u_crop ；这里 _fi 是整幅给的，
@@ -2642,9 +2644,17 @@
 +                                f'({_off[0]:+.2f}, {_off[1]:+.2f})px')
 +                    except Exception as _e2:
 +                        log(f'[网格] 星点对账跳过（{type(_e2).__name__}: {_e2}）')
-+                    # 输出网格只决定「画布几何」（朝向/构图/像素栅格的 1× 基准），
-+                    # 分辨率仍听用户的 drizzle 倍率：2× 时画布是参考图的 2 倍。
-+                    _s_grid = float(drz_s) if drz_on else 1.0
++                    # 输出网格决定「画布几何」，但用户选的 drizzle 倍率是
++                    # 相对**原生像素**的。参考图本身可能就是 2× drizzle 产物
++                    # （文件名带 _drizzle_2x，或星点匹配量到 _inv≈2），
++                    # 直接再乘一次会让画布变成 4×，星点被拉成 4 像素方糖。
++                    # 所以这里换算成「相对参考栅格」的倍率：s = 倍率 / _inv。
++                    _s_req = float(drz_s) if drz_on else 1.0
++                    _s_grid = _s_req / _inv if _inv else _s_req
++                    _s_grid = max(0.05, min(8.0, _s_grid))
++                    if abs(_inv - 1.0) > 0.02:
++                        log(f'[网格] 参考图本身是 {_inv:.2f}× 上采样（相对原生像素）；'
++                            f'drizzle {_s_req:g}× 按原生像素折算 → 画布 = 参考 × {_s_grid:.2f}')
 +                    drz_plan = {'s': _s_grid, 'ox': 0.0, 'oy': 0.0,
 +                                'W': int(round(_w * _s_grid)),
 +                                'H': int(round(_h * _s_grid))}
@@ -2790,27 +2800,28 @@
 +        # R 场的 σ_psf 必须用"参考像自己"的 FWHM：参考像取的是最锐 k 帧，
 +        # 比全帧中位锐得多（实测 4.23px vs 2.6px）。用中位值会把窗和包络放大
 +        # 1.6 倍，细节区的 R 被压到 0.07%，分区加权等于没开。
-+        sigma_rf = float(sigma_psf) * drz_s
++        _px_scale = float(drz_plan.get('s', drz_s)) * float(_inv_grid)
++        sigma_rf = float(sigma_psf) * _px_scale
 +        try:
 +            _sm = 0.5 if _pl2 is not None else 1.0
 +            _plm = _pl2 if _pl2 is not None else drz_plan
-+            _ho = max(16, int(round(16 * drz_s * _sm)))
-+            _so = max(29, int(round(29 * drz_s * _sm)))
++            _ho = max(16, int(round(16 * _px_scale * _sm)))
++            _so = max(29, int(round(29 * _px_scale * _sm)))
 +            _so = _so | 1
-+            _st = _seed_map(_plm, drz_s * _sm)
-+            _fr = float(measure_fwhm(sref, _st, fwhm_guess=6.0 * drz_s * _sm,
++            _st = _seed_map(_plm, _px_scale * _sm)
++            _fr = float(measure_fwhm(sref, _st, fwhm_guess=6.0 * _px_scale * _sm,
 +                                     half=_ho, fit_shape=_so))
 +        except Exception:
 +            _fr = float('nan')
 +        if _pl2 is not None:
 +            # 半网格上量的 FWHM 要换算回输出网格：×2；σ 再换回半网格给 R 场用：/2
 +            _fr = _fr * 2.0 if np.isfinite(_fr) else _fr
-+        if np.isfinite(_fr) and 2.0 * drz_s < _fr < 40.0 * drz_s:
++        if np.isfinite(_fr) and 0.5 * _px_scale < _fr < 40.0 * _px_scale:
 +            sigma_rf = _fr / 2.3548
 +            if _pl2 is not None:
 +                sigma_rf = sigma_rf / 2.0
 +            log(f'[drizzle] 参考像自量 FWHM {_fr:.2f}px（输出网格）→ R 场 σ_psf '
-+                f'{sigma_rf:.2f}px（中位帧折算值本应是 {float(sigma_psf) * drz_s:.2f}px）')
++                f'{sigma_rf:.2f}px（中位帧折算值本应是 {float(sigma_psf) * _px_scale:.2f}px）')
 +        grow_rf = float(star_grow)
 +        R, rinfo = build_r_field(sref, sigma_rf, r_floor=r_floor,
 +                                 env_win_mult=env_win_mult,
@@ -3282,7 +3293,7 @@
      log(f'[W] 单帧最大权重（条带均值）{np.mean(wmax):.3f}  '
          f'等权份额 = {1.0:.3f} → 最大独占约 {np.mean(wmax):.1f}× 份额')
      log(f'[叠加] 完成 {time.perf_counter() - t2:.1f}s  排异剔除率 {rej_rate:.3%}')
-@@ -1688,11 +4087,54 @@
+@@ -1688,11 +4098,56 @@
          log(f'[读数] {name:<18} 占 {msk.mean():6.2%}  N_eff 中位 '
              f'{np.median(neff[msk]):5.2f}  σ {sd:.4e}')
  
@@ -3310,19 +3321,21 @@
 +    if drz_on:
 +        # 星表与量星窗口都要换算到输出网格；读数再折回本机口径才与 fmed 同尺度
 +        stars_o = _seed_map(drz_plan, drz_s)
-+        hw = max(16, int(round(16 * drz_s)))
-+        fsz = max(29, int(round(29 * drz_s)) | 1)
-+        f_out_px = measure_fwhm(Stk, stars_o, fwhm_guess=6.0 * drz_s,
++        # 输出像素/原生像素 的真实比例：带 2× 参考网格时是 2，而不是 drz_s（1）
++        _pxr = float(_px_scale if np.isfinite(_px_scale) and _px_scale > 0 else drz_s)
++        hw = max(16, int(round(16 * _pxr)))
++        fsz = max(29, int(round(29 * _pxr)) | 1)
++        f_out_px = measure_fwhm(Stk, stars_o, fwhm_guess=6.0 * _pxr,
 +                                half=hw, fit_shape=fsz)
-+        f_out = f_out_px / drz_s
++        f_out = f_out_px / _pxr
 +        if np.isfinite(f_out) and np.isfinite(fmed) and fmed > 0:
 +            log(f'[输出] 成品星点 FWHM {f_out:.2f}px（本机口径；图上 {f_out_px:.2f}px'
-+                f' @×{drz_s:g}）  单帧中位 {fmed:.2f}px  '
++                f' @×{_pxr:g}）  单帧中位 {fmed:.2f}px  '
 +                f'改善 {100 * (1 - f_out / fmed):.1f}%')
 +        else:
 +            log('[输出] 成品星点 FWHM 量不出来（该通道样本太少或太暗，'
 +                '高斯拟合不收敛）；图本身正常，以目视/外部工具为准')
-+        log(f'[输出] 采样口径：σ_psf {sigma_psf:.2f}→{sigma_psf * drz_s:.2f}px'
++        log(f'[输出] 采样口径：σ_psf {sigma_psf:.2f}→{sigma_psf * _pxr:.2f}px'
 +            f'（1.5~2 为目标区间）')
 +        if f_out > 1.15 * fmed:
 +            log('[输出] 注意：这个通道量出来比单帧还糊，多半是通道太暗、高斯拟合在'
@@ -3340,7 +3353,7 @@
  
      res = {
          'n': n, 'shape': Stk.shape, 'fwhms': fwhms, 'C': C, 'S': S, 'sigma': sig_out,
-@@ -1700,27 +4142,133 @@
+@@ -1700,27 +4155,133 @@
          'R_info': rinfo, 'neff': neff, 'rej_rate': float(rej_rate),
          'A': A, 'B': B, 'rej_k': rej_k, 'stars': stars,
          'metas': metas, 'skies': skies, 'scale_out': float(scale_out),
@@ -3478,7 +3491,7 @@
  
      log(f'[时] 总计 {time.perf_counter() - t_start:.1f}s')
      _emit('输出', 1.0, '完成')
-@@ -1750,13 +4298,23 @@
+@@ -1750,13 +4311,23 @@
                              choices=[v for _, v in prm.choices], help=text)
          else:
              ap.add_argument(flag, default=default, help=text)
@@ -3502,7 +3515,7 @@
      try:
          run(p)
      except Cancelled:
-@@ -1764,5 +4322,82 @@
+@@ -1764,5 +4335,82 @@
      return 0
  
  
@@ -12702,7 +12715,7 @@
 +        """关于：方法与原文出处（PWS，D.Cikey）"""
 +        messagebox.showinfo(
 +            "关于 DWT · Drizzle",
-+            "DWT · Drizzle 2.7.61-D\n\n" + LICENSE_TEXT)
++            "DWT · Drizzle 2.7.62-D\n\n" + LICENSE_TEXT)
 +
 +    def show_help(self):
 +        """打开内置使用说明（不依赖浏览器 / 外部程序）"""
