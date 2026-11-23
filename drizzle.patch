@@ -2116,7 +2116,7 @@
      sig_out = sig * scale_out          # 展示与落盘量纲 = 成品量纲（内部仍用 sig 算比值）
      log(f'[S] 单帧信噪比权重（σ_中位/σ_i）{S.min():.3f}~{S.max():.3f}  中位 {np.median(S):.3f}')
      log(f'[σ] 逐帧噪声 {sig_out.min():.4e}~{sig_out.max():.4e}'
-@@ -1486,40 +2924,153 @@
+@@ -1486,40 +2924,165 @@
  
      # ---- 阶段 A：C_i（星点 FWHM，开源 fit_fwhm）----
      # 先用最干净的一帧建固定星表（星表位置对全部帧共用）
@@ -2206,10 +2206,18 @@
 +            _reuse_fw = True
 +        else:
 +            _reuse_fw = False
++        # 每进程峰值 ≈ 6 个整帧临时数组（拆色/卷积/掩膜），全幅约 600 MiB；
++        # 按 900 MiB 估会开太多进程，用户 16 GiB 机器上实测 OOM。
++        _bgs0 = tuple(getattr(fs, 'bgshape', fs.shape))
++        _per_c = max(900 * 2 ** 20, _bgs0[0] * _bgs0[1] * 4 * 6 + (256 << 20))
 +        if not _reuse_fw and fs.parallelable and not _no_parallel():
-+            _nw_c = min(plan_workers(900 * 2 ** 20, '测星点', cap=CAP_FWHM), n)
++            _nw_c = min(plan_workers(_per_c, '测星点', cap=CAP_FWHM), n)
++            # 再按「可用内存的一半」压一次：父进程还有 memmap 页缓存与成品画布，
++            # 按满额分配会在真机上把提交内存打穿（用户 16 GiB + 全幅 CFA 实测 OOM）。
++            _nw_c = max(1, min(_nw_c, int((_avail_bytes() * 0.5) // _per_c)))
 +        else:
 +            _nw_c = 1
++        _oom_fallback = False
 +        if _nw_c > 1 and not _reuse_fw:
 +            log('[C] 真 CFA：在 G 平面上逐帧量 FWHM（%d 进程并行）' % _nw_c)
 +            _ini, _iargs = fs.reader
@@ -2229,10 +2237,14 @@
 +                    _FIT_STAT['n'] += _dn
 +                    _FIT_STAT['conv'] += _dc
 +                    _emit('测星点', (_i + 1) / max(n, 1), f'{_i + 1}/{n} 帧')
++            except MemoryError as _eom:
++                # 并行拆色把内存打穿时不要把整轮叠加判死：退回串行重算这一段。
++                _oom_fallback = True
++                log(f'[C] 并行测 FWHM 内存不足（{_eom}），改串行重算这一段')
 +            finally:
 +                ex.shutdown(wait=True, cancel_futures=True)
-+        log('[C] 真 CFA：在 G 平面上逐帧量 FWHM（串行）') if (not _reuse_fw and _nw_c <= 1) else None
-+        for i in ([] if (_reuse_fw or _nw_c > 1) else range(n)):
++        log('[C] 真 CFA：在 G 平面上逐帧量 FWHM（串行）') if (not _reuse_fw and (_nw_c <= 1 or _oom_fallback)) else None
++        for i in ([] if (_reuse_fw or (_nw_c > 1 and not _oom_fallback)) else range(n)):
 +            _check_cancel()
 +            try:
 +                _g = _cfa.plane(np.asarray(fs.frame(i), np.float32),
@@ -2276,7 +2288,7 @@
          f' {np.nanmin(fwhms):.2f}~{np.nanmax(fwhms):.2f}px  中位 {fmed:.2f}px  '
          f'{time.perf_counter() - t1:.1f}s')
      log(f'[C] 清晰度权重（FWHM_中位/FWHM_i）{C.min():.3f}~{C.max():.3f}')
-@@ -1556,9 +3107,22 @@
+@@ -1556,9 +3119,22 @@
                  _check_cancel()
                  lam1[i], pas[i] = fs.trail(i, stars, sigma_psf)
  
@@ -2300,7 +2312,7 @@
      idx = np.argsort(np.nan_to_num(fwhms, nan=1e9))[:k]
  
      if star_grow_pct > 0:
-@@ -1586,88 +3150,958 @@
+@@ -1586,88 +3162,958 @@
      else:
          log('[拖线] 星点锐帧扩展已关闭（0%）')
  
@@ -3317,7 +3329,7 @@
      log(f'[W] 单帧最大权重（条带均值）{np.mean(wmax):.3f}  '
          f'等权份额 = {1.0:.3f} → 最大独占约 {np.mean(wmax):.1f}× 份额')
      log(f'[叠加] 完成 {time.perf_counter() - t2:.1f}s  排异剔除率 {rej_rate:.3%}')
-@@ -1688,11 +4122,56 @@
+@@ -1688,11 +4134,56 @@
          log(f'[读数] {name:<18} 占 {msk.mean():6.2%}  N_eff 中位 '
              f'{np.median(neff[msk]):5.2f}  σ {sd:.4e}')
  
@@ -3377,7 +3389,7 @@
  
      res = {
          'n': n, 'shape': Stk.shape, 'fwhms': fwhms, 'C': C, 'S': S, 'sigma': sig_out,
-@@ -1700,27 +4179,133 @@
+@@ -1700,27 +4191,133 @@
          'R_info': rinfo, 'neff': neff, 'rej_rate': float(rej_rate),
          'A': A, 'B': B, 'rej_k': rej_k, 'stars': stars,
          'metas': metas, 'skies': skies, 'scale_out': float(scale_out),
@@ -3515,7 +3527,7 @@
  
      log(f'[时] 总计 {time.perf_counter() - t_start:.1f}s')
      _emit('输出', 1.0, '完成')
-@@ -1750,13 +4335,23 @@
+@@ -1750,13 +4347,23 @@
                              choices=[v for _, v in prm.choices], help=text)
          else:
              ap.add_argument(flag, default=default, help=text)
@@ -3539,7 +3551,7 @@
      try:
          run(p)
      except Cancelled:
-@@ -1764,5 +4359,82 @@
+@@ -1764,5 +4371,82 @@
      return 0
  
  
@@ -12753,7 +12765,7 @@
 +        """关于：方法与原文出处（PWS，D.Cikey）"""
 +        messagebox.showinfo(
 +            "关于 DWT · Drizzle",
-+            "DWT · Drizzle 2.7.64-D\n\n" + LICENSE_TEXT)
++            "DWT · Drizzle 2.7.65-D\n\n" + LICENSE_TEXT)
 +
 +    def show_help(self):
 +        """打开内置使用说明（不依赖浏览器 / 外部程序）"""

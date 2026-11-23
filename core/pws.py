@@ -3007,10 +3007,18 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             _reuse_fw = True
         else:
             _reuse_fw = False
+        # 每进程峰值 ≈ 6 个整帧临时数组（拆色/卷积/掩膜），全幅约 600 MiB；
+        # 按 900 MiB 估会开太多进程，用户 16 GiB 机器上实测 OOM。
+        _bgs0 = tuple(getattr(fs, 'bgshape', fs.shape))
+        _per_c = max(900 * 2 ** 20, _bgs0[0] * _bgs0[1] * 4 * 6 + (256 << 20))
         if not _reuse_fw and fs.parallelable and not _no_parallel():
-            _nw_c = min(plan_workers(900 * 2 ** 20, '测星点', cap=CAP_FWHM), n)
+            _nw_c = min(plan_workers(_per_c, '测星点', cap=CAP_FWHM), n)
+            # 再按「可用内存的一半」压一次：父进程还有 memmap 页缓存与成品画布，
+            # 按满额分配会在真机上把提交内存打穿（用户 16 GiB + 全幅 CFA 实测 OOM）。
+            _nw_c = max(1, min(_nw_c, int((_avail_bytes() * 0.5) // _per_c)))
         else:
             _nw_c = 1
+        _oom_fallback = False
         if _nw_c > 1 and not _reuse_fw:
             log('[C] 真 CFA：在 G 平面上逐帧量 FWHM（%d 进程并行）' % _nw_c)
             _ini, _iargs = fs.reader
@@ -3030,10 +3038,14 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                     _FIT_STAT['n'] += _dn
                     _FIT_STAT['conv'] += _dc
                     _emit('测星点', (_i + 1) / max(n, 1), f'{_i + 1}/{n} 帧')
+            except MemoryError as _eom:
+                # 并行拆色把内存打穿时不要把整轮叠加判死：退回串行重算这一段。
+                _oom_fallback = True
+                log(f'[C] 并行测 FWHM 内存不足（{_eom}），改串行重算这一段')
             finally:
                 ex.shutdown(wait=True, cancel_futures=True)
-        log('[C] 真 CFA：在 G 平面上逐帧量 FWHM（串行）') if (not _reuse_fw and _nw_c <= 1) else None
-        for i in ([] if (_reuse_fw or _nw_c > 1) else range(n)):
+        log('[C] 真 CFA：在 G 平面上逐帧量 FWHM（串行）') if (not _reuse_fw and (_nw_c <= 1 or _oom_fallback)) else None
+        for i in ([] if (_reuse_fw or (_nw_c > 1 and not _oom_fallback)) else range(n)):
             _check_cancel()
             try:
                 _g = _cfa.plane(np.asarray(fs.frame(i), np.float32),
