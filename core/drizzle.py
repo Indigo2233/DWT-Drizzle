@@ -419,7 +419,21 @@ def _verify_all(s_ref, s_i, th, k, u, frac_min=None, rad=2.5):
     # 归一化用「两边星数少的那一边」：检出一千颗的帧去对只检出百来颗的参考帧，
     # 命中率上限就是 参考星数/本帧星数，按本帧归一属于结构性误杀。
     base = min(len(s_i), len(s_ref))
-    return (hit / float(max(base, 1)) >= frac_min), hit, int(len(s_i))
+    if hit / float(max(base, 1)) >= frac_min:
+        return True, hit, int(len(s_i))
+    # 二次判据：视场边缘的旋转/尺度残差会让好帧在 2.5px 半径下只剩两三成命中。
+    # 放宽半径再验一次，避免把「够好但边缘略偏」的帧当坏帧剔除。
+    try:
+        _rad2 = float(os.environ.get("DWT_VERIFY_RAD2", "4.0") or 4.0)
+    except Exception:
+        _rad2 = 4.0
+    if _rad2 > rad:
+        d2, _ = cKDTree(s_ref).query(rot + np.asarray(u, np.float64)[None, :],
+                                     k=1, distance_upper_bound=_rad2)
+        hit2 = int(np.sum(np.isfinite(d2)))
+        if hit2 / float(max(base, 1)) >= frac_min:
+            return True, hit2, int(len(s_i))
+    return False, hit, int(len(s_i))
 
 
 def _dist_warp(p, c, rc, d2):
