@@ -7058,7 +7058,7 @@
 +    return coefs, stats
 --- a/core/matchref.py
 +++ b/core/matchref.py
-@@ -0,0 +1,574 @@
+@@ -0,0 +1,577 @@
 +# -*- coding: utf-8 -*-
 +"""把叠加成品对齐并裁切到一张参考图（通常是 WBPP 的 master）的网格上。
 +
@@ -7444,7 +7444,7 @@
 +    ss = find_stars(src)
 +    if len(ss) < 20:
 +        return None, {"error": f"待配图星点太少（{len(ss)} 颗）"}
-+    tr = trireg.solve(ss, sr, max_pts=48, log=log)
++    tr = trireg.solve(ss, sr, max_pts=48, log=log, s_lo=0.40, s_hi=2.50)
 +    if not tr:
 +        return None, {"error": "三角形没有找到一致解"}
 +    if tr["n_in"] < 40 or tr["rms"] > 2.0:
@@ -7535,7 +7535,10 @@
 +                cov = float((out0 > 0).mean())
 +                log(f'  [裁切] {k}x 转 {deg:.0f}° 平移 ({cdx:.0f},{cdy:.0f})  '
 +                    f'结构相关 {cc0:.3f}  覆盖 {cov:.1%}')
-+                if cc0 >= 0.15 and cov >= 0.30:
++                _d = ((float(deg) + 180.0) % 360.0) - 180.0
++                _axis = abs(_d) <= 30.0 or abs(abs(_d) - 180.0) <= 30.0
++                _need = 0.15 if _axis else 0.35
++                if cc0 >= _need and cov >= 0.30:
 +                    return out0, {"k": k, "theta": float(deg),
 +                                  "u": (float(cdx), float(cdy)),
 +                                  "n_pair": 0, "rms": float('nan'), "cover": cov,
@@ -7715,7 +7718,7 @@
 +
 +
 +def solve(src_pts, ref_pts, max_pts=48, tol=0.03, inlier_px=2.5, log=None,
-+          ref_prep=None):
++          ref_prep=None, s_lo=0.98, s_hi=1.02):
 +    ds, (di, dv, dp) = _tri_descriptors(src_pts, max_pts)
 +    if ref_prep is not None:
 +        dr, (rj, rv, rp), tree = ref_prep['desc'], (ref_prep['idx'], ref_prep['v'],
@@ -7765,9 +7768,9 @@
 +    # 同一套光学的两帧之间不可能有 2% 以上的尺度差；历史上出现过 0.4348 这种
 +    # 伪解（三角形碰巧相似），它一旦被采纳，整帧会被当成放大/缩小 2.3 倍对齐，
 +    # 叠出来就是星点脱线。宁可不认，交给平移兜底。
-+    if not (0.98 <= float(s) <= 1.02):
++    if not (float(s_lo) <= float(s) <= float(s_hi)):
 +        if log:
-+            log('  [三角] 尺度 %.4f 不符合同一光路（应在 1±2%%），放弃该解' % float(s))
++            log('  [三角] 尺度 %.4f 超出允许范围 %.2f~%.2f，放弃该解' % (float(s), float(s_lo), float(s_hi)))
 +        return None
 +    # 用内点重解一次，收紧精度
 +    q = (s * (R @ src_pts.T)).T + t
@@ -13196,7 +13199,7 @@
 +        """关于：方法与原文出处（PWS，D.Cikey）"""
 +        messagebox.showinfo(
 +            "关于 DWT · Drizzle",
-+            "DWT · Drizzle 2.7.75-D\n\n" + LICENSE_TEXT)
++            "DWT · Drizzle 2.7.76-D\n\n" + LICENSE_TEXT)
 +
 +    def show_help(self):
 +        """打开内置使用说明（不依赖浏览器 / 外部程序）"""

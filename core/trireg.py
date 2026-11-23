@@ -77,7 +77,7 @@ def prepare(pts, max_pts=48):
 
 
 def solve(src_pts, ref_pts, max_pts=48, tol=0.03, inlier_px=2.5, log=None,
-          ref_prep=None):
+          ref_prep=None, s_lo=0.98, s_hi=1.02):
     ds, (di, dv, dp) = _tri_descriptors(src_pts, max_pts)
     if ref_prep is not None:
         dr, (rj, rv, rp), tree = ref_prep['desc'], (ref_prep['idx'], ref_prep['v'],
@@ -127,9 +127,9 @@ def solve(src_pts, ref_pts, max_pts=48, tol=0.03, inlier_px=2.5, log=None,
     # 同一套光学的两帧之间不可能有 2% 以上的尺度差；历史上出现过 0.4348 这种
     # 伪解（三角形碰巧相似），它一旦被采纳，整帧会被当成放大/缩小 2.3 倍对齐，
     # 叠出来就是星点脱线。宁可不认，交给平移兜底。
-    if not (0.98 <= float(s) <= 1.02):
+    if not (float(s_lo) <= float(s) <= float(s_hi)):
         if log:
-            log('  [三角] 尺度 %.4f 不符合同一光路（应在 1±2%%），放弃该解' % float(s))
+            log('  [三角] 尺度 %.4f 超出允许范围 %.2f~%.2f，放弃该解' % (float(s), float(s_lo), float(s_hi)))
         return None
     # 用内点重解一次，收紧精度
     q = (s * (R @ src_pts.T)).T + t

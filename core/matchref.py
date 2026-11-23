@@ -383,7 +383,7 @@ def _tri_align(src: np.ndarray, ref: np.ndarray, sr: np.ndarray, log=print):
     ss = find_stars(src)
     if len(ss) < 20:
         return None, {"error": f"待配图星点太少（{len(ss)} 颗）"}
-    tr = trireg.solve(ss, sr, max_pts=48, log=log)
+    tr = trireg.solve(ss, sr, max_pts=48, log=log, s_lo=0.40, s_hi=2.50)
     if not tr:
         return None, {"error": "三角形没有找到一致解"}
     if tr["n_in"] < 40 or tr["rms"] > 2.0:
@@ -474,7 +474,10 @@ def align(src: np.ndarray, ref: np.ndarray, log=print) -> Tuple[Optional[np.ndar
                 cov = float((out0 > 0).mean())
                 log(f'  [裁切] {k}x 转 {deg:.0f}° 平移 ({cdx:.0f},{cdy:.0f})  '
                     f'结构相关 {cc0:.3f}  覆盖 {cov:.1%}')
-                if cc0 >= 0.15 and cov >= 0.30:
+                _d = ((float(deg) + 180.0) % 360.0) - 180.0
+                _axis = abs(_d) <= 30.0 or abs(abs(_d) - 180.0) <= 30.0
+                _need = 0.15 if _axis else 0.35
+                if cc0 >= _need and cov >= 0.30:
                     return out0, {"k": k, "theta": float(deg),
                                   "u": (float(cdx), float(cdy)),
                                   "n_pair": 0, "rms": float('nan'), "cover": cov,
