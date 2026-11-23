@@ -1191,6 +1191,25 @@ def measure_flux_frame(mm, i, off, stars, th=0.0, kk=1.0, dx=0.0, dy=0.0,
     return out
 
 
+class _ResidentStack:
+    """把常驻内存的 FrameSet 伪装成 memmap（只实现 shape 与按帧取图）。
+
+    --limit 1 或内存充足时读帧走常驻路径、不建 memmap，而测吞吐等任务函数
+    只认 _MEM['mm']；这里补一个薄适配器，避免 KeyError: 'mm'。
+    """
+
+    def __init__(self, fs, n: int, h: int, w: int):
+        self._fs = fs
+        self.shape = (int(n), int(h), int(w))
+
+    def __getitem__(self, key):
+        if isinstance(key, tuple):            # 形如 (i, ys, xs) 的切片访问
+            i, ys, xs = key
+            d = np.asarray(self._fs.frame(int(i)), np.float32)
+            return d[ys, xs]
+        return np.asarray(self._fs.frame(int(key)), np.float32)
+
+
 def _task_flux(job):
     i, stars, th, kk, dx, dy = job
     fl = measure_flux_frame(_MEM['mm'], i, _MEM['off'], stars, th=th, kk=kk,
@@ -3375,6 +3394,11 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 finally:
                     exf.shutdown(wait=True, cancel_futures=True)
             else:
+                if 'mm' not in _MEM:            # 常驻内存路径：临时提供适配器
+                    _h0, _w0 = fs.shape
+                    _n0 = int(len(dx))
+                    _MEM['mm'] = _ResidentStack(fs, _n0, _h0, _w0)
+                    _MEM['off'] = np.zeros(int(_n0), np.float64)
                 for i, fl in (_task_flux(j) for j in jobs):
                     _check_cancel()
                     fluxes[i] = fl
