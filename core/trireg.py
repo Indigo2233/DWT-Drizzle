@@ -8,6 +8,7 @@
   3) 描述子近似的三角形对 -> 顶点按边长顺序一一对应 -> Umeyama 解相似变换；
   4) 用全部星点验证，投内点最多的那个解。
 """
+import os
 import numpy as np
 from scipy.spatial import cKDTree
 
@@ -104,8 +105,11 @@ def solve(src_pts, ref_pts, max_pts=48, tol=0.03, inlier_px=2.5, log=None,
     best = None
     ref_all = ref_pts
     tree2 = cKDTree(ref_all)
-    _want = 0.6 * max(1, len(src_pts))
-    for _dv, i, j in pairs[:4000]:
+    # 想多快收敛可调：默认要求 50% 内点就收工（原来是 60%，多数帧跑满 4000 对）；
+    # 候选对上限也从 4000 降到 1500——排在后面的三角形对几乎不可能翻盘。
+    _want = float(os.environ.get('DWT_TRI_WANT', '') or 0.5) * max(1, len(src_pts))
+    _pmax = int(os.environ.get('DWT_TRI_PAIRS', '') or 1500)
+    for _dv, i, j in pairs[:_pmax]:
         p3 = dp[dv[i]]
         q3 = rp[rv[j]]
         try:

@@ -4369,6 +4369,19 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 if _nan_n:
                     Stk = np.where(_bad, np.nan, Stk).astype(Stk.dtype, copy=False)
                     log(f'[输出] 未覆盖像素置 NaN：{_nan_n} 个（{_nan_n / Stk.size:.3%}）')
+        # 成品有效性门禁：几乎全空的图不该写盘（否则用户拿到一张全黑图还收到"完成"）
+        _fin = np.isfinite(Stk)
+        _vfrac = float(np.count_nonzero(_fin)) / float(max(1, Stk.size))
+        if _vfrac < 0.05:
+            _nmed = float(np.median(neff)) if neff is not None and len(neff) else float('nan')
+            log('[输出] 成品只有 %.2f%% 像素有数据（N_eff 中位 %.2f），判定叠加失败、不写成品。'
+                % (_vfrac * 100.0, _nmed))
+            log('[输出] 常见原因：参考网格旋转/尺度解错、或所有帧都被配准门禁排除；'
+                '请把本次日志发回，可用 --frame 去掉参考网格再试。')
+            raise SystemExit(3)
+        if _vfrac < 0.5:
+            log('[输出] 注意：只有 %.1f%% 像素有数据，边缘大片为空（前面可加「自动裁边」）'
+                % (_vfrac * 100.0))
         save_linear_xisf(p_out, Stk, metas,
                          f'PWS A={A:g} B={B:g} rej_k={rej_k:g}',
                          diag={'A': A, 'B': B, 'RejK': rej_k, 'RejGate': rej_gate,

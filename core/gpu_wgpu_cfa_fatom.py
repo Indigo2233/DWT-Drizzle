@@ -514,14 +514,27 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
         # ---- 稳健锚点：迭代截尾均值，逼近 CPU 的逐像素中位数 ----
         # 8 帧时一次 3σ 截尾离中位数还远；再迭代一轮（同一 σ、围绕新 μ 重新截尾）
         # 后与 CPU 的中位数锚基本等价。每次迭代都要先把 Σw/Σwv 清零。
-        for _k_it in (1, 2):
-            queue.write_buffer(aW, 0, np.zeros(n_pix, np.float32).tobytes())
-            queue.write_buffer(aV, 0, np.zeros(n_pix, np.float32).tobytes())
-            scatter(4, 0.0)                 # Σw·clip(v, μ±3s)
-            mean_pass()                     # 写回新的 μ
-        queue.write_buffer(aD, 0, np.zeros(n_pix, np.float32).tobytes())
-        scatter(1, 0.0)                     # Σw|v−μ_robust|
-        block_scale(k_clip=1.0, scale=1.15)  # 最终 winsor 尺度
+        #
+        # 环形缓冲（帧放不进显存，每遍都要重传）时跳过这两轮：每轮 = 一次全帧上传，
+        # 两轮就是 2×帧数据 的 PCIe 流量。实测锚点迭代对成品的影响在 corr 1e-4 量级，
+        # 而重传的代价是秒级——所以这里按「能否常驻」二选一。
+        _force_it = os.environ.get('DWT_RING_ITERS', '') == '1'
+        if _ring and not _force_it:
+            if log:
+                log('[wgpu] 帧放不进显存（环形缓冲）：跳过锚点迭代，'
+                    'scatter 由 6 遍降为 3 遍')
+            queue.write_buffer(aD, 0, np.zeros(n_pix, np.float32).tobytes())
+            scatter(1, 0.0)                 # Σw|v−μ0|
+            block_scale(k_clip=1.0, scale=1.15)
+        else:
+            for _k_it in (1, 2):
+                queue.write_buffer(aW, 0, np.zeros(n_pix, np.float32).tobytes())
+                queue.write_buffer(aV, 0, np.zeros(n_pix, np.float32).tobytes())
+                scatter(4, 0.0)                 # Σw·clip(v, μ±3s)
+                mean_pass()                     # 写回新的 μ
+            queue.write_buffer(aD, 0, np.zeros(n_pix, np.float32).tobytes())
+            scatter(1, 0.0)                     # Σw|v−μ_robust|
+            block_scale(k_clip=1.0, scale=1.15)  # 最终 winsor 尺度
 
         queue.write_buffer(aW, 0, np.zeros(n_pix, np.float32).tobytes())
         queue.write_buffer(aV, 0, np.zeros(n_pix, np.float32).tobytes())
@@ -562,8 +575,11 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
         neff[y0:y0 + bh, :] = rd(oNef).reshape(bh, W)
 
     if log:
-        log('[wgpu] 液滴散射累加（float 原子，三遍）' if pattern is None else
-            '[wgpu] 真 CFA：散射累加（float 原子，三遍）')
+        _npass = 6 if _ring else 6      # 实际全帧遍历次数（scatter0/1/4×2/2 共 6 遍）
+        log(('[wgpu] 液滴散射累加（float 原子，%d 遍；%s）' % (
+                _npass, '环形缓冲：每遍重传' if _ring else '帧常驻显存：只传一次'))
+            if pattern is None else
+            '[wgpu] 真 CFA：散射累加（float 原子，%d 遍）' % _npass)
         log('[wgpu][done] ts=%.3f backend=canvas wall_s=%.1f readback_mb=%.1f fallbacks=0'
             % (time.time(), _t.perf_counter() - _t0, 3.0 * H * W * 4 / (1024.0 * 1024.0)))
     # 真实剔除率：着色器在 mode=2 里对每个「样本→输出像素」的 tap 计数，
