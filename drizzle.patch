@@ -2454,7 +2454,7 @@
      idx = np.argsort(np.nan_to_num(fwhms, nan=1e9))[:k]
  
      if star_grow_pct > 0:
-@@ -1586,88 +3266,973 @@
+@@ -1586,88 +3266,1006 @@
      else:
          log('[拖线] 星点锐帧扩展已关闭（0%）')
  
@@ -3234,6 +3234,11 @@
 +                log('[wgpu] 真 CFA：液滴散射（定点原子加，pixfrac×倍率=%.2f）'
 +                    % (_pf * _sc))
 +        _use_wgpu = _wgpu_ok
++        # 灰度素材：收集式（stack_pws）与 CPU 差 2~3%，改用液滴散射（float 原子画布），
++        # 60 帧实测 corr 0.998、比 CuPy 快 22%。收集式只保留给彩机最近邻路径。
++        if _use_wgpu and _cfa_sel is None:
++            log('[wgpu] 灰度素材走液滴散射后端（收集式只用于彩机）')
++            _use_wgpu = False
 +        _wmap = None
 +        def _do_stack():
 +            if _use_wgpu:
@@ -3349,6 +3354,34 @@
 +                        % (_cv_mb, int(_drizzle_workers()), _nw))
 +            except Exception:
 +                _nw = int(_drizzle_workers())
++            # ---- wgpu 后端：没有 CUDA 时不要直接掉到 CPU（跨平台 Vulkan/Metal/D3D12）----
++            if _cfa_sel is None and str(os.environ.get('DWT_GPU', 'auto')).lower() not in (
++                    '0', 'off', 'false', 'no'):
++                # 2.7.73：wgpu 作为主 GPU 后端（跨平台、60 帧实测比 CuPy 还快 22%），
++                # CuPy 只在 wgpu 不可用时兜底；DWT_CUPY_FIRST=1 可恢复旧优先序。
++                _cupy_first = os.environ.get('DWT_CUPY_FIRST', '') == '1'
++                if not _cupy_first:
++                    try:
++                        import gpu_wgpu_cfa_fatom as _wmod
++                        if _wmod.available():
++                            log('[drizzle] 叠加走 GPU（wgpu）：整张画布')
++                            _r = _wmod.stack_cfa_fatom(
++                                fs, C, S, dx, dy, th, kk, drz_plan, A, B,
++                                rej_k=rej_k, rej_gate=rej_gate, R=R,
++                                pixfrac=float(drz_p),
++                                band_rows=int(max(64, drz_plan.get('H', 1024))),
++                                T=T, fp=float(fp), log=log,
++                                pattern=None, channel=None)
++                            try:
++                                _r.setdefault('ncov', _r.get('cov'))
++                                _r.setdefault('rej_rate', 0.0)
++                                _r.setdefault('wmax', 0.0)
++                            except Exception:
++                                pass
++                            return _r
++                    except Exception as _e_w:
++                        log('[drizzle] wgpu 不可用（%s: %s），改走 CPU'
++                            % (type(_e_w).__name__, _e_w))
 +            return stack_drizzle(fs, R, C, S, dx, dy, drz_plan, A, B, rej_k,
 +                                rej_gate, float(fs.sky0), drz_p, band,
 +                                theta=th, scale=kk, dist=_dist, workers=_nw,
@@ -3486,7 +3519,7 @@
      log(f'[W] 单帧最大权重（条带均值）{np.mean(wmax):.3f}  '
          f'等权份额 = {1.0:.3f} → 最大独占约 {np.mean(wmax):.1f}× 份额')
      log(f'[叠加] 完成 {time.perf_counter() - t2:.1f}s  排异剔除率 {rej_rate:.3%}')
-@@ -1688,11 +4253,56 @@
+@@ -1688,11 +4286,56 @@
          log(f'[读数] {name:<18} 占 {msk.mean():6.2%}  N_eff 中位 '
              f'{np.median(neff[msk]):5.2f}  σ {sd:.4e}')
  
@@ -3546,7 +3579,7 @@
  
      res = {
          'n': n, 'shape': Stk.shape, 'fwhms': fwhms, 'C': C, 'S': S, 'sigma': sig_out,
-@@ -1700,27 +4310,133 @@
+@@ -1700,27 +4343,133 @@
          'R_info': rinfo, 'neff': neff, 'rej_rate': float(rej_rate),
          'A': A, 'B': B, 'rej_k': rej_k, 'stars': stars,
          'metas': metas, 'skies': skies, 'scale_out': float(scale_out),
@@ -3684,7 +3717,7 @@
  
      log(f'[时] 总计 {time.perf_counter() - t_start:.1f}s')
      _emit('输出', 1.0, '完成')
-@@ -1750,13 +4466,23 @@
+@@ -1750,13 +4499,23 @@
                              choices=[v for _, v in prm.choices], help=text)
          else:
              ap.add_argument(flag, default=default, help=text)
@@ -3708,7 +3741,7 @@
      try:
          run(p)
      except Cancelled:
-@@ -1764,5 +4490,82 @@
+@@ -1764,5 +4523,82 @@
      return 0
  
  
@@ -11200,7 +11233,7 @@
 +            'plan': plan, 'backend': 'wgpu-scatter'}
 --- a/core/gpu_wgpu_cfa_fatom.py
 +++ b/core/gpu_wgpu_cfa_fatom.py
-@@ -0,0 +1,577 @@
+@@ -0,0 +1,578 @@
 +"""真·散射累加后端（float32 原子加）。
 +
 +与分桶后端的区别：不保存样本，直接对输出像素做原子累加，显存只占 6 个画布大小的
@@ -11765,7 +11798,8 @@
 +        neff[y0:y0 + bh, :] = rd(oNef).reshape(bh, W)
 +
 +    if log:
-+        log('[wgpu] 真 CFA：散射累加（float 原子，三遍）')
++        log('[wgpu] 液滴散射累加（float 原子，三遍）' if pattern is None else
++            '[wgpu] 真 CFA：散射累加（float 原子，三遍）')
 +        log('[wgpu][done] ts=%.3f backend=canvas wall_s=%.1f readback_mb=%.1f fallbacks=0'
 +            % (time.time(), _t.perf_counter() - _t0, 3.0 * H * W * 4 / (1024.0 * 1024.0)))
 +    # 真实剔除率：着色器在 mode=2 里对每个「样本→输出像素」的 tap 计数，
@@ -13148,7 +13182,7 @@
 +        """关于：方法与原文出处（PWS，D.Cikey）"""
 +        messagebox.showinfo(
 +            "关于 DWT · Drizzle",
-+            "DWT · Drizzle 2.7.72-D\n\n" + LICENSE_TEXT)
++            "DWT · Drizzle 2.7.73-D\n\n" + LICENSE_TEXT)
 +
 +    def show_help(self):
 +        """打开内置使用说明（不依赖浏览器 / 外部程序）"""

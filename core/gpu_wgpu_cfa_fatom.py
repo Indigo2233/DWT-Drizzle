@@ -562,7 +562,8 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
         neff[y0:y0 + bh, :] = rd(oNef).reshape(bh, W)
 
     if log:
-        log('[wgpu] 真 CFA：散射累加（float 原子，三遍）')
+        log('[wgpu] 液滴散射累加（float 原子，三遍）' if pattern is None else
+            '[wgpu] 真 CFA：散射累加（float 原子，三遍）')
         log('[wgpu][done] ts=%.3f backend=canvas wall_s=%.1f readback_mb=%.1f fallbacks=0'
             % (time.time(), _t.perf_counter() - _t0, 3.0 * H * W * 4 / (1024.0 * 1024.0)))
     # 真实剔除率：着色器在 mode=2 里对每个「样本→输出像素」的 tap 计数，

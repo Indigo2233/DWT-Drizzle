@@ -4011,6 +4011,11 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 log('[wgpu] 真 CFA：液滴散射（定点原子加，pixfrac×倍率=%.2f）'
                     % (_pf * _sc))
         _use_wgpu = _wgpu_ok
+        # 灰度素材：收集式（stack_pws）与 CPU 差 2~3%，改用液滴散射（float 原子画布），
+        # 60 帧实测 corr 0.998、比 CuPy 快 22%。收集式只保留给彩机最近邻路径。
+        if _use_wgpu and _cfa_sel is None:
+            log('[wgpu] 灰度素材走液滴散射后端（收集式只用于彩机）')
+            _use_wgpu = False
         _wmap = None
         def _do_stack():
             if _use_wgpu:
@@ -4126,6 +4131,34 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                         % (_cv_mb, int(_drizzle_workers()), _nw))
             except Exception:
                 _nw = int(_drizzle_workers())
+            # ---- wgpu 后端：没有 CUDA 时不要直接掉到 CPU（跨平台 Vulkan/Metal/D3D12）----
+            if _cfa_sel is None and str(os.environ.get('DWT_GPU', 'auto')).lower() not in (
+                    '0', 'off', 'false', 'no'):
+                # 2.7.73：wgpu 作为主 GPU 后端（跨平台、60 帧实测比 CuPy 还快 22%），
+                # CuPy 只在 wgpu 不可用时兜底；DWT_CUPY_FIRST=1 可恢复旧优先序。
+                _cupy_first = os.environ.get('DWT_CUPY_FIRST', '') == '1'
+                if not _cupy_first:
+                    try:
+                        import gpu_wgpu_cfa_fatom as _wmod
+                        if _wmod.available():
+                            log('[drizzle] 叠加走 GPU（wgpu）：整张画布')
+                            _r = _wmod.stack_cfa_fatom(
+                                fs, C, S, dx, dy, th, kk, drz_plan, A, B,
+                                rej_k=rej_k, rej_gate=rej_gate, R=R,
+                                pixfrac=float(drz_p),
+                                band_rows=int(max(64, drz_plan.get('H', 1024))),
+                                T=T, fp=float(fp), log=log,
+                                pattern=None, channel=None)
+                            try:
+                                _r.setdefault('ncov', _r.get('cov'))
+                                _r.setdefault('rej_rate', 0.0)
+                                _r.setdefault('wmax', 0.0)
+                            except Exception:
+                                pass
+                            return _r
+                    except Exception as _e_w:
+                        log('[drizzle] wgpu 不可用（%s: %s），改走 CPU'
+                            % (type(_e_w).__name__, _e_w))
             return stack_drizzle(fs, R, C, S, dx, dy, drz_plan, A, B, rej_k,
                                 rej_gate, float(fs.sky0), drz_p, band,
                                 theta=th, scale=kk, dist=_dist, workers=_nw,
