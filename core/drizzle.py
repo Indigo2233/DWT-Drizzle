@@ -1846,7 +1846,9 @@ def _drizzle_band(ctx, Y0: int, Y1: int) -> Dict:
             dd = 0.0 if dist is None else float(dist[i])
             if not np.isfinite(dd):
                 dd = 0.0
-            Pi = max(1e-6, float(pixfrac) * s * kk * (2.0 if ctx.get('cfa_sel') is not None else 1.0))
+            _pm = float(os.environ.get('DWT_CFA_PMUL', '0') or 0)
+            _pm = _pm if _pm > 0 else (2.0 if ctx.get('cfa_sel') is not None else 1.0)
+            Pi = max(1e-6, float(pixfrac) * s * kk * _pm)
             ux, uy = -float(dx[i]), -float(dy[i])
             j0, j1 = _band_rows(plan, th, uy, Y0, Y1, h, w, Pi, kk, dd)
             if j1 <= j0:
@@ -1907,8 +1909,22 @@ def _drizzle_band(ctx, Y0: int, Y1: int) -> Dict:
                 an = np.nanmedian(_sub, axis=0)
             anchor[goodcol] = np.where(np.isfinite(an), an, 0.0)
         # winsor 的截尾上限要用「值」的标准差，不能用 |偏差| 的标准差
-        _s_pix = (np.nanstd(v, axis=0).astype(np.float32)
-                  if str(cm) == 'winsor' else None)
+        if str(cm) == 'winsor':
+            if os.environ.get('DWT_REJ_MAD', '') != '1':
+                _s_pix = np.nanstd(v, axis=0).astype(np.float32)
+            else:
+                # 逐像素尺度用「跨帧 MAD」而不是 std：卫星线只出现在少数帧，
+                # 用 std 时它会把该像素的标准差抬高 k 倍，阈值跟着变松，
+                # 于是恰恰放过了要剔的线（实测卫星线残留）。MAD 对 <50% 的
+                # 离群帧不敏感，线会被正常判为离群。
+                _n = v.shape[0]
+                _step = max(1, _n // 32)
+                _vs = v[::_step]
+                _md = np.nanmedian(_vs, axis=0)
+                _s_pix = (1.4826 * np.nanmedian(np.abs(_vs - _md[None]), axis=0)).astype(np.float32)
+                _s_pix = np.maximum(_s_pix, 1e-12)
+        else:
+            _s_pix = None
         # dev 就地算：v 之后不再需要原值，省一块 (n, bh, W) 的临时量
         np.subtract(v, anchor[None], out=v)
         np.abs(v, out=v)

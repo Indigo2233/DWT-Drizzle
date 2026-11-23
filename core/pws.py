@@ -4469,7 +4469,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         # 「全被排异掉」的像素会留下 0：cov>0 但分子为 0，图上看就是一个个黑点，
         # 连成 2×2/4×4 的细密网格。这些像素没有任何真值，用最近邻补上（天空量级），
         # 否则拉伸后网格非常显眼。
-        _z = np.isfinite(Stk) & (Stk <= 0.0)
+        _z = np.isfinite(Stk) & (Stk <= 0.0) if os.environ.get('DWT_NO_HOLEFILL','') != '1' else np.zeros_like(Stk, bool)
         _zn = int(np.count_nonzero(_z))
         if _zn:
             try:

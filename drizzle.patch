@@ -3744,7 +3744,7 @@
 +        # 「全被排异掉」的像素会留下 0：cov>0 但分子为 0，图上看就是一个个黑点，
 +        # 连成 2×2/4×4 的细密网格。这些像素没有任何真值，用最近邻补上（天空量级），
 +        # 否则拉伸后网格非常显眼。
-+        _z = np.isfinite(Stk) & (Stk <= 0.0)
++        _z = np.isfinite(Stk) & (Stk <= 0.0) if os.environ.get('DWT_NO_HOLEFILL','') != '1' else np.zeros_like(Stk, bool)
 +        _zn = int(np.count_nonzero(_z))
 +        if _zn:
 +            try:
@@ -4641,7 +4641,7 @@
 +    return bool(detect_pattern(meta))
 --- a/core/drizzle.py
 +++ b/core/drizzle.py
-@@ -0,0 +1,2375 @@
+@@ -0,0 +1,2391 @@
 +"""Drizzle 重采样层（PWS 的几何层）
 +
 +把 PWS 阶段 C 的"唯一一次加权平均（式 12）"换成**带权 drizzle 累积**，从而在
@@ -6490,7 +6490,9 @@
 +            dd = 0.0 if dist is None else float(dist[i])
 +            if not np.isfinite(dd):
 +                dd = 0.0
-+            Pi = max(1e-6, float(pixfrac) * s * kk * (2.0 if ctx.get('cfa_sel') is not None else 1.0))
++            _pm = float(os.environ.get('DWT_CFA_PMUL', '0') or 0)
++            _pm = _pm if _pm > 0 else (2.0 if ctx.get('cfa_sel') is not None else 1.0)
++            Pi = max(1e-6, float(pixfrac) * s * kk * _pm)
 +            ux, uy = -float(dx[i]), -float(dy[i])
 +            j0, j1 = _band_rows(plan, th, uy, Y0, Y1, h, w, Pi, kk, dd)
 +            if j1 <= j0:
@@ -6551,8 +6553,22 @@
 +                an = np.nanmedian(_sub, axis=0)
 +            anchor[goodcol] = np.where(np.isfinite(an), an, 0.0)
 +        # winsor 的截尾上限要用「值」的标准差，不能用 |偏差| 的标准差
-+        _s_pix = (np.nanstd(v, axis=0).astype(np.float32)
-+                  if str(cm) == 'winsor' else None)
++        if str(cm) == 'winsor':
++            if os.environ.get('DWT_REJ_MAD', '') != '1':
++                _s_pix = np.nanstd(v, axis=0).astype(np.float32)
++            else:
++                # 逐像素尺度用「跨帧 MAD」而不是 std：卫星线只出现在少数帧，
++                # 用 std 时它会把该像素的标准差抬高 k 倍，阈值跟着变松，
++                # 于是恰恰放过了要剔的线（实测卫星线残留）。MAD 对 <50% 的
++                # 离群帧不敏感，线会被正常判为离群。
++                _n = v.shape[0]
++                _step = max(1, _n // 32)
++                _vs = v[::_step]
++                _md = np.nanmedian(_vs, axis=0)
++                _s_pix = (1.4826 * np.nanmedian(np.abs(_vs - _md[None]), axis=0)).astype(np.float32)
++                _s_pix = np.maximum(_s_pix, 1e-12)
++        else:
++            _s_pix = None
 +        # dev 就地算：v 之后不再需要原值，省一块 (n, bh, W) 的临时量
 +        np.subtract(v, anchor[None], out=v)
 +        np.abs(v, out=v)
@@ -11462,7 +11478,7 @@
 +            'plan': plan, 'backend': 'wgpu-scatter'}
 --- a/core/gpu_wgpu_cfa_fatom.py
 +++ b/core/gpu_wgpu_cfa_fatom.py
-@@ -0,0 +1,600 @@
+@@ -0,0 +1,601 @@
 +"""真·散射累加后端（float32 原子加）。
 +
 +与分桶后端的区别：不保存样本，直接对输出像素做原子累加，显存只占 6 个画布大小的
@@ -11697,7 +11713,8 @@
 +    ox, oy = float(plan.get('ox', 0.0)), float(plan.get('oy', 0.0))
 +    h, w = int(fs.shape[0]), int(fs.shape[1])
 +    # CFA：同色格点间隔 2 源像素，液滴边长要乘 2，否则 2× 输出会留 3/4 覆盖空洞
-+    _pm = 2.0 if pattern is not None else 1.0
++    _pm = float(os.environ.get('DWT_CFA_PMUL', '0') or 0)
++    _pm = _pm if _pm > 0 else (2.0 if pattern is not None else 1.0)
 +    P = max(1e-6, float(pixfrac) * s_grid * _pm)
 +
 +    n = len(dx)
@@ -13445,7 +13462,7 @@
 +        """关于：方法与原文出处（PWS，D.Cikey）"""
 +        messagebox.showinfo(
 +            "关于 DWT · Drizzle",
-+            "DWT · Drizzle 2.7.85-D\n\n" + LICENSE_TEXT)
++            "DWT · Drizzle 2.7.86-D\n\n" + LICENSE_TEXT)
 +
 +    def show_help(self):
 +        """打开内置使用说明（不依赖浏览器 / 外部程序）"""
