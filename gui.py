@@ -306,7 +306,7 @@ class App(tk.Tk):
         style.configure(".", font=FONT, background=BG, foreground=FG)
         style.configure("TFrame", background=BG)
         style.configure("Card.TFrame", background=CARD)
-        style.configure("TLabel", background=BG, foreground=FG)
+        style.configure("TLabel", background=CARD, foreground=FG)
         style.configure("Card.TLabel", background=CARD, foreground=FG)
         style.configure("Hint.TLabel", background=CARD, foreground=FG2,
                         font=FONT_S)
@@ -393,8 +393,12 @@ class App(tk.Tk):
             win = cv.create_window((0, 0), window=bd, anchor="nw")
             bd.bind("<Configure>", lambda e, c=cv: c.configure(
                 scrollregion=c.bbox("all")))
-            cv.bind("<Configure>", lambda e, c=cv, w=win: c.itemconfigure(
-                w, width=e.width))
+            def _fit_page(e, c=cv, w=win):
+                # 正文最大 _px(1100) 并水平居中：大屏不再把输入框拉成一整条
+                _wd = min(e.width, _px(1100))
+                c.coords(w, max(0, (e.width - _wd) // 2), 0)
+                c.itemconfigure(w, width=_wd)
+            cv.bind("<Configure>", _fit_page)
             for wdg in (cv, bd):
                 wdg.bind("<MouseWheel>", self._wheel)
             bd.columnconfigure(0, weight=1)
@@ -416,7 +420,7 @@ class App(tk.Tk):
         body_log = _body_of("日志")
 
         # 路径
-        p = ttk.Labelframe(body, text=" 素材与输出 ", padding=10)
+        p = ui_round.RoundCard(body, text="素材与输出", padding=_px(16), radius=_px(18)) if ui_round else ttk.Labelframe(body, text=" 素材与输出 ", padding=10)
         p.pack(fill="x")
         p.columnconfigure(1, weight=1)
 
@@ -463,14 +467,14 @@ class App(tk.Tk):
                                bg=BG, fg="#6b7280", font=FONT_S)
         self.lab_ch.pack(side="left", padx=10)
 
-        fr_lb = tk.Frame(p)
+        fr_lb = tk.Frame(p, bg=CARD)
         fr_lb.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(4, 0))
-        self.cv_ch = tk.Canvas(fr_lb, height=108, highlightthickness=0, bg=BG)
+        self.cv_ch = tk.Canvas(fr_lb, height=96, highlightthickness=0, bg=CARD)
         sb = ttk.Scrollbar(fr_lb, orient="vertical", command=self.cv_ch.yview)
         self.cv_ch.configure(yscrollcommand=sb.set)
         self.cv_ch.pack(side="left", fill="x", expand=True)
         sb.pack(side="right", fill="y")
-        self.fr_ch = tk.Frame(self.cv_ch, bg=BG)
+        self.fr_ch = tk.Frame(self.cv_ch, bg=CARD)
         self.ch_win = self.cv_ch.create_window((0, 0), window=self.fr_ch, anchor="nw")
         self.fr_ch.bind("<Configure>",
                         lambda e: self.cv_ch.configure(scrollregion=self.cv_ch.bbox("all")))
@@ -480,7 +484,7 @@ class App(tk.Tk):
         self.ch_vars: list = []
 
         # 参数
-        g = ttk.Labelframe(body, text=" 叠加参数 ", padding=10)
+        g = ui_round.RoundCard(body, text="叠加参数", padding=_px(16), radius=_px(18)) if ui_round else ttk.Labelframe(body, text=" 叠加参数 ", padding=10)
         g.pack(fill="x", pady=(_px(2), _px(10)))
         self.v_A = tk.StringVar()
         self.v_rejk = tk.StringVar()
@@ -502,7 +506,7 @@ class App(tk.Tk):
         cell(g, 3, "限帧", self.v_limit, 8, "只用前 N 帧；0 = 全部")
 
         # Drizzle
-        d = ttk.Labelframe(body_dz, text=" Drizzle ", padding=10)
+        d = ui_round.RoundCard(body_dz, text="Drizzle", padding=_px(16), radius=_px(18)) if ui_round else ttk.Labelframe(body_dz, text=" Drizzle ", padding=10)
         d.pack(fill="x", pady=(_px(2), _px(10)))
         self.v_drz = tk.BooleanVar()
         self.v_scale = tk.StringVar()
@@ -538,7 +542,7 @@ class App(tk.Tk):
 
 
         # 高级
-        adv = ttk.Labelframe(body_adv, text=" 高级 ", padding=10)
+        adv = ui_round.RoundCard(body_adv, text="高级参数", padding=_px(16), radius=_px(18)) if ui_round else ttk.Labelframe(body_adv, text=" 高级 ", padding=10)
         adv.pack(fill="x", pady=(10, 0))
         adv.columnconfigure(1, weight=1)
         self.v_bgdeg = tk.StringVar()
@@ -717,18 +721,20 @@ class App(tk.Tk):
             self.btn_stop = ttk.Button(bar, text="停止", command=self.stop,
                                        state="disabled")
             self.btn_stop.pack(side="left")
-        ttk.Button(bar, text="存为默认", width=10, command=self.save_default).pack(
-            side="left", padx=(16, 0))
-        ttk.Button(bar, text="查看权重场", width=12,
-                   command=self.show_maps).pack(side="left", padx=(8, 0))
-        ttk.Button(bar, text="运行监控", width=10,
-                   command=self.show_monitor).pack(side="left", padx=(8, 0))
-        ttk.Button(bar, text="使用说明", width=10,
-                   command=self.show_help).pack(side="left", padx=(8, 0))
-        ttk.Button(bar, text="关于", width=6,
-                   command=self.show_about).pack(side="left", padx=(8, 0))
-        ttk.Button(bar, text="自动调参", width=10,
-                   command=self.start_tune).pack(side="left", padx=(8, 0))
+        for _txt, _cmd in (("存为默认", self.save_default),
+                           ("查看权重场", self.show_maps),
+                           ("运行监控", self.show_monitor),
+                           ("使用说明", self.show_help),
+                           ("关于", self.show_about),
+                           ("自动调参", self.start_tune)):
+            if ui_round is not None:
+                ui_round.RoundButton(bar, _txt, command=_cmd,
+                                     font=(_FONT_FAMILY, _f(9)),
+                                     pad_x=_px(14), pad_y=_px(9)).pack(
+                    side="left", padx=(_px(8), 0))
+            else:
+                ttk.Button(bar, text=_txt, width=10, command=_cmd).pack(
+                    side="left", padx=(8, 0))
         self.pb = ttk.Progressbar(bar, mode="determinate", value=0, length=180)
         self.pb.pack(side="left", padx=16)
         self.lab_time = tk.Label(bar, text="用时 00:00", bg=BG, fg="#4b5563", font=FONT)
@@ -737,7 +743,7 @@ class App(tk.Tk):
         self.lab_stage.pack(side="right", padx=16)
 
         # 日志
-        lg = ttk.Labelframe(body_log, text=" 日志 ", padding=6)
+        lg = ui_round.RoundCard(body_log, text="日志", padding=_px(12), radius=_px(18), dark=True) if ui_round else ttk.Labelframe(body_log, text=" 日志 ", padding=6)
         lg.pack(fill="both", expand=True, pady=(10, 0))
         self.txt = tk.Text(lg, height=16, bg="#0f172a", fg="#cbd5e1", insertbackground="#cbd5e1",
                            font=("Consolas", 9), relief="flat", wrap="none", padx=8, pady=6)
@@ -1304,7 +1310,7 @@ class App(tk.Tk):
         """关于：方法与原文出处（PWS，D.Cikey）"""
         messagebox.showinfo(
             "关于 DWT · Drizzle",
-            "DWT · Drizzle 2.7.52-D\n\n" + LICENSE_TEXT)
+            "DWT · Drizzle 2.7.53-D\n\n" + LICENSE_TEXT)
 
     def show_help(self):
         """打开内置使用说明（不依赖浏览器 / 外部程序）"""
