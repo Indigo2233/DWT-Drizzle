@@ -876,6 +876,7 @@ def measure_shifts(fs, stars: Sequence[Tuple[int, int]], ref: int = 0,
                         f'（全星命中 {_hit3}/{_nt3}）')
         if _n_rescue and log:
             log(f'  [位移] 三角配准兜底救回 {_n_rescue} 帧')
+    _is_chain = np.zeros(n, bool)
     # 链式兜底：直配参考帧仍然失败的帧，先和最近的已成功帧配准（相邻帧位移只有
     #   几像素，三角形不变量几乎不会错），再把这份相对变换复合回参考帧坐标。
     #   代价是误差按链路累积（N 跳约 √N 倍随机误差 + 每跳的系统偏差），所以只在
@@ -928,6 +929,7 @@ def measure_shifts(fs, stars: Sequence[Tuple[int, int]], ref: int = 0,
                     dx[_i], dy[_i], theta[_i] = -_ui[0], -_ui[1], _thi
                     scale[_i] = _ki
                     bad[_i] = False
+                    _is_chain[_i] = True
                     _n_chain += 1
                     log and log(f'  [位移] 第 {_i} 帧直配失败，链式救回（经第 {_j} 帧，'
                                 f'相对旋转 {_thij:+.2f}° 尺度 {_kij:.4f} 残差 {_trc["rms"]:.2f}px，'
@@ -935,6 +937,72 @@ def measure_shifts(fs, stars: Sequence[Tuple[int, int]], ref: int = 0,
                     break
         if _n_chain and log:
             log(f'  [位移] 链式配准兜底救回 {_n_chain} 帧（误差会按链路累积，留意边缘）')
+        # 全局平差：链式救回的帧带着累积误差。把「每帧对参考的直配观测」与
+        #   「相邻帧之间的成对观测」放在一起做加权最小二乘，只求平移（旋转/尺度
+        #   的每跳误差比平移小一个量级，先不动），把链路误差摊平。
+        #   权重：直配 1.0、救回帧 0.25、成对 2.0（相邻帧观测最可靠）。
+        try:
+            _rescued = [int(i) for i in range(n) if (not bad[i]) and np.isfinite(dx[i]) and _is_chain[i]]
+            if _rescued and len(_good) >= 3:
+                _nodes = sorted(set(_rescued) | {j for i in _rescued
+                                                 for j in _good
+                                                 if abs(j - i) <= 2})
+                _idx = {v: k for k, v in enumerate(_nodes)}
+                _m = len(_nodes)
+                _rows, _rx, _ry, _wts = [], [], [], []
+                for _v in _nodes:
+                    _r = np.zeros(_m); _r[_idx[_v]] = 1.0
+                    _rows.append(_r)
+                    _rx.append(float(dx[_v])); _ry.append(float(dy[_v]))
+                    _wts.append(0.25 if _v in _rescued else 1.0)
+                _stars_ba = {}
+                for _a, _c in zip(_nodes[:-1], _nodes[1:]):
+                    if _c - _a > 3:
+                        continue
+                    try:
+                        for _t in (_a, _c):
+                            if _t not in _stars_ba:
+                                _stars_ba[_t] = _detect_stars(fs.frame(int(_t)))
+                        _trb = _tri2.solve(np.asarray(_stars_ba[_a], float),
+                                           np.asarray(_stars_ba[_c], float),
+                                           max_pts=40, inlier_px=2.5)
+                    except Exception:
+                        _trb = None
+                    if not _trb or _trb['n_in'] < 12 or _trb['rms'] > 2.0:
+                        continue
+                    if not (0.98 <= float(_trb['scale']) <= 1.02):
+                        continue
+                    _rr = np.zeros(_m)
+                    _rr[_idx[_a]] = 1.0; _rr[_idx[_c]] = -1.0
+                    _rows.append(_rr)
+                    _rx.append(-float(_trb['t'][0])); _ry.append(-float(_trb['t'][1]))
+                    _wts.append(2.0)
+                if len(_rows) > _m:
+                    _A = np.asarray(_rows); _W = np.asarray(_wts)[:, None]
+                    _Aw = _A * _W
+                    _sx, *_ = np.linalg.lstsq(_Aw, np.asarray(_rx) * _wts, rcond=None)
+                    _sy, *_ = np.linalg.lstsq(_Aw, np.asarray(_ry) * _wts, rcond=None)
+                    _n_adj = 0
+                    for _v in _nodes:
+                        _dx0, _dy0 = float(dx[_v]), float(dy[_v])
+                        dx[_v], dy[_v] = float(_sx[_idx[_v]]), float(_sy[_idx[_v]])
+                        try:
+                            _si3 = _detect_stars(fs.frame(int(_v)))
+                            _u3 = np.array([-dx[_v], -dy[_v]])
+                            _okb, _hb, _ntb = _verify_all(s_ref, _si3, float(theta[_v]),
+                                                          float(scale[_v]), _u3)
+                        except Exception:
+                            _okb = False
+                        if not _okb:
+                            dx[_v], dy[_v] = _dx0, _dy0      # 平差后反而验不过就退回
+                        else:
+                            _n_adj += 1
+                    if log:
+                        log(f'  [位移] 全局平差：{_n_adj}/{_m} 帧更新（相邻成对观测 '
+                            f'{len(_rows) - _m} 条，链路累积误差已摊平）')
+        except Exception as _eba:
+            log and log(f'  [位移] 全局平差跳过（{type(_eba).__name__}: {_eba}）')
+
     # 帧间漂移一致性：真实跟踪漂移是平滑的（每帧几像素、方向连续）。某帧的
     #   (dx,dy) 若与「帧号→位移」的线性趋势差出好几像素，说明它是"验证通过"
     #   的错配解——叠上去会把同一颗星画两遍（双影/脱线），比少叠一帧更难发现。
