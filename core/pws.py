@@ -3219,6 +3219,30 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                     f'θ {np.min(_gt):+.2f}°~{np.max(_gt):+.2f}°  '
                     f'k {np.min(_gk):.4f}~{np.max(_gk):.4f}')
         sh = measure_shifts(_reg, stars, ref=int(seed), log=log, guess=_gg)
+        # 参考帧回退：自动挑的参考帧若是异类（星少/最糊/取景偏），会把整组都判成配准失败。
+        # 这里只在首轮参与率 < 50% 时，换星点最多的几个候选各试一次，取参与最多的那一次。
+        _ref_fallback = None
+        try:
+            _n_all = int(len(sh['dx']))
+            _kr = float(sh.get('n_keep', 0)) / max(1, _n_all)
+            if _kr < 0.5 and len(stars) > 2:
+                _cnt = np.array([len(_s) for _s in stars], np.float64)
+                _order = [int(i) for i in np.argsort(-_cnt) if int(i) != int(seed)]
+                _best, _best_sh = int(sh.get('n_keep', 0)), sh
+                for _cand in _order[:3]:
+                    try:
+                        _sh2 = measure_shifts(_reg, stars, ref=_cand, log=None, guess=_gg)
+                    except Exception:
+                        continue
+                    if int(_sh2.get('n_keep', 0)) > _best:
+                        _best, _best_sh = int(_sh2.get('n_keep', 0)), _sh2
+                        _ref_fallback = _cand
+                if _ref_fallback is not None:
+                    log(f'[配准] 参考帧 #{int(seed)} 只对上 {int(sh["n_keep"])}/{_n_all} 帧，'
+                        f'改参考帧 #{_ref_fallback}（对上 {_best} 帧）')
+                    sh = _best_sh
+        except Exception as _e:
+            log(f'[配准] 参考帧回退失败（不影响本次）：{_e}')
         _drop = [int(i) for i in np.nonzero(~np.asarray(sh['keep'], bool))[0]]
         if _drop:
             log(f'  [叠加] 未参与的帧索引：{_drop[:40]}'
@@ -3267,8 +3291,11 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                                        'fwhm': (None if not np.isfinite(fwhms[_i])
                                                 else round(float(fwhms[_i]), 3))})
         if _excluded_rows:
-            _payload = {'n_used': int(np.count_nonzero(np.isfinite(dx) & np.isfinite(dy))),
-                        'n_total': int(n), 'items': _excluded_rows}
+            try:
+                _nu = int(np.count_nonzero(np.asarray(sh.get('keep', np.isfinite(dx)), bool)))
+            except Exception:
+                _nu = int(np.count_nonzero(np.isfinite(dx) & np.isfinite(dy)))
+            _payload = {'n_used': _nu, 'n_total': int(n), 'items': _excluded_rows}
             try:
                 log('[EXCLUDED] ' + json.dumps(_payload, ensure_ascii=False))
             except Exception:

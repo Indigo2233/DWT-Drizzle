@@ -393,13 +393,18 @@ def _trans_only(img, ref_img, stars, refc, half) -> Optional[Tuple[float, float]
     return float(x0), float(y0)
 
 
-def _verify_all(s_ref, s_i, th, k, u, frac_min=0.35, rad=2.5):
+def _verify_all(s_ref, s_i, th, k, u, frac_min=None, rad=2.5):
     """用最终相似变换把本帧检到的星全部投到参考帧，返回 (是否可信, 命中数, 总数)。
 
     匹配器对「对不上的帧」会给出自洽的假解：少数点的 SVD 能把误差整个塞进
     尺度里，残差仍然只有 0.1~0.4px，单看 scatter 抓不住。全星命中率是可靠
     判据——真对上时通常 60%~95%，假解一般 < 15%。
     """
+    if frac_min is None:
+        try:
+            frac_min = float(os.environ.get("DWT_VERIFY_FRAC", "0.35") or 0.35)
+        except Exception:
+            frac_min = 0.35
     from scipy.spatial import cKDTree
     s_ref = np.asarray(s_ref, np.float64)
     s_i = np.asarray(s_i, np.float64)
