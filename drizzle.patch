@@ -4397,7 +4397,7 @@
 +    return bool(detect_pattern(meta))
 --- a/core/drizzle.py
 +++ b/core/drizzle.py
-@@ -0,0 +1,2360 @@
+@@ -0,0 +1,2372 @@
 +"""Drizzle 重采样层（PWS 的几何层）
 +
 +把 PWS 阶段 C 的"唯一一次加权平均（式 12）"换成**带权 drizzle 累积**，从而在
@@ -5349,11 +5349,12 @@
 +                                                 if abs(j - i) <= 2})
 +                _idx = {v: k for k, v in enumerate(_nodes)}
 +                _m = len(_nodes)
-+                _rows, _rx, _ry, _wts = [], [], [], []
++                _rows, _rx, _ry, _rt, _rl, _wts = [], [], [], [], [], []
 +                for _v in _nodes:
 +                    _r = np.zeros(_m); _r[_idx[_v]] = 1.0
 +                    _rows.append(_r)
 +                    _rx.append(float(dx[_v])); _ry.append(float(dy[_v]))
++                    _rt.append(float(theta[_v])); _rl.append(math.log(max(float(scale[_v]), 1e-3)))
 +                    _wts.append(0.25 if _v in _rescued else 1.0)
 +                _stars_ba = {}
 +                for _a, _c in zip(_nodes[:-1], _nodes[1:]):
@@ -5376,16 +5377,26 @@
 +                    _rr[_idx[_a]] = 1.0; _rr[_idx[_c]] = -1.0
 +                    _rows.append(_rr)
 +                    _rx.append(-float(_trb['t'][0])); _ry.append(-float(_trb['t'][1]))
++                    _rt.append(float(_trb['theta'])); _rl.append(math.log(float(_trb['scale'])))
 +                    _wts.append(2.0)
 +                if len(_rows) > _m:
 +                    _A = np.asarray(_rows); _W = np.asarray(_wts)[:, None]
 +                    _Aw = _A * _W
 +                    _sx, *_ = np.linalg.lstsq(_Aw, np.asarray(_rx) * _wts, rcond=None)
 +                    _sy, *_ = np.linalg.lstsq(_Aw, np.asarray(_ry) * _wts, rcond=None)
++                    # 旋转与 ln(尺度) 也满足「可加」：θ_i = θ_j + θ_ij、ln k_i = ln k_j + ln k_ij，
++                    #   所以同一个约束矩阵能一并解出来（仍是线性最小二乘）。
++                    _st, *_ = np.linalg.lstsq(_Aw, np.asarray(_rt) * _wts, rcond=None)
++                    _sl, *_ = np.linalg.lstsq(_Aw, np.asarray(_rl) * _wts, rcond=None)
 +                    _n_adj = 0
 +                    for _v in _nodes:
 +                        _dx0, _dy0 = float(dx[_v]), float(dy[_v])
++                        _th0, _k0 = float(theta[_v]), float(scale[_v])
 +                        dx[_v], dy[_v] = float(_sx[_idx[_v]]), float(_sy[_idx[_v]])
++                        theta[_v] = float(_st[_idx[_v]])
++                        scale[_v] = math.exp(float(_sl[_idx[_v]]))
++                        if not (0.95 < float(scale[_v]) < 1.05):
++                            theta[_v], scale[_v] = _th0, _k0
 +                        try:
 +                            _si3 = _detect_stars(fs.frame(int(_v)))
 +                            _u3 = np.array([-dx[_v], -dy[_v]])
@@ -5395,6 +5406,7 @@
 +                            _okb = False
 +                        if not _okb:
 +                            dx[_v], dy[_v] = _dx0, _dy0      # 平差后反而验不过就退回
++                            theta[_v], scale[_v] = _th0, _k0
 +                        else:
 +                            _n_adj += 1
 +                    if log:
@@ -13136,7 +13148,7 @@
 +        """关于：方法与原文出处（PWS，D.Cikey）"""
 +        messagebox.showinfo(
 +            "关于 DWT · Drizzle",
-+            "DWT · Drizzle 2.7.71-D\n\n" + LICENSE_TEXT)
++            "DWT · Drizzle 2.7.72-D\n\n" + LICENSE_TEXT)
 +
 +    def show_help(self):
 +        """打开内置使用说明（不依赖浏览器 / 外部程序）"""
