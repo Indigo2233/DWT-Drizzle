@@ -4466,6 +4466,21 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 if _nan_n:
                     Stk = np.where(_bad, np.nan, Stk).astype(Stk.dtype, copy=False)
                     log(f'[输出] 未覆盖像素置 NaN：{_nan_n} 个（{_nan_n / Stk.size:.3%}）')
+        # 「全被排异掉」的像素会留下 0：cov>0 但分子为 0，图上看就是一个个黑点，
+        # 连成 2×2/4×4 的细密网格。这些像素没有任何真值，用最近邻补上（天空量级），
+        # 否则拉伸后网格非常显眼。
+        _z = np.isfinite(Stk) & (Stk <= 0.0)
+        _zn = int(np.count_nonzero(_z))
+        if _zn:
+            try:
+                from scipy.ndimage import distance_transform_edt as _edt2
+                _ok = ~_z
+                if _ok.any():
+                    _idx = _edt2(_z, return_distances=False, return_indices=True)
+                    Stk = Stk[tuple(_idx)].astype(Stk.dtype, copy=False)
+                    log(f'[输出] 空像素补洞：{_zn} 个（{_zn / Stk.size:.3%}）用最近邻填充')
+            except Exception as _e:
+                log(f'[输出] 空像素补洞失败（{_e}），保留原值')
         # 成品有效性门禁：几乎全空的图不该写盘（否则用户拿到一张全黑图还收到"完成"）
         _fin = np.isfinite(Stk)
         _vfrac = float(np.count_nonzero(_fin)) / float(max(1, Stk.size))

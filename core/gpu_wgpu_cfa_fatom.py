@@ -231,7 +231,9 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
     s_grid = float(plan.get('s', 1.0))
     ox, oy = float(plan.get('ox', 0.0)), float(plan.get('oy', 0.0))
     h, w = int(fs.shape[0]), int(fs.shape[1])
-    P = max(1e-6, float(pixfrac) * s_grid)
+    # CFA：同色格点间隔 2 源像素，液滴边长要乘 2，否则 2× 输出会留 3/4 覆盖空洞
+    _pm = 2.0 if pattern is not None else 1.0
+    P = max(1e-6, float(pixfrac) * s_grid * _pm)
 
     n = len(dx)
     idx = [i for i in range(n) if np.isfinite(dx[i]) and np.isfinite(dy[i])

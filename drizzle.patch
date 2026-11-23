@@ -3717,7 +3717,7 @@
  
      res = {
          'n': n, 'shape': Stk.shape, 'fwhms': fwhms, 'C': C, 'S': S, 'sigma': sig_out,
-@@ -1700,27 +4446,180 @@
+@@ -1700,27 +4446,195 @@
          'R_info': rinfo, 'neff': neff, 'rej_rate': float(rej_rate),
          'A': A, 'B': B, 'rej_k': rej_k, 'stars': stars,
          'metas': metas, 'skies': skies, 'scale_out': float(scale_out),
@@ -3741,6 +3741,21 @@
 +                if _nan_n:
 +                    Stk = np.where(_bad, np.nan, Stk).astype(Stk.dtype, copy=False)
 +                    log(f'[输出] 未覆盖像素置 NaN：{_nan_n} 个（{_nan_n / Stk.size:.3%}）')
++        # 「全被排异掉」的像素会留下 0：cov>0 但分子为 0，图上看就是一个个黑点，
++        # 连成 2×2/4×4 的细密网格。这些像素没有任何真值，用最近邻补上（天空量级），
++        # 否则拉伸后网格非常显眼。
++        _z = np.isfinite(Stk) & (Stk <= 0.0)
++        _zn = int(np.count_nonzero(_z))
++        if _zn:
++            try:
++                from scipy.ndimage import distance_transform_edt as _edt2
++                _ok = ~_z
++                if _ok.any():
++                    _idx = _edt2(_z, return_distances=False, return_indices=True)
++                    Stk = Stk[tuple(_idx)].astype(Stk.dtype, copy=False)
++                    log(f'[输出] 空像素补洞：{_zn} 个（{_zn / Stk.size:.3%}）用最近邻填充')
++            except Exception as _e:
++                log(f'[输出] 空像素补洞失败（{_e}），保留原值')
 +        # 成品有效性门禁：几乎全空的图不该写盘（否则用户拿到一张全黑图还收到"完成"）
 +        _fin = np.isfinite(Stk)
 +        _vfrac = float(np.count_nonzero(_fin)) / float(max(1, Stk.size))
@@ -3902,7 +3917,7 @@
  
      log(f'[时] 总计 {time.perf_counter() - t_start:.1f}s')
      _emit('输出', 1.0, '完成')
-@@ -1750,13 +4649,23 @@
+@@ -1750,13 +4664,23 @@
                              choices=[v for _, v in prm.choices], help=text)
          else:
              ap.add_argument(flag, default=default, help=text)
@@ -3926,7 +3941,7 @@
      try:
          run(p)
      except Cancelled:
-@@ -1764,5 +4673,82 @@
+@@ -1764,5 +4688,82 @@
      return 0
  
  
@@ -6472,7 +6487,7 @@
 +            dd = 0.0 if dist is None else float(dist[i])
 +            if not np.isfinite(dd):
 +                dd = 0.0
-+            Pi = max(1e-6, float(pixfrac) * s * kk)
++            Pi = max(1e-6, float(pixfrac) * s * kk * (2.0 if ctx.get('cfa_sel') is not None else 1.0))
 +            ux, uy = -float(dx[i]), -float(dy[i])
 +            j0, j1 = _band_rows(plan, th, uy, Y0, Y1, h, w, Pi, kk, dd)
 +            if j1 <= j0:
@@ -6656,7 +6671,7 @@
 +    else:
 +        use_rot = ((theta is not None and bool(np.any(np.abs(np.nan_to_num(theta[idx])) > 1e-9)))
 +               or (scale is not None and bool(np.any(np.abs(np.nan_to_num(scale[idx]) - 1.0) > 1e-9))))
-+    P = max(1e-6, float(pixfrac) * s)
++    P = max(1e-6, float(pixfrac) * s * (2.0 if cfa_sel is not None else 1.0))
 +    mx = {} if use_rot else {i: _axis_matrix(w, W, s, dx[i], pixfrac, plan['ox']) for i in idx}
 +    Stk = np.zeros((H, W), np.float32)
 +    neff = np.zeros((H, W), np.float32)
@@ -6696,7 +6711,7 @@
 +           'beta': float(beta),
 +           'scale': scale, 'native_shape': (h, w), 'n': len(idx), 'W': W,
 +           's': float(plan['s']),
-+           'P': max(1e-6, float(pixfrac) * float(plan['s'])),
++           'P': max(1e-6, float(pixfrac) * float(plan['s']) * (2.0 if cfa_sel is not None else 1.0)),
 +           'psf_extra': _pm_list,
 +           'dist': (None if dist is None else np.asarray(dist, np.float64)),
 +           'idx': idx, 'use_rot': use_rot, 'mx': mx, 'cfa_sel': cfa_sel, 'fs_n': n_all,
@@ -11444,7 +11459,7 @@
 +            'plan': plan, 'backend': 'wgpu-scatter'}
 --- a/core/gpu_wgpu_cfa_fatom.py
 +++ b/core/gpu_wgpu_cfa_fatom.py
-@@ -0,0 +1,598 @@
+@@ -0,0 +1,600 @@
 +"""真·散射累加后端（float32 原子加）。
 +
 +与分桶后端的区别：不保存样本，直接对输出像素做原子累加，显存只占 6 个画布大小的
@@ -11678,7 +11693,9 @@
 +    s_grid = float(plan.get('s', 1.0))
 +    ox, oy = float(plan.get('ox', 0.0)), float(plan.get('oy', 0.0))
 +    h, w = int(fs.shape[0]), int(fs.shape[1])
-+    P = max(1e-6, float(pixfrac) * s_grid)
++    # CFA：同色格点间隔 2 源像素，液滴边长要乘 2，否则 2× 输出会留 3/4 覆盖空洞
++    _pm = 2.0 if pattern is not None else 1.0
++    P = max(1e-6, float(pixfrac) * s_grid * _pm)
 +
 +    n = len(dx)
 +    idx = [i for i in range(n) if np.isfinite(dx[i]) and np.isfinite(dy[i])
@@ -13425,7 +13442,7 @@
 +        """关于：方法与原文出处（PWS，D.Cikey）"""
 +        messagebox.showinfo(
 +            "关于 DWT · Drizzle",
-+            "DWT · Drizzle 2.7.83-D\n\n" + LICENSE_TEXT)
++            "DWT · Drizzle 2.7.84-D\n\n" + LICENSE_TEXT)
 +
 +    def show_help(self):
 +        """打开内置使用说明（不依赖浏览器 / 外部程序）"""

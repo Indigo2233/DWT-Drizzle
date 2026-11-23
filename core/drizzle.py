@@ -1843,7 +1843,7 @@ def _drizzle_band(ctx, Y0: int, Y1: int) -> Dict:
             dd = 0.0 if dist is None else float(dist[i])
             if not np.isfinite(dd):
                 dd = 0.0
-            Pi = max(1e-6, float(pixfrac) * s * kk)
+            Pi = max(1e-6, float(pixfrac) * s * kk * (2.0 if ctx.get('cfa_sel') is not None else 1.0))
             ux, uy = -float(dx[i]), -float(dy[i])
             j0, j1 = _band_rows(plan, th, uy, Y0, Y1, h, w, Pi, kk, dd)
             if j1 <= j0:
@@ -2027,7 +2027,7 @@ def stack_drizzle(fs, R_out: np.ndarray, C: np.ndarray, S: np.ndarray,
     else:
         use_rot = ((theta is not None and bool(np.any(np.abs(np.nan_to_num(theta[idx])) > 1e-9)))
                or (scale is not None and bool(np.any(np.abs(np.nan_to_num(scale[idx]) - 1.0) > 1e-9))))
-    P = max(1e-6, float(pixfrac) * s)
+    P = max(1e-6, float(pixfrac) * s * (2.0 if cfa_sel is not None else 1.0))
     mx = {} if use_rot else {i: _axis_matrix(w, W, s, dx[i], pixfrac, plan['ox']) for i in idx}
     Stk = np.zeros((H, W), np.float32)
     neff = np.zeros((H, W), np.float32)
@@ -2067,7 +2067,7 @@ def stack_drizzle(fs, R_out: np.ndarray, C: np.ndarray, S: np.ndarray,
            'beta': float(beta),
            'scale': scale, 'native_shape': (h, w), 'n': len(idx), 'W': W,
            's': float(plan['s']),
-           'P': max(1e-6, float(pixfrac) * float(plan['s'])),
+           'P': max(1e-6, float(pixfrac) * float(plan['s']) * (2.0 if cfa_sel is not None else 1.0)),
            'psf_extra': _pm_list,
            'dist': (None if dist is None else np.asarray(dist, np.float64)),
            'idx': idx, 'use_rot': use_rot, 'mx': mx, 'cfa_sel': cfa_sel, 'fs_n': n_all,
