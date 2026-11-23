@@ -884,7 +884,11 @@ def measure_shifts(fs, stars: Sequence[Tuple[int, int]], ref: int = 0,
 
             _px, _py = _fit(_ex), _fit(_ey)
             _rx, _ry = _ex - _px, _ey - _py
-            _thr = max(3.0, 5.0 * float(np.median(np.hypot(_rx, _ry))))
+            try:
+                _floor = float(os.environ.get('DWT_DRIFT_PX', '3.0') or 3.0)
+            except Exception:
+                _floor = 3.0
+            _thr = max(_floor, 5.0 * float(np.median(np.hypot(_rx, _ry))))
             _n_out = 0
             for _k, _i in enumerate(_gidx):
                 _dev = float(np.hypot(_rx[_k], _ry[_k]))
