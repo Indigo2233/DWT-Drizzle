@@ -1412,7 +1412,7 @@
      img.pixel_storage = 'Planar'
      img.fits_keywords = [
          {'name': 'TOTALEXP', 'value': round(sum(m['exptime'] for m in metas), 1),
-@@ -1383,6 +2144,499 @@
+@@ -1383,6 +2144,525 @@
          f'元数据：关键字 {len(img.fits_keywords)}  Property {len(prop_raws)}')
  
  
@@ -1727,6 +1727,32 @@
 +    h = min(p.shape[0] for p in planes)
 +    w = min(p.shape[1] for p in planes)
 +    a = np.stack([np.ascontiguousarray(p[:h, :w], dtype=np.float32) for p in planes], axis=-1)
++    # ---- 高光保护：任一通道接近饱和时，把该点三通道拉平（保持星点白色）----
++    # 三通道各自归一化后再叠加，亮星的「饱和半径」不同：R/B 可能先顶到 1.0，
++    # 合成后核心就成了彩色（红/蓝边）。这里把接近饱和的像素取三通道均值，
++    # 只影响少数核心像素（实测 0.002% 量级），让星点核心保持中性。
++    try:
++        _hot = np.nanmax(a, axis=2) >= 0.985
++        _n_hot = int(_hot.sum())
++        if _n_hot:
++            _m = np.nanmean(a, axis=2)
++            for _c in range(3):
++                a[..., _c] = np.where(_hot, _m, a[..., _c])
++            log('[CFA] 高光保护：%d 个像素（%.4f%%）三通道已接近饱和，取均值保持星点中性色'
++                % (_n_hot, 100.0 * _n_hot / float(_hot.size)))
++    except Exception:
++        pass
++    # ---- 零值孔洞填补：极少像素没有任何样本（drizzle 落在像素缝里）----
++    try:
++        _zero = (a == 0.0).all(axis=2) & np.isfinite(a).all(axis=2)
++        _nz = int(_zero.sum())
++        if _nz:
++            from scipy.ndimage import distance_transform_edt as _edt
++            _idx = _edt(_zero, return_distances=False, return_indices=True)
++            a = a[tuple(_idx)]
++            log('[CFA] 补洞：%d 个无样本像素（%.5f%%）用最近邻填充' % (_nz, 100.0 * _nz / float(_zero.size)))
++    except Exception as _ez:
++        log('[CFA] 补洞跳过（%s）' % _ez)
 +    img = XISFImage()
 +    img.data = a
 +    img.geometry = (w, h, 3)                 # XISF geometry = 宽:高:通道
@@ -1912,7 +1938,7 @@
  def run(p: PwsParams, on_log=None, on_progress=None, should_cancel=None) -> Dict:
      """PWS 引擎的对外唯一入口（界面与命令行都调它）
  
-@@ -1391,6 +2645,7 @@
+@@ -1391,6 +2671,7 @@
      """
      set_hooks(on_log, on_progress, should_cancel)
      try:
@@ -1920,7 +1946,7 @@
          return _run(p)
      finally:
          set_hooks()
-@@ -1406,7 +2661,7 @@
+@@ -1406,7 +2687,7 @@
      photos = (p.photos or '').strip()
      if not photos:
          raise SystemExit('请选择素材（目录或单张帧）')
@@ -1929,7 +1955,7 @@
      if not (p.out or '').strip():
          raise SystemExit('请选择输出目录（不放在素材目录里，避免成品被当成帧）')
      out_dir = Path(p.out)
-@@ -1414,34 +2669,330 @@
+@@ -1414,34 +2695,330 @@
  
      _emit('读帧', 0.0, '读头分组')
      groups = group_frames_by_filter(frames)
@@ -2272,7 +2298,7 @@
  
  def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 out_dir: Path, stem: str) -> Dict:
-@@ -1449,10 +3000,12 @@
+@@ -1449,10 +3026,12 @@
      完整流程（读帧→星表→R 场→叠加→导出），成品文件主名由 stem 给出。"""
      # 参数别名：算法体统一从 PwsParams 取值
      A, B = float(p.A), float(p.B)
@@ -2285,7 +2311,7 @@
      rej_gate = float(p.rej_gate)                  # 剔除比例上限（默认 1/3）
      limit = int(p.limit) or None
      crop, keep_frames, frames_dir = int(p.crop), bool(p.keep_frames), p.frames_dir
-@@ -1463,9 +3016,46 @@
+@@ -1463,9 +3042,46 @@
  
      # ---- 阶段 0：读帧 + 帧级归一（自动选驻留 / memmap）----
      center = resolve_center(frames, crop, parse_center(p.center))
@@ -2334,7 +2360,7 @@
      metas = fs.metas
      skies = fs.skies
      # 量纲回乘：内部一切计算都在 EXPTIME_REF 基准上（权重/排异全是比值，不受影响），
-@@ -1479,6 +3069,18 @@
+@@ -1479,6 +3095,18 @@
      # S_i = σ_中位 / σ_i（归一化后测 → 曝光差异已被吸收，可直接跨帧比）
      sig = fs.sigma
      S = np.median(sig) / np.maximum(sig, 1e-30)
@@ -2353,7 +2379,7 @@
      sig_out = sig * scale_out          # 展示与落盘量纲 = 成品量纲（内部仍用 sig 算比值）
      log(f'[S] 单帧信噪比权重（σ_中位/σ_i）{S.min():.3f}~{S.max():.3f}  中位 {np.median(S):.3f}')
      log(f'[σ] 逐帧噪声 {sig_out.min():.4e}~{sig_out.max():.4e}'
-@@ -1486,40 +3088,165 @@
+@@ -1486,40 +3114,165 @@
  
      # ---- 阶段 A：C_i（星点 FWHM，开源 fit_fwhm）----
      # 先用最干净的一帧建固定星表（星表位置对全部帧共用）
@@ -2525,7 +2551,7 @@
          f' {np.nanmin(fwhms):.2f}~{np.nanmax(fwhms):.2f}px  中位 {fmed:.2f}px  '
          f'{time.perf_counter() - t1:.1f}s')
      log(f'[C] 清晰度权重（FWHM_中位/FWHM_i）{C.min():.3f}~{C.max():.3f}')
-@@ -1556,9 +3283,22 @@
+@@ -1556,9 +3309,22 @@
                  _check_cancel()
                  lam1[i], pas[i] = fs.trail(i, stars, sigma_psf)
  
@@ -2549,7 +2575,7 @@
      idx = np.argsort(np.nan_to_num(fwhms, nan=1e9))[:k]
  
      if star_grow_pct > 0:
-@@ -1586,88 +3326,1015 @@
+@@ -1586,88 +3352,1015 @@
      else:
          log('[拖线] 星点锐帧扩展已关闭（0%）')
  
@@ -3623,7 +3649,7 @@
      log(f'[W] 单帧最大权重（条带均值）{np.mean(wmax):.3f}  '
          f'等权份额 = {1.0:.3f} → 最大独占约 {np.mean(wmax):.1f}× 份额')
      log(f'[叠加] 完成 {time.perf_counter() - t2:.1f}s  排异剔除率 {rej_rate:.3%}')
-@@ -1688,11 +4355,56 @@
+@@ -1688,11 +4381,56 @@
          log(f'[读数] {name:<18} 占 {msk.mean():6.2%}  N_eff 中位 '
              f'{np.median(neff[msk]):5.2f}  σ {sd:.4e}')
  
@@ -3683,7 +3709,7 @@
  
      res = {
          'n': n, 'shape': Stk.shape, 'fwhms': fwhms, 'C': C, 'S': S, 'sigma': sig_out,
-@@ -1700,27 +4412,146 @@
+@@ -1700,27 +4438,146 @@
          'R_info': rinfo, 'neff': neff, 'rej_rate': float(rej_rate),
          'A': A, 'B': B, 'rej_k': rej_k, 'stars': stars,
          'metas': metas, 'skies': skies, 'scale_out': float(scale_out),
@@ -3834,7 +3860,7 @@
  
      log(f'[时] 总计 {time.perf_counter() - t_start:.1f}s')
      _emit('输出', 1.0, '完成')
-@@ -1750,13 +4581,23 @@
+@@ -1750,13 +4607,23 @@
                              choices=[v for _, v in prm.choices], help=text)
          else:
              ap.add_argument(flag, default=default, help=text)
@@ -3858,7 +3884,7 @@
      try:
          run(p)
      except Cancelled:
-@@ -1764,5 +4605,82 @@
+@@ -1764,5 +4631,82 @@
      return 0
  
  
@@ -13353,7 +13379,7 @@
 +        """关于：方法与原文出处（PWS，D.Cikey）"""
 +        messagebox.showinfo(
 +            "关于 DWT · Drizzle",
-+            "DWT · Drizzle 2.7.81-D\n\n" + LICENSE_TEXT)
++            "DWT · Drizzle 2.7.82-D\n\n" + LICENSE_TEXT)
 +
 +    def show_help(self):
 +        """打开内置使用说明（不依赖浏览器 / 外部程序）"""

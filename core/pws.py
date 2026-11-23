@@ -2455,6 +2455,32 @@ def _merge_cfa_rgb(out_dir, stem: str, log) -> None:
     h = min(p.shape[0] for p in planes)
     w = min(p.shape[1] for p in planes)
     a = np.stack([np.ascontiguousarray(p[:h, :w], dtype=np.float32) for p in planes], axis=-1)
+    # ---- 高光保护：任一通道接近饱和时，把该点三通道拉平（保持星点白色）----
+    # 三通道各自归一化后再叠加，亮星的「饱和半径」不同：R/B 可能先顶到 1.0，
+    # 合成后核心就成了彩色（红/蓝边）。这里把接近饱和的像素取三通道均值，
+    # 只影响少数核心像素（实测 0.002% 量级），让星点核心保持中性。
+    try:
+        _hot = np.nanmax(a, axis=2) >= 0.985
+        _n_hot = int(_hot.sum())
+        if _n_hot:
+            _m = np.nanmean(a, axis=2)
+            for _c in range(3):
+                a[..., _c] = np.where(_hot, _m, a[..., _c])
+            log('[CFA] 高光保护：%d 个像素（%.4f%%）三通道已接近饱和，取均值保持星点中性色'
+                % (_n_hot, 100.0 * _n_hot / float(_hot.size)))
+    except Exception:
+        pass
+    # ---- 零值孔洞填补：极少像素没有任何样本（drizzle 落在像素缝里）----
+    try:
+        _zero = (a == 0.0).all(axis=2) & np.isfinite(a).all(axis=2)
+        _nz = int(_zero.sum())
+        if _nz:
+            from scipy.ndimage import distance_transform_edt as _edt
+            _idx = _edt(_zero, return_distances=False, return_indices=True)
+            a = a[tuple(_idx)]
+            log('[CFA] 补洞：%d 个无样本像素（%.5f%%）用最近邻填充' % (_nz, 100.0 * _nz / float(_zero.size)))
+    except Exception as _ez:
+        log('[CFA] 补洞跳过（%s）' % _ez)
     img = XISFImage()
     img.data = a
     img.geometry = (w, h, 3)                 # XISF geometry = 宽:高:通道
