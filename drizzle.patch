@@ -1,7 +1,5 @@
 --- a/DWT_DetailCore.py
 +++ b/DWT_DetailCore.py
---- 
-+++ 
 @@ -362,6 +362,58 @@
      return ''
  
@@ -61,10 +59,36 @@
  # ---------------------------------------------------------------------------
  # 星点检测与"星点层"选帧（固定星表，避免逐帧检测偏差）
  # ---------------------------------------------------------------------------
+@@ -1674,6 +1726,27 @@
+               'bg', 'noise', 'sharpness', 'fwhm', 'n_used', 'n_stars')
+ 
+ 
++_SIG_CACHE: Dict[str, bytes] = {}
++
++
++def _paths_sig(photo_dir: Path, paths: List[Path]) -> bytes:
++    """帧清单指纹（名字/大小/修改时间）—— 按目录缓存一次
++
++    每块、每通道、每遍都会调用 `_cache_file`，原来每次都对全部帧 `stat()`
++    一遍：60 帧 × 42 带 ≈ 2500 次系统调用（实测 20 帧就有 1.7 万次，9 s）。
++    帧清单在一次运行里不会变，缓存住即可。
++    """
++    key = f'{photo_dir}|{len(paths)}|{paths[0].name}|{paths[-1].name}'
++    hit = _SIG_CACHE.get(key)
++    if hit is not None:
++        return hit
++    h = hashlib.sha1()
++    h.update(_paths_sig(photo_dir, paths))
++    sig = h.digest()
++    _SIG_CACHE[key] = sig
++    return sig
++
++
+ def _cache_file(photo_dir: Path, paths: List[Path], block: int, crop_px,
+                 key_extra: str, cache_dir: Optional[Path]) -> Path:
+     """缓存文件名 = 目录名 + 帧清单指纹（名字/大小/修改时间）+ 参数指纹
 --- a/core/pws.py
 +++ b/core/pws.py
---- 
-+++ 
 @@ -25,13 +25,31 @@
  from __future__ import annotations
  
@@ -131,7 +155,7 @@
  
  # 各阶段的并行进程上限（实际进程数还受"核数−1"与内存预算约束，见 plan_workers）
  #   叠加：每进程持一条条带的临时量，内存随进程数倍增 → 上限保守
-@@ -99,6 +127,16 @@
+@@ -99,6 +127,18 @@
  #   测星点：每帧仅取星点小窗（约 0.5 MiB），几乎不占内存 → 上限可放宽到核数量级
  CAP_WORKERS = 8
  CAP_FWHM = 12
@@ -141,6 +165,8 @@
 +    """内部信号：该 GPU 路径按配置跳过，不是失败，不写日志。"""
 +
 +
++_FS_CACHE: dict = {}
++
 +CAP_DRIZZLE = 32
 +
 +# 逐帧行固定纹去除（row FPN）：默认开，DWT_NO_ROWFPN=1 关掉做 A/B
@@ -148,7 +174,7 @@
  
  
  # ---------------------------------------------------------------------------
-@@ -135,6 +173,24 @@
+@@ -135,6 +175,24 @@
      _GROUP[2] = f'[{label}] ' if label else ''
  
  
@@ -173,7 +199,7 @@
  def log(msg: str = '') -> None:
      """引擎唯一输出口：界面接管后写成日志行，未接管则打 stdout（回调异常也退回）。
      多滤镜分组时自动带组前缀（空行不加）——否则几十上百行日志分不清是哪组滤镜的。"""
-@@ -143,12 +199,12 @@
+@@ -143,12 +201,12 @@
          msg = f'{pre}{msg}'
      sink = _LOG_SINK[0]
      if sink is None:
@@ -188,7 +214,7 @@
  
  
  def _emit(phase: str, frac: float, text: str = '') -> None:
-@@ -197,10 +253,67 @@
+@@ -197,10 +255,67 @@
  # 阶段 0：帧加载与帧级归一
  # ---------------------------------------------------------------------------
  
@@ -257,7 +283,7 @@
      """把素材声明展开成帧文件列表（多源：目录与单张可混用，用 ; 分隔）
  
      目录按**递归**收集：深空数据常按 目标/日期/滤镜 分级存放，子文件夹里的帧也收。
-@@ -253,7 +366,60 @@
+@@ -253,7 +368,60 @@
      if not files:
          raise SystemExit('素材里没有帧')
      files.sort(key=lambda f: str(f).lower())
@@ -318,7 +344,7 @@
  
  
  def group_frames_by_filter(files: List[Path]) -> Dict[str, List[Path]]:
-@@ -284,6 +450,22 @@
+@@ -284,6 +452,22 @@
      return groups
  
  
@@ -341,7 +367,7 @@
  def _safe_seg(s: str) -> str:
      """文件名段安全化：路径非法字符换下划线"""
      return re.sub(r'[\\/:*?"<>|]+', '_', (s or '').strip()).strip()
-@@ -311,12 +493,31 @@
+@@ -311,12 +495,31 @@
      if not crop or crop <= 0 or center is not None:
          return center
      from DWT_DetailCore import locate_extended_source
@@ -378,7 +404,7 @@
  
  
  def pick_frames_dir(need_bytes: int, want: Optional[str] = None) -> Path:
-@@ -328,6 +529,10 @@
+@@ -328,6 +531,10 @@
          ① 用户 --frames-dir  ② 软件所在盘  ③ 系统 TEMP  ④ 其余固定盘按余量降序
      """
      import shutil
@@ -389,7 +415,7 @@
      need = int(need_bytes * 1.25)
      head: List[Path] = []
      if want:
-@@ -379,6 +584,7 @@
+@@ -379,6 +586,7 @@
                  continue
              log(f'[memmap] 帧文件目录 {p}（该盘余量 {free / 2 ** 30:.1f} GiB，'
                  f'需 {need / 2 ** 30:.1f} GiB）')
@@ -397,7 +423,7 @@
              return p
      raise SystemExit(f'没有任何盘能放下 {need / 2 ** 30:.1f} GiB 的 memmap 帧文件'
                       f'（需要 1.25× 余量）。请用 --frames-dir 指到大盘。')
-@@ -419,21 +625,60 @@
+@@ -419,21 +627,60 @@
          self.off = np.zeros(n, dtype=np.float64)
          self.sky0 = 0.0            # 平移后的公共天空水平（排异信号项的零点）
          self.metas: List[Dict] = []
@@ -463,7 +489,18 @@
  
      def stack_strips(self, y0: int, y1: int) -> np.ndarray:
          """条带内所有帧堆成 (n, y1-y0, W) —— 排异与加权平均的唯一输入"""
-@@ -491,10 +736,40 @@
+@@ -476,6 +723,10 @@
+             盘都放不下、退回父进程内存 list 时，它记的是进程自己的占用。
+         """
+         return self.n * self.shape[0] * self.shape[1] * 4 if self.resident else 0
++
++    #: 三通道共用同一份帧存储时置 True：通道结束时只 flush，不释放/不删文件，
++    #: 由 _run 在最后一个通道跑完后统一 close()（见 _run 末尾）。
++    _shared = False
+ 
+     def close(self, keep: bool = False) -> None:
+         if self.mm is not None:
+@@ -491,10 +742,40 @@
                  log(f'[memmap] 删除失败（可手动删）：{self.path}  {e}')
  
  
@@ -505,7 +542,7 @@
      """读帧 → 裁剪 → float32 → **曝光归一**（×EXPTIME_REF/t_i），
      同时逐帧量天空中位与噪声尺度；按内存预算自动决定驻留还是落 memmap。
  
-@@ -524,6 +799,13 @@
+@@ -524,6 +805,13 @@
          x0 = max(0, min(cx - half, fw - crop))
      else:
          y0 = x0 = 0
@@ -519,7 +556,7 @@
  
      need = n * h * w * 4
      try:
-@@ -541,7 +823,10 @@
+@@ -541,7 +829,10 @@
      mmpath = None
      arrays: Optional[List[np.ndarray]] = None
      try:
@@ -531,7 +568,7 @@
          mm = np.memmap(str(mmpath), dtype=np.float32, mode='w+', shape=(n, h, w))
      except SystemExit as e:
          log(f'[帧] 没有盘能放下 {need / 2 ** 30:.2f} GiB 的帧文件 → 退回父进程内存'
-@@ -552,7 +837,33 @@
+@@ -552,7 +843,33 @@
          f'可用 {avail / 2 ** 30:.1f} GiB → '
          f'{"父进程内存（串行）" if mm is None else "memmap 流式（并行）"}')
  
@@ -566,7 +603,7 @@
      t0 = time.perf_counter()
      # 逐帧独立（各读各的源文件、各写各的槽位）→ 可分给多进程。
      #   工作进程各自只读打开同一个帧文件，直接写自己那一格，
-@@ -562,24 +873,35 @@
+@@ -562,24 +879,35 @@
      #   + median 内部副本（np.median 对浮点数组会先复制一份）。
      ini_rw, ini_rw_args = fs.writer
      nw = 0 if (not fs.parallelable or _no_parallel()) \
@@ -605,7 +642,7 @@
          else:
              for i, f in enumerate(files):
                  _check_cancel()                     # 读帧阶段也要能终止
-@@ -588,18 +910,37 @@
+@@ -588,18 +916,37 @@
                  d = np.ascontiguousarray(data[y0:y0 + h, x0:x0 + w]).astype(np.float32)
                  del data
                  d *= np.float32(EXPTIME_REF / float(meta['exptime']))
@@ -645,7 +682,7 @@
      except BaseException:
          # 读帧半途失败（终止 / 工作进程异常 / 盘满）都要把半成品临时帧文件清掉，
          #   否则一块几十 GiB 的文件会一直占着盘；清完再把异常往上抛
-@@ -618,6 +959,20 @@
+@@ -618,6 +965,20 @@
          fs.off[:] = 0.0            # 已就地烘焙，读出时不再减
      if mmpath is not None:
          mm.flush()
@@ -666,7 +703,7 @@
      span = float(fs.skies.max() - fs.skies.min())
      log(f'[帧] 耗时 {time.perf_counter() - t0:.1f}s  '
          f'{"父进程内存 " + f"{fs.resident_bytes / 2 ** 30:.2f} GiB" if mm is None else f"盘上 {need / 2 ** 30:.2f} GiB（{mmpath.parent}）"}')
-@@ -654,7 +1009,9 @@
+@@ -654,7 +1015,9 @@
      sky = float(np.median(ref))
      nz = 1.4826 * float(np.median(np.abs(ref - sky)))
      fwhm0 = 6.0
@@ -677,7 +714,7 @@
      if tbl is None or len(tbl) == 0:
          return []
      names = tbl.colnames
-@@ -691,7 +1048,7 @@
+@@ -691,7 +1054,7 @@
  
  
  def _fwhm_each(kut, stars: List[Tuple[int, int]], fwhm_guess: float,
@@ -686,7 +723,7 @@
      """逐星量高斯 PSF FWHM 的公共实现；kut(xi,yi) 给一颗星的小窗（越界给 None）
  
      小窗来源有两处（整帧切片 / 帧后端直接取），两者的数值路径完全相同：
-@@ -699,22 +1056,27 @@
+@@ -699,22 +1062,27 @@
      """
      from photutils.psf import fit_fwhm
      out = np.full(len(stars), np.nan, dtype=np.float64)
@@ -730,7 +767,7 @@
  
  
  def measure_fwhm_each(img: np.ndarray, stars: List[Tuple[int, int]],
-@@ -739,7 +1101,7 @@
+@@ -739,7 +1107,7 @@
  
  def measure_fwhm_frame(mm: np.ndarray, i: int, off: np.ndarray,
                         stars: List[Tuple[int, int]], fwhm_guess: float = 6.0,
@@ -739,7 +776,7 @@
      """从帧后端（memmap）直接取星点小窗量 FWHM 中位 —— **不物化整帧**
  
      一帧 244 MiB，而 120 颗星的小窗合起来才 ~0.5 MiB。先 mm[i] − off 物化整帧
-@@ -756,12 +1118,78 @@
+@@ -756,12 +1124,78 @@
              return None
          return mm[i, yi - half:yi + half + 1, xi - half:xi + half + 1] - offi
  
@@ -824,7 +861,7 @@
  
  def measure_fwhm(img: np.ndarray, stars: List[Tuple[int, int]],
                   fwhm_guess: float = 6.0, half: int = 16,
-@@ -854,7 +1282,9 @@
+@@ -854,7 +1288,9 @@
  # ---------------------------------------------------------------------------
  
  def _r_envelope(sref: np.ndarray, sigma_psf: float, env_win_mult: float = 2.0,
@@ -835,7 +872,7 @@
      """R = **亮度归一包络**：E = (I−sky) / local_max(I−sky, 窗≈4σ_psf)
  
      包络规格由以下约束唯一确定 —— **R 必须在 ≲4σ_psf 内从 1 落到 0**：
-@@ -883,7 +1313,48 @@
+@@ -883,7 +1319,48 @@
      dm = np.maximum(d - sky, 0.0)
      half = int(max(1, round(float(env_win_mult) * max(float(sigma_psf), 0.5))))
      win = 2 * half + 1
@@ -885,7 +922,7 @@
      E = dm / (loc + float(env_eps) * max(sig, 1e-30))
      E = np.clip(E, 0.0, 1.0)
      if env_p and abs(float(env_p) - 1.0) > 1e-9:
-@@ -905,8 +1376,8 @@
+@@ -905,8 +1382,8 @@
      h = int(round(float(radius_px)))
      if h <= 0:
          return R
@@ -896,7 +933,7 @@
      return np.clip(d, 0.0, 1.0).astype(np.float32)
  
  
-@@ -954,10 +1425,84 @@
+@@ -954,10 +1431,84 @@
      return np.clip(out, 0.0, 1.0)
  
  
@@ -982,7 +1019,7 @@
                    ) -> Tuple[np.ndarray, Dict]:
      """分区权重 R ∈ [0,1]：此处是"细节型"还是"朦胧型"
  
-@@ -974,17 +1519,28 @@
+@@ -974,17 +1525,28 @@
        σ_psf 与 win 均由测得的 FWHM 得到 → 换目标不改数值也不改含义。
        T 现在只用于报表诊断（info 里的 T_p50…），不参与 R 的计算。
      """
@@ -1014,7 +1051,7 @@
  
      # 星点锐帧区外扩：半径随星点亮度自适应（亮星推到更暗处，暗星不动）
      grow_px = float(star_grow) * max(float(sigma_psf), 0.5)
-@@ -1005,9 +1561,13 @@
+@@ -1005,9 +1567,13 @@
      if r_floor and r_floor > 0:
          f = min(float(r_floor), 0.95)
          R = f + (1.0 - f) * R
@@ -1028,7 +1065,7 @@
          'star_grow': float(star_grow), 'grow_px': float(grow_px),
          'grow_px_mean': float(grow_mean),
          'T_p50': float(np.median(T)), 'T_p90': float(np.percentile(T, 90)),
-@@ -1023,7 +1583,8 @@
+@@ -1023,7 +1589,8 @@
  # ---------------------------------------------------------------------------
  
  def strip_weights(C: np.ndarray, S: np.ndarray, R: np.ndarray,
@@ -1038,7 +1075,7 @@
      """W[i,r] = C_i^(A·R_r) · S_i^(B·(1−R_r))，并逐像素归一使 mean_i(W) = 1
  
      融合式的形状选择依据（式 6、式 7）：
-@@ -1038,10 +1599,16 @@
+@@ -1038,10 +1605,16 @@
      """
      n = len(C)
      a = (A * R)[None, ...]
@@ -1057,11 +1094,36 @@
      W /= np.maximum(W.mean(axis=0), 1e-30)[None]
      return W.astype(np.float32)
  
-@@ -1177,14 +1744,25 @@
+@@ -1177,14 +1750,50 @@
      _MEM['off'] = off
  
  
 -def _task_fwhm(job) -> Tuple[int, float]:
++def _task_fwhm_cfa(job) -> Tuple[int, float, int, int]:
++    """真 CFA：子进程里拼 G 平面再量 FWHM —— 与串行的 fs.frame() 逐元素等价。
++
++    串行版这段是 60 帧 × (整帧拆色 + 69 次二维高斯拟合)，实测 ~45 s；
++    分到多进程后拟合按核数摊薄。**背景梯度必须一起带过来**：只减常数偏置会
++    让星点附近的天空略微倾斜，C 会偏 2%（试过，FWHM 差 0.46 px），所以这里
++    照 fs.frame() 的做法减掉 bggrad 的平面模型。
++    """
++    i, stars, pat, bgcoef, bgdeg, bgshape, bgrcoef = job
++    n0, c0 = _FIT_STAT['n'], _FIT_STAT['conv']
++    img = np.asarray(_MEM['mm'][i], np.float32) - np.float32(_MEM['off'][i])
++    if bgcoef is not None and bgdeg > 0:
++        try:
++            from . import bggrad as _bgg
++        except ImportError:                     # 子进程里没有包上下文
++            import bggrad as _bgg
++        m = _bgg.model_strip(bgcoef, bgdeg, 0, bgshape[0], bgshape[1],
++                             bgshape[0], rcoef=bgrcoef)
++        if m is not None:
++            img -= np.asarray(m, np.float32)
++    g = _cfa.plane(img, pat, 'G')
++    v = measure_fwhm(g, stars)
++    return int(i), v, 0.0, _FIT_STAT['n'] - n0, _FIT_STAT['conv'] - c0
++
++
 +def _task_fwhm(job) -> Tuple[int, float, int, int]:
      """一帧的星点 FWHM 中位（帧号一并返回，父进程按下标落位）
  
@@ -1085,19 +1147,19 @@
  
  
  def _task_trail(job) -> Tuple[int, float, float]:
-@@ -1196,8 +1774,9 @@
+@@ -1196,8 +1805,9 @@
  
  def _task_strip(job):
      """一条带的权重 + 排异 + 加权平均（与串行的三段调用完全同序同式）"""
 -    y0, y1, Rr, C, S, A, B, rej_k, sky0, rej_gate = job
 -    W = strip_weights(C, S, Rr, A, B)
 +    y0, y1, Rr, C, S, A, B, rej_k, sky0, rej_gate, T, fp = job
-+    _beta = float(getattr(p, 'detail_snr', 0.0) or 0.0)
++    _beta = _detail_beta(p)          # 黑白流程恒为 0
 +    W = strip_weights(C, S, Rr, A, B, T=T, fp=fp, beta=_beta)
      mm, off = _MEM['mm'], _MEM['off']
      D = np.stack([mm[i, y0:y1] - np.float32(off[i]) for i in range(len(C))])
      s, ne, rr = stack_strip(D, W, Rr, sky0, rej_k=rej_k, rej_max_frac=rej_gate)
-@@ -1214,22 +1793,77 @@
+@@ -1214,22 +1824,77 @@
      _MEM['mmw'] = np.memmap(path, dtype=np.float32, mode='r+', shape=(n, h, w))
  
  
@@ -1179,7 +1241,7 @@
  
  
  # ---------------------------------------------------------------------------
-@@ -1357,7 +1991,15 @@
+@@ -1357,7 +2022,15 @@
      img.geometry = (a.shape[1], a.shape[0], 1)      # XISF geometry = 宽:高:通道
      img.sample_format = 'Float32'
      img.color_space = 'Gray'
@@ -1196,7 +1258,7 @@
      img.pixel_storage = 'Planar'
      img.fits_keywords = [
          {'name': 'TOTALEXP', 'value': round(sum(m['exptime'] for m in metas), 1),
-@@ -1383,6 +2025,326 @@
+@@ -1383,6 +2056,428 @@
          f'元数据：关键字 {len(img.fits_keywords)}  Property {len(prop_raws)}')
  
  
@@ -1518,12 +1580,114 @@
 +    with contextlib.redirect_stdout(io.StringIO()):
 +        write_xisf(str(out), img, compression=None)
 +    log(f'[CFA] 合成彩色 {out.name}  {w}×{h}×3（三个单通道文件也保留）')
++    # ---- 自动预览：和「重新合成 RGB」用同一套定标（中位 ± MAD、asinh）----
++    if str(os.environ.get('DWT_RGB_PREVIEW', '1')).strip().lower() not in (
++            '0', 'off', 'false', 'no'):
++        try:
++            from maps_page import _to_png
++            _lo = np.zeros(3, np.float32)
++            _hi = np.zeros(3, np.float32)
++            for _c in range(3):
++                _v = a[..., _c]
++                _m = float(np.nanmedian(_v))
++                _d = float(np.nanmedian(np.abs(_v - _m))) * 1.4826
++                _lo[_c] = max(0.0, _m - 2.8 * _d)
++                _hi[_c] = _m + 60.0 * _d
++            _x = np.clip((a - _lo) / np.maximum(_hi - _lo, 1e-12), 0.0, 1.0)
++            _x = np.arcsinh(_x * 18.0) / np.arcsinh(18.0)
++            _u8 = np.nan_to_num(_x * 255.0).astype(np.uint8)
++            _sg = max(1, int(np.ceil(max(h, w) / 1200.0)))
++            _u8 = _u8[::_sg, ::_sg]
++            _pv = src / f'{stem}_RGB_preview.png'
++            _pv.write_bytes(_to_png(_u8))
++            log('[CFA] 预览图 %s  %d×%d（抽样 %d）'
++                % (_pv.name, _u8.shape[1], _u8.shape[0], _sg))
++        except Exception as _ep:
++            log('[CFA] 预览图生成失败（不影响成品）：%s' % _ep)
++
++
++def _clean_stale_frames(max_age_h: float = 2.0) -> int:
++    """删掉 core/_DWT_frames 里超过 max_age_h 小时的旧文件（崩溃残留）。
++
++    正常结束时 FrameSet.close() 会自己清理；但中途被杀掉或断电就会留下
++    几十 GB 的 .dat，跑几次就把盘塞满，所以启动时兜一次底。
++    """
++    import time
++    try:
++        base = Path(__file__).resolve().parent / "_DWT_frames"
++        if not base.is_dir():
++            return 0
++        cutoff = time.time() - max_age_h * 3600.0
++        n = 0
++        for f in base.iterdir():
++            try:
++                if f.is_file() and f.stat().st_mtime < cutoff:
++                    f.unlink()
++                    n += 1
++            except Exception:
++                continue
++        try:
++            if not any(base.iterdir()):
++                base.rmdir()
++        except Exception:
++            pass
++        return n
++    except Exception:
++        return 0
++
++
++def _detail_beta(p) -> float:
++    """满月帧补偿（--detail-snr）只在真 CFA 时生效，黑白流程必须为零。"""
++    if not _CFA.get("pattern"):
++        return 0.0
++    return float(getattr(p, "detail_snr", 0.0) or 0.0)
++
++
++def _clear_cfa_env() -> None:
++    """离开彩机流程时清掉可能残留的环境变量（GUI 连跑多组时尤其重要）。"""
++    for _k in ("DWT_DETAIL_SNR", "DWT_CFA_CHANNELS", "DWT_CFA_K", "DWT_CFA_RAW"):
++        os.environ.pop(_k, None)
++
++
++def _check_disk_space(frames, out_dir, scale: float, log,
++                      n_ch: int = 1, px: float = 0.0,
++                      n_frames: int = 0, rgb: bool = False) -> None:
++    """跑之前先看盘，按「实际启用通道数」估。
++
++    组成：memmap 帧（n×单帧）+ 每个输出平面一张 float32 画布
++    （单通道文件 × n_ch + 彩机 RGB 合成 3 张 + 约 20% 辅助数组）。
++    """
++    try:
++        import shutil
++        f0 = frames[0]
++        if isinstance(f0, (tuple, list)):
++            f0 = f0[0]
++        one = float(Path(str(f0)).stat().st_size)
++        n = int(n_frames) if n_frames else len(frames)
++        if px <= 0:
++            px = max(1.0, one / 4.0)          # 估不到就按 float32 反推
++        s2 = max(1.0, float(scale)) ** 2
++        plane = px * s2 * 4.0                 # 一张输出平面（float32）
++        n_planes = max(1, int(n_ch)) + (3 if rgb else 0)
++        need = n * one + n_planes * plane * 1.2
++        free = float(shutil.disk_usage(str(out_dir)).free)
++        if free < need:
++            raise SystemExit(
++                "磁盘空间不足：%s 还剩 %.1f GB，这次大约需要 %.1f GB（%d 帧、%d 个平面）。"
++                % (out_dir, free / 2 ** 30, need / 2 ** 30, n, n_planes)
++                + chr(10) + "请清理后再跑，或把输出目录换到空间更大的盘。")
++        log("[磁盘] %s 可用 %.1f GB，预计需要 %.1f GB（%d 帧、%d 个平面）"
++            % (out_dir, free / 2 ** 30, need / 2 ** 30, n, n_planes))
++    except SystemExit:
++        raise
++    except Exception as _e:
++        log("[磁盘] 空间检查跳过（%s: %s）" % (type(_e).__name__, _e))
 +
 +
  def run(p: PwsParams, on_log=None, on_progress=None, should_cancel=None) -> Dict:
      """PWS 引擎的对外唯一入口（界面与命令行都调它）
  
-@@ -1406,7 +2368,7 @@
+@@ -1406,7 +2501,7 @@
      photos = (p.photos or '').strip()
      if not photos:
          raise SystemExit('请选择素材（目录或单张帧）')
@@ -1532,7 +1696,7 @@
      if not (p.out or '').strip():
          raise SystemExit('请选择输出目录（不放在素材目录里，避免成品被当成帧）')
      out_dir = Path(p.out)
-@@ -1414,34 +2376,275 @@
+@@ -1414,34 +2509,307 @@
  
      _emit('读帧', 0.0, '读头分组')
      groups = group_frames_by_filter(frames)
@@ -1607,7 +1771,29 @@
 +        # 因此 auto = 共用；真要逐通道，手动填 --cfa-weights own。
 +        log('[CFA] 权重 auto：真 CFA 下逐通道 FWHM 估计被噪声主导（实测排序相关≈0.3），'
 +            '逐通道权重只会放大噪声且多花两遍测量 → 使用共用权重；要强制逐通道请填 own')
++    _stale = _clean_stale_frames()
++    if _stale:
++        log('[清理] 删掉 %d 个过期的临时帧缓存（>2 小时）' % _stale)
++    # ---- 磁盘预检：cfa_pat 已定，知道要出几个平面了 ----
++    try:
++        _p0 = next(iter(groups.values()))[0]
++        _img0, _meta0 = read_frame(_p0)
++        _shp0 = tuple(getattr(_img0, 'shape', ()))[:2]
++        _px0 = float(_shp0[0] * _shp0[1]) if len(_shp0) == 2 else 0.0
++        del _img0
++    except Exception:
++        _px0 = 0.0
++    _n_ch = 3 if cfa_pat else max(1, len(groups))
++    _lim = int(getattr(p, 'limit', 0) or 0)
++    _n_fr = sum((min(len(v), _lim) if _lim > 0 else len(v))
++                for v in groups.values())
++    _check_disk_space(frames, out_dir,
++                      float(getattr(p, 'drizzle_scale', 1.0) or 1.0), log,
++                      n_ch=_n_ch, px=_px0, n_frames=_n_fr,
++                      rgb=bool(cfa_pat))
 +    _CFA['share'] = None
++    if not cfa_pat:
++        _clear_cfa_env()
 +    _CFA['want_share'] = bool(cfa_pat and _gshare)
 +    _CFA['want_wshare'] = bool(cfa_pat and _wshare)
 +    _CFA['want_wshare'] = bool(cfa_pat and _wshare)
@@ -1712,14 +1898,24 @@
 +                except Exception as _e:
 +                    _merge_cfa_rgb._ref_dir = None
 +                    log(f'[参考] 扫描彩机参考目录失败（跳过）：{_e}')
++                # 无论画布模式如何都尝试合成：逐通道模式下三张画布可能差一两个像素，
++                # 合并函数会按最小画布裁齐并给出提示（实测差 1~2 px，裁掉即可，
++                # 不合成反而让用户以为功能没生效）。
 +                if _grid_own:
-+                    log('[CFA] 逐通道画布：三通道各自定画布，本次不做 RGB 合成'
-+                        '（需要合色请在 PI 里对齐后合成，或改回「共用画布」）')
-+                else:
-+                    _merge_cfa_rgb(out_dir, stem, log)
++                    log('[CFA] 逐通道画布：按最小画布裁齐后合成 RGB'
++                        '（像素级对齐仍以各通道自己的配准为准）')
++                _merge_cfa_rgb(out_dir, stem, log)
 +            except Exception as e:
 +                log(f'[CFA] RGB 合成失败（不影响三个单通道成品）：{e}')
 +        _CFA['ch'], _CFA['pattern'] = None, None
++        # 三通道共用缓存到这里才真正释放（含删 memmap 临时文件）
++        for _f in list(_FS_CACHE.values()):
++            try:
++                _f._shared = False
++                _f.close(keep=keep_frames)
++            except Exception:
++                pass
++        _FS_CACHE.clear()
      _set_group(0, 1, '')
 +    _fit_line = fit_warn_line()
 +    if _fit_line:
@@ -1820,7 +2016,7 @@
  
  def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 out_dir: Path, stem: str) -> Dict:
-@@ -1449,10 +2652,12 @@
+@@ -1449,10 +2817,12 @@
      完整流程（读帧→星表→R 场→叠加→导出），成品文件主名由 stem 给出。"""
      # 参数别名：算法体统一从 PwsParams 取值
      A, B = float(p.A), float(p.B)
@@ -1833,14 +2029,36 @@
      rej_gate = float(p.rej_gate)                  # 剔除比例上限（默认 1/3）
      limit = int(p.limit) or None
      crop, keep_frames, frames_dir = int(p.crop), bool(p.keep_frames), p.frames_dir
-@@ -1464,8 +2669,25 @@
+@@ -1463,9 +2833,46 @@
+ 
      # ---- 阶段 0：读帧 + 帧级归一（自动选驻留 / memmap）----
      center = resolve_center(frames, crop, parse_center(p.center))
-     fs = prepare_frames(frames, ';'.join(str(s) for s in sources), crop, center,
+-    fs = prepare_frames(frames, ';'.join(str(s) for s in sources), crop, center,
 -                        limit, frames_dir, keep_frames=keep_frames)
-+                        limit, frames_dir, keep_frames=keep_frames,
-+                        bgdeg=int(getattr(p, 'bgdeg', 1) or 0),
-+                        bg_r=int(getattr(p, 'bg_r', 0) or 0))
++    # 三通道共用几何时，读帧 / 减背景 / 量天空这十几秒只需做一次。
++    # 同一个 run 内按（帧列表、裁剪、中心、上限、背景模型）缓存；帧数据只读
++    # （拆色在 _PlaneFS 里按需做），复用不会污染任何通道。
++    _ck = (tuple(str(f) for f in frames), int(crop), tuple(center or ()),
++           int(limit or 0), int(getattr(p, 'bgdeg', 1) or 0),
++           int(getattr(p, 'bg_r', 0) or 0), bool(keep_frames))
++    _hit = _FS_CACHE.get(_ck)
++    if _hit is not None and _hit.arrays is not None or (
++            _hit is not None and _hit.mm is not None):
++        fs = _hit
++        fs._shared = True
++        log('[读帧] 复用本组已读入的 %d 帧（三通道共用同一批帧，免重复读盘）' % fs.n)
++        try:
++            _emit('读帧', 1.0, '%d/%d 帧（复用）' % (fs.n, fs.n))
++        except Exception:
++            pass
++    else:
++        fs = prepare_frames(frames, ';'.join(str(s) for s in sources), crop, center,
++                            limit, frames_dir, keep_frames=keep_frames,
++                            bgdeg=int(getattr(p, 'bgdeg', 1) or 0),
++                            bg_r=int(getattr(p, 'bg_r', 0) or 0))
++        if _CFA.get('pattern'):
++            fs._shared = True
++        _FS_CACHE[_ck] = fs
      n = len(fs)
 +    # ---- 彩机对齐方式 auto：在 G 通道这遍（第一个通道）量一次色差 ----
 +    if (_CFA.get('pattern') and _CFA.get('ch') == 'G'
@@ -1860,7 +2078,7 @@
      metas = fs.metas
      skies = fs.skies
      # 量纲回乘：内部一切计算都在 EXPTIME_REF 基准上（权重/排异全是比值，不受影响），
-@@ -1479,6 +2701,18 @@
+@@ -1479,6 +2886,18 @@
      # S_i = σ_中位 / σ_i（归一化后测 → 曝光差异已被吸收，可直接跨帧比）
      sig = fs.sigma
      S = np.median(sig) / np.maximum(sig, 1e-30)
@@ -1879,7 +2097,7 @@
      sig_out = sig * scale_out          # 展示与落盘量纲 = 成品量纲（内部仍用 sig 算比值）
      log(f'[S] 单帧信噪比权重（σ_中位/σ_i）{S.min():.3f}~{S.max():.3f}  中位 {np.median(S):.3f}')
      log(f'[σ] 逐帧噪声 {sig_out.min():.4e}~{sig_out.max():.4e}'
-@@ -1486,40 +2720,115 @@
+@@ -1486,40 +2905,153 @@
  
      # ---- 阶段 A：C_i（星点 FWHM，开源 fit_fwhm）----
      # 先用最干净的一帧建固定星表（星表位置对全部帧共用）
@@ -1957,9 +2175,45 @@
          else min(plan_workers(32 * 2 ** 20, '测星点', cap=CAP_FWHM), n)
 -    if nw > 1:
 +    if _CFA.get('raw') and _CFA.get('pattern'):
-+        # 真 CFA：帧存储是马赛克，必须在 G 平面上量（否则拟合全废、C 恒 1）
-+        log('[C] 真 CFA：在 G 平面上逐帧量 FWHM（串行）')
-+        for i in range(n):
++        # 真 CFA：帧存储是马赛克，必须在 G 平面上量（否则拟合全废、C 恒 1）。
++        # 而且这个量与最终跑哪个通道无关（永远在 G 平面上量），所以三通道共用几何时
++        # R/B 直接复用 G 的结果——省掉每通道一次 60 帧 × 全幅拆色 + 120 次高斯拟合。
++        _fw_cache = _CFA.get('fwhm_cache')
++        if _fw_cache is not None and len(_fw_cache) == n:
++            log('[C] 复用 G 通道逐帧 FWHM（同一批帧、同在 G 平面上量，与重算等价）')
++            fwhms = np.array(_fw_cache, np.float64, copy=True)
++            for i in range(n):
++                _emit('测星点', (i + 1) / max(n, 1), f'{i + 1}/{n} 帧')
++            _reuse_fw = True
++        else:
++            _reuse_fw = False
++        if not _reuse_fw and fs.parallelable and not _no_parallel():
++            _nw_c = min(plan_workers(900 * 2 ** 20, '测星点', cap=CAP_FWHM), n)
++        else:
++            _nw_c = 1
++        if _nw_c > 1 and not _reuse_fw:
++            log('[C] 真 CFA：在 G 平面上逐帧量 FWHM（%d 进程并行）' % _nw_c)
++            _ini, _iargs = fs.reader
++            _bgc = getattr(fs, 'bgcoef', None)
++            _bgd = int(getattr(fs, 'bgdeg', 0) or 0)
++            _bgs = tuple(getattr(fs, 'bgshape', fs.shape))
++            _bgrc = getattr(fs, 'bgrcoef', None)
++            ex = ProcessPoolExecutor(max_workers=_nw_c,
++                                     initializer=_ini, initargs=_iargs)
++            try:
++                _jobs = ((i, _cs, _CFA['pattern'],
++                          None if _bgc is None else _bgc[i], _bgd, _bgs,
++                          None if _bgrc is None else _bgrc[i]) for i in range(n))
++                for _i, _v, _fx, _dn, _dc in ex.map(_task_fwhm_cfa, _jobs, chunksize=1):
++                    _check_cancel()
++                    fwhms[_i] = _v
++                    _FIT_STAT['n'] += _dn
++                    _FIT_STAT['conv'] += _dc
++                    _emit('测星点', (_i + 1) / max(n, 1), f'{_i + 1}/{n} 帧')
++            finally:
++                ex.shutdown(wait=True, cancel_futures=True)
++        log('[C] 真 CFA：在 G 平面上逐帧量 FWHM（串行）') if (not _reuse_fw and _nw_c <= 1) else None
++        for i in ([] if (_reuse_fw or _nw_c > 1) else range(n)):
 +            _check_cancel()
 +            try:
 +                _g = _cfa.plane(np.asarray(fs.frame(i), np.float32),
@@ -1970,6 +2224,8 @@
 +                if i == 0:
 +                    log(f'[C] G 平面量 FWHM 失败（{type(_ec).__name__}: {_ec}），C 退回 1.0')
 +            _emit('测星点', (i + 1) / max(n, 1), f'{i + 1}/{n} 帧')
++        if not _reuse_fw:
++            _CFA['fwhm_cache'] = np.array(fwhms, np.float64, copy=True)
 +    elif nw > 1:
          ex = ProcessPoolExecutor(max_workers=nw, initializer=ini, initargs=ini_args)
          try:
@@ -2001,7 +2257,7 @@
          f' {np.nanmin(fwhms):.2f}~{np.nanmax(fwhms):.2f}px  中位 {fmed:.2f}px  '
          f'{time.perf_counter() - t1:.1f}s')
      log(f'[C] 清晰度权重（FWHM_中位/FWHM_i）{C.min():.3f}~{C.max():.3f}')
-@@ -1556,9 +2865,22 @@
+@@ -1556,9 +3088,22 @@
                  _check_cancel()
                  lam1[i], pas[i] = fs.trail(i, stars, sigma_psf)
  
@@ -2025,7 +2281,7 @@
      idx = np.argsort(np.nan_to_num(fwhms, nan=1e9))[:k]
  
      if star_grow_pct > 0:
-@@ -1586,88 +2908,914 @@
+@@ -1586,88 +3131,942 @@
      else:
          log('[拖线] 星点锐帧扩展已关闭（0%）')
  
@@ -2126,6 +2382,30 @@
 +                    f'θ {np.min(_gt):+.2f}°~{np.max(_gt):+.2f}°  '
 +                    f'k {np.min(_gk):.4f}~{np.max(_gk):.4f}')
 +        sh = measure_shifts(_reg, stars, ref=int(seed), log=log, guess=_gg)
++        # 参考帧回退：自动挑的参考帧若是异类（星少/最糊/取景偏），会把整组都判成配准失败。
++        # 这里只在首轮参与率 < 50% 时，换星点最多的几个候选各试一次，取参与最多的那一次。
++        _ref_fallback = None
++        try:
++            _n_all = int(len(sh['dx']))
++            _kr = float(sh.get('n_keep', 0)) / max(1, _n_all)
++            if _kr < 0.5 and len(stars) > 2:
++                _cnt = np.array([len(_s) for _s in stars], np.float64)
++                _order = [int(i) for i in np.argsort(-_cnt) if int(i) != int(seed)]
++                _best, _best_sh = int(sh.get('n_keep', 0)), sh
++                for _cand in _order[:3]:
++                    try:
++                        _sh2 = measure_shifts(_reg, stars, ref=_cand, log=None, guess=_gg)
++                    except Exception:
++                        continue
++                    if int(_sh2.get('n_keep', 0)) > _best:
++                        _best, _best_sh = int(_sh2.get('n_keep', 0)), _sh2
++                        _ref_fallback = _cand
++                if _ref_fallback is not None:
++                    log(f'[配准] 参考帧 #{int(seed)} 只对上 {int(sh["n_keep"])}/{_n_all} 帧，'
++                        f'改参考帧 #{_ref_fallback}（对上 {_best} 帧）')
++                    sh = _best_sh
++        except Exception as _e:
++            log(f'[配准] 参考帧回退失败（不影响本次）：{_e}')
 +        _drop = [int(i) for i in np.nonzero(~np.asarray(sh['keep'], bool))[0]]
 +        if _drop:
 +            log(f'  [叠加] 未参与的帧索引：{_drop[:40]}'
@@ -2174,8 +2454,11 @@
 +                                       'fwhm': (None if not np.isfinite(fwhms[_i])
 +                                                else round(float(fwhms[_i]), 3))})
 +        if _excluded_rows:
-+            _payload = {'n_used': int(np.count_nonzero(np.isfinite(dx) & np.isfinite(dy))),
-+                        'n_total': int(n), 'items': _excluded_rows}
++            try:
++                _nu = int(np.count_nonzero(np.asarray(sh.get('keep', np.isfinite(dx)), bool)))
++            except Exception:
++                _nu = int(np.count_nonzero(np.isfinite(dx) & np.isfinite(dy)))
++            _payload = {'n_used': _nu, 'n_total': int(n), 'items': _excluded_rows}
 +            try:
 +                log('[EXCLUDED] ' + json.dumps(_payload, ensure_ascii=False))
 +            except Exception:
@@ -2794,8 +3077,7 @@
 +                            raise RuntimeError('bucket disabled by env')
 +                        _canv = os.environ.get('DWT_CANVAS', '1').strip()
 +                        # 细节区噪声权重 beta（--detail-snr）：GPU 内核从环境读
-+                        os.environ['DWT_DETAIL_SNR'] = str(
-+                            float(getattr(p, 'detail_snr', 0.0) or 0.0))
++                        os.environ['DWT_DETAIL_SNR'] = str(_detail_beta(p))
 +                        if _canv != '0':
 +                            try:
 +                                from gpu_wgpu_cfa_fatom import (
@@ -2893,7 +3175,8 @@
 +                if _wmap is not None:
 +                    r_d = _do_stack()
 +        finally:
-+            fs.close(keep=keep_frames)
++            if not getattr(fs, '_shared', False):
++                fs.close(keep=keep_frames)
 +        Stk = r_d['stack']
 +        neff = r_d['neff']
 +        cov_map = r_d.get('ncov')
@@ -2942,7 +3225,7 @@
                      _check_cancel()
 -                    y0 = k * strip
                      y1 = min(h, y0 + strip)
-+                    _beta = float(getattr(p, 'detail_snr', 0.0) or 0.0)
++                    _beta = _detail_beta(p)
 +                    W = strip_weights(C, S, R[y0:y1], A, B, T=T, fp=fp, beta=_beta)
 +                    D = fs.stack_strips(y0, y1)
 +                    s, ne, rr = stack_strip(D, W, R[y0:y1], fs.sky0, rej_k=rej_k,
@@ -2979,8 +3262,9 @@
 -        # 正常跑完与中途终止都要清理临时帧文件
 -        fs.close(keep=keep_frames)
 +        finally:
-+            # 正常跑完与中途终止都要清理临时帧文件
-+            fs.close(keep=keep_frames)
++            # 正常跑完与中途终止都要清理临时帧文件（三通道共享时由 _run 收尾统一关）
++            if not getattr(fs, '_shared', False):
++                fs.close(keep=keep_frames)
      # 条带全部落位后一次回乘（串行/并行在此汇合，只乘一次；元素级乘法与切分无关）
      Stk *= np.float32(scale_out)
      log(f'[量纲] 成品回乘 ×{scale_out:g}（曝光中位 {t_med:g}s / 归一基准 {EXPTIME_REF:g}s），'
@@ -2998,7 +3282,7 @@
      log(f'[W] 单帧最大权重（条带均值）{np.mean(wmax):.3f}  '
          f'等权份额 = {1.0:.3f} → 最大独占约 {np.mean(wmax):.1f}× 份额')
      log(f'[叠加] 完成 {time.perf_counter() - t2:.1f}s  排异剔除率 {rej_rate:.3%}')
-@@ -1688,11 +3836,54 @@
+@@ -1688,11 +4087,54 @@
          log(f'[读数] {name:<18} 占 {msk.mean():6.2%}  N_eff 中位 '
              f'{np.median(neff[msk]):5.2f}  σ {sd:.4e}')
  
@@ -3056,7 +3340,7 @@
  
      res = {
          'n': n, 'shape': Stk.shape, 'fwhms': fwhms, 'C': C, 'S': S, 'sigma': sig_out,
-@@ -1700,27 +3891,127 @@
+@@ -1700,27 +4142,133 @@
          'R_info': rinfo, 'neff': neff, 'rej_rate': float(rej_rate),
          'A': A, 'B': B, 'rej_k': rej_k, 'stars': stars,
          'metas': metas, 'skies': skies, 'scale_out': float(scale_out),
@@ -3090,15 +3374,25 @@
                                 'NeffMedian': float(np.median(neff)),
                                 'SigmaFrameMedian': float(np.median(sig_out)),
                                 'SigmaSky': sky_sd})
-         np.save(out_dir / f'{stem}_neff.npy', neff)
-+        if cov_map is not None:
-+            np.save(out_dir / f'{stem}_ncov.npy', np.asarray(cov_map, np.float32))
-         np.save(out_dir / f'{stem}_R.npy', R)
+-        np.save(out_dir / f'{stem}_neff.npy', neff)
+-        np.save(out_dir / f'{stem}_R.npy', R)
++        # 辅助数组（R 场 / N_eff / 覆盖）每个都是整幅 417 MB，三通道写 1.25 GB。
++        # 评价页与权重场页需要时才落盘（DWT_SAVE_AUX=1），默认只写成品与权重表，
++        # 省掉每通道 ~0.6 s 的写盘与 800 MB 磁盘占用。
++        _save_aux = str(os.environ.get('DWT_SAVE_AUX', '0')).strip() == '1'
++        if _save_aux:
++            np.save(out_dir / f'{stem}_neff.npy', neff)
++            if cov_map is not None:
++                np.save(out_dir / f'{stem}_ncov.npy', np.asarray(cov_map, np.float32))
++            np.save(out_dir / f'{stem}_R.npy', R)
          np.savetxt(out_dir / f'{stem}_weights.txt',
                     np.column_stack([np.arange(n), fwhms, C, sig_out, S]),
                     header='idx fwhm_px C_sharp sigma S_snr', comments='# ', fmt='%.6g')
-         log(f'[输出] 逐帧权重表 {stem}_weights.txt / R 场 {stem}_R.npy / '
-             f'N_eff {stem}_neff.npy')
+-        log(f'[输出] 逐帧权重表 {stem}_weights.txt / R 场 {stem}_R.npy / '
+-            f'N_eff {stem}_neff.npy')
++        log(f'[输出] 逐帧权重表 {stem}_weights.txt'
++            + (f' / R 场 {stem}_R.npy / N_eff {stem}_neff.npy' if _save_aux else
++               '（R 场与 N_eff 未落盘，需要时设 DWT_SAVE_AUX=1）'))
 +
 +        # ---- 原生尺寸副本：按 N×N 块平均缩回（不额外叠一遍）----
 +        try:
@@ -3184,7 +3478,7 @@
  
      log(f'[时] 总计 {time.perf_counter() - t_start:.1f}s')
      _emit('输出', 1.0, '完成')
-@@ -1750,13 +4041,23 @@
+@@ -1750,13 +4298,23 @@
                              choices=[v for _, v in prm.choices], help=text)
          else:
              ap.add_argument(flag, default=default, help=text)
@@ -3208,7 +3502,7 @@
      try:
          run(p)
      except Cancelled:
-@@ -1764,6 +4065,83 @@
+@@ -1764,5 +4322,82 @@
      return 0
  
  
@@ -3291,11 +3585,8 @@
 +
  if __name__ == '__main__':
      main()
- 
 --- a/core/pws_params.py
 +++ b/core/pws_params.py
---- 
-+++ 
 @@ -46,7 +46,13 @@
      # ---- 标准 ----
      A: float = 20.0
@@ -3383,11 +3674,12 @@
            '用「添加目录 / 添加单张」加入多个来源（一行一个，行尾「×」移除，「清空」一键移除）；'
            '重复声明的文件只算一帧。同一目标不同夜晚的帧可以混叠。'
            '混合滤镜的素材会按文件头（FILTER）自动分组，各滤镜独立叠加、各自出一张成品。'),
-@@ -85,9 +141,23 @@
+@@ -85,9 +141,24 @@
            '细节区愿意用多少信噪比换解析力',
            '唯一需要标定的参数，也是本方法唯一"可调风格"的旋钮。'
            'R=1 处的权重为 C^A，A 越大越偏向锐帧。'
 -          '推荐 20；12 更保守：天空噪声只涨 2~4%、星点略软；'
++          '推荐值：彩机 6（R/B 采样稀，等效帧数比锐度更值钱）、黑白 20、折中 14。'
 +          '推荐 20（更锐；14 更干净、有效帧多三成、星点软 2.5%）；'
 +          '20 更锐但权重更集中；10 更干净；'
            '30 更锐：星点再细 0.1~0.3px，但天空噪声涨 6~7%、细节区等效帧数掉到 4 以下。',
@@ -3408,7 +3700,7 @@
      Param('rej_k', '排异强度 k', 'float', '标准',
            '剔除单帧异常像元（卫星、宇宙线、热噪）',
            '逐像素跨帧|偏差|超过 阈值 = k×1.4826×MAD + m·R·信号（信号 = 比较基准−天空）的帧判为离群剔除；'
-@@ -101,6 +171,28 @@
+@@ -101,6 +172,28 @@
            '0 = 全部（正式出图用这个）。>0 用于先在小样本上试参数，'
            '注意这不是"挑好帧"：帧的取舍由权重在叠加内部完成。',
            lo=0, hi=100000, step=1),
@@ -3437,7 +3729,7 @@
      Param('frames_dir', '帧落盘目录', 'dir', '标准',
            '帧多到装不进内存时的临时帧文件位置',
            '留空 = 自动挑盘（需 1.25× 余量）：优先软件所在目录 _DWT_frames'
-@@ -113,6 +205,54 @@
+@@ -113,6 +206,54 @@
            '注意：无论是否勾选，每次叠加都会重新读取源帧并重新落盘，勾选并不省落盘时间。'),
  
      # ---------------- 高级 ----------------
@@ -3492,7 +3784,7 @@
      Param('crop', '裁剪边长', 'int', '高级',
            '只叠画面中间 N×N 像素',
            '0 = 全幅（正式出图）。>0 只用于快速试参数：裁剪后帧小、跑得快，'
-@@ -142,6 +282,65 @@
+@@ -142,6 +283,65 @@
            '把 R 收得更紧',
            '1.0 即推荐值。>1 收窄支撑（R 更贴核心），<1 放宽。',
            lo=0.25, hi=4.0, step=0.05, dec=2),
@@ -3558,7 +3850,7 @@
      Param('star_grow_pct', '星点锐帧扩展', 'float', '高级',
            '按实测拖线长度自动外扩星点锐帧区',
            '100% = 用实测值（默认）：逐帧量星点长轴方差，相减得到拖线长度，'
-@@ -160,12 +359,114 @@
+@@ -160,12 +360,114 @@
            '在信噪比最好的一帧上一次性选星（未饱和、孤立、最亮），'
            '之后所有帧量同一批位置。中位数在 100 颗以上已稳定；星太少的视场可调小。',
            lo=20, hi=600, step=10),
@@ -3673,11 +3965,29 @@
  )
  
  GROUP_ORDER: Tuple[str, ...] = ('基础', '标准', '高级')
---- /dev/null
+--- a/xisf_io.py
++++ b/xisf_io.py
+@@ -947,11 +947,14 @@
+         image_data_list = []
+         for idx, image in enumerate(self.images):
+             if image.data is not None:
+-                data_bytes = image.data.tobytes()
++                # 不 tobytes()：那会给整幅图再复制一份（全幅 float32 是 417 MB），
++                # 直接给 memoryview 让写盘按块摄取。字节内容与 tobytes() 完全一致。
++                _a = np.ascontiguousarray(image.data)
++                data_bytes = memoryview(_a).cast('B')
+                 if compression and compression.startswith('zlib'):
+-                    compressed_data = zlib.compress(data_bytes)
++                    compressed_data = zlib.compress(data_bytes.tobytes())
+                     image_data_list.append(compressed_data)
+-                    image.compression = f"zlib:{len(data_bytes)}"
++                    image.compression = f"zlib:{_a.nbytes}"
+                 else:
+                     image_data_list.append(data_bytes)
+             else:
+--- a/core/cfa.py
 +++ b/core/cfa.py
---- 
-+++ 
-@@ -0,0 +1,200 @@
+@@ -0,0 +1,201 @@
 +# -*- coding: utf-8 -*-
 +"""单色传感器（OSC / CFA）支持：识别拜耳阵列、按通道拆色。
 +
@@ -3782,10 +4092,12 @@
 +    其它核保留通用实现。
 +    """
 +    if k.shape == (3, 3) and bool(np.all(k == 1.0)):
-+        p = np.pad(a, 1, mode='edge')
-+        return (p[:-2, :-2] + p[:-2, 1:-1] + p[:-2, 2:]
-+                + p[1:-1, :-2] + p[1:-1, 1:-1] + p[1:-1, 2:]
-+                + p[2:, :-2] + p[2:, 1:-1] + p[2:, 2:])
++        # 3×3 全 1 卷积是可分离的：先横着加三列，再竖着加三行。
++        # 9 次切片相加 → 6 次，实测全幅帧从 2 s 降到 0.5 s 级（结果逐位相同）。
++        q = np.pad(a, ((0, 0), (1, 1)), mode='edge')
++        r = q[:, :-2] + q[:, 1:-1] + q[:, 2:]
++        q2 = np.pad(r, ((1, 1), (0, 0)), mode='edge')
++        return q2[:-2] + q2[1:-1] + q2[2:]
 +    p = np.pad(a, 1, mode='edge')
 +    out = np.zeros_like(a, dtype=np.float32)
 +    h, w = a.shape
@@ -3877,12 +4189,9 @@
 +    if len(img_shape) == 3 and img_shape[2] >= 3:
 +        return False
 +    return bool(detect_pattern(meta))
-+
---- /dev/null
+--- a/core/drizzle.py
 +++ b/core/drizzle.py
---- 
-+++ 
-@@ -0,0 +1,2156 @@
+@@ -0,0 +1,2160 @@
 +"""Drizzle 重采样层（PWS 的几何层）
 +
 +把 PWS 阶段 C 的"唯一一次加权平均（式 12）"换成**带权 drizzle 累积**，从而在
@@ -4278,13 +4587,18 @@
 +    return float(x0), float(y0)
 +
 +
-+def _verify_all(s_ref, s_i, th, k, u, frac_min=0.35, rad=2.5):
++def _verify_all(s_ref, s_i, th, k, u, frac_min=None, rad=2.5):
 +    """用最终相似变换把本帧检到的星全部投到参考帧，返回 (是否可信, 命中数, 总数)。
 +
 +    匹配器对「对不上的帧」会给出自洽的假解：少数点的 SVD 能把误差整个塞进
 +    尺度里，残差仍然只有 0.1~0.4px，单看 scatter 抓不住。全星命中率是可靠
 +    判据——真对上时通常 60%~95%，假解一般 < 15%。
 +    """
++    if frac_min is None:
++        try:
++            frac_min = float(os.environ.get("DWT_VERIFY_FRAC", "0.35") or 0.35)
++        except Exception:
++            frac_min = 0.35
 +    from scipy.spatial import cKDTree
 +    s_ref = np.asarray(s_ref, np.float64)
 +    s_i = np.asarray(s_i, np.float64)
@@ -6038,12 +6352,9 @@
 +        else:
 +            out[Y0:Y1] = np.median(buf, axis=0)
 +    return out
-+
---- /dev/null
+--- a/core/bggrad.py
 +++ b/core/bggrad.py
---- 
-+++ 
-@@ -0,0 +1,245 @@
+@@ -0,0 +1,244 @@
 +# -*- coding: utf-8 -*-
 +"""逐帧加性背景梯度校正（低阶多项式面）
 +
@@ -6288,12 +6599,9 @@
 +            f'残差中位 {stats["resid_med"]:.2f}σ  用块 {stats["used_med"]:.0%}')
 +    stats['rcoefs'] = rcs
 +    return coefs, stats
-+
---- /dev/null
+--- a/core/matchref.py
 +++ b/core/matchref.py
---- 
-+++ 
-@@ -0,0 +1,554 @@
+@@ -0,0 +1,553 @@
 +# -*- coding: utf-8 -*-
 +"""把叠加成品对齐并裁切到一张参考图（通常是 WBPP 的 master）的网格上。
 +
@@ -6847,12 +7155,9 @@
 +        f'残差={info["rms"]:.3f}px  覆盖={info["cover"]:.1%}  '
 +        f'（{out.shape[1]}×{out.shape[0]}）')
 +    return info
-+
---- /dev/null
+--- a/core/trireg.py
 +++ b/core/trireg.py
---- 
-+++ 
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,141 @@
 +# -*- coding: utf-8 -*-
 +"""三角形（asterism）配准：对旋转、尺度、平移全免疫，不依赖初始猜测。
 +
@@ -6994,12 +7299,9 @@
 +    if log:
 +        log('  [三角] 内点 %d 对  尺度 %.4f  旋转 %.2f°  残差 %.2fpx' % (n_in, s, th, rms))
 +    return {'n_in': n_in, 'scale': s, 'theta': th, 'R': R, 't': t, 'rms': rms}
-+
---- /dev/null
+--- a/core/cropcover.py
 +++ b/core/cropcover.py
---- 
-+++ 
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,161 @@
 +# -*- coding: utf-8 -*-
 +"""自动裁掉没有覆盖的边缘（drizzle 画布四角与只被少数帧覆盖的带子）。
 +
@@ -7161,12 +7463,9 @@
 +    h, w = np.shape(img)
 +    return (int(y0) * block, min(int(y1) * block, h),
 +            int(x0) * block, min(int(x1) * block, w))
-+
---- /dev/null
+--- a/core/tune.py
 +++ b/core/tune.py
---- 
-+++ 
-@@ -0,0 +1,313 @@
+@@ -0,0 +1,312 @@
 +# -*- coding: utf-8 -*-
 +"""叠加前自动调参：抽几帧快速试几组参数，按实测指标给建议。
 +
@@ -7479,12 +7778,9 @@
 +        log('[调参] 写 CSV 失败：%s' % e)
 +
 +    return {'rows': rows, 'best': best}
-+
---- /dev/null
+--- a/core/gpu_dz.py
 +++ b/core/gpu_dz.py
---- 
-+++ 
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,141 @@
 +# -*- coding: utf-8 -*-
 +"""GPU 叠加（CuPy）—— 与 CPU 版 `_drizzle_band` 逐位等价的替代实现。
 +
@@ -7626,12 +7922,9 @@
 +    X = cp.float32(s) * (cp.float32(k) * bx + cp.float32(ux)) + cp.float32(ox)
 +    Y = cp.float32(s) * (cp.float32(k) * by + cp.float32(uy)) + cp.float32(oy)
 +    return X, Y
-+
---- /dev/null
+--- a/core/gpu_band.py
 +++ b/core/gpu_band.py
---- 
-+++ 
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,200 @@
 +# -*- coding: utf-8 -*-
 +"""GPU 版 drizzle 带核 —— 与 `_drizzle_band` 同语义，逐位可比。"""
 +import math
@@ -7832,12 +8125,9 @@
 +            'ncov': cp.asnumpy(ncov),
 +            'rej_num': rej_num, 'rej_den': rej_den,
 +            'wmax': [float(cp.asnumpy(mxw).mean())]}
-+
---- /dev/null
+--- a/core/xdrz.py
 +++ b/core/xdrz.py
---- 
-+++ 
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,147 @@
 +"""读取 PixInsight / WBPP 的 .xdrz（XDRZ 1.0）几何数据。
 +
 +为什么需要它
@@ -7985,12 +8275,9 @@
 +    if not ok.any():
 +        raise SystemExit('.xdrz 里的源文件名和素材目录里的帧名对不上，请检查 --xdrz 指向的目录')
 +    return {'dx': dx, 'dy': dy, 'theta': th, 'scale': kk, 'ok': ok, 'miss': miss}
-+
---- /dev/null
+--- a/core/cfadz.py
 +++ b/core/cfadz.py
---- 
-+++ 
-@@ -0,0 +1,480 @@
+@@ -0,0 +1,479 @@
 +"""CFA Drizzle（Bayer drizzle）：不解马赛克，直接把原始 CFA 像素按颜色分平面叠加。
 +
 +设计要点（每条都是硬约束，改了就失去意义）：
@@ -8470,12 +8757,9 @@
 +    return {'n': n, 'shape': (H, W), 'fwhm_med': fmed, 'fwhm_out': fwhm_out,
 +            'rej_rate': rej_hit / max(rej_tot, 1.0), 'stack': None,
 +            'stem': stem, 'out_dir': str(out_dir), 'cfa_drizzle': True}
-+
---- /dev/null
+--- a/core/dbg_band.py
 +++ b/core/dbg_band.py
---- 
-+++ 
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,88 @@
 +"""诊断：CFA drizzle 按带累积 vs 整幅一次累积，找出棋盘状明暗的来源。
 +
 +用法：python dbg_band.py <帧目录> [帧数]
@@ -8564,12 +8848,9 @@
 +
 +if __name__ == '__main__':
 +    main()
-+
---- /dev/null
+--- a/core/gpu_wgpu.py
 +++ b/core/gpu_wgpu.py
---- 
-+++ 
-@@ -0,0 +1,457 @@
+@@ -0,0 +1,456 @@
 +"""wgpu 可移植 GPU 后端（branch B）。
 +
 +为什么不是 CubeCL：CubeCL 是 Rust 库（`#[cube]` 宏 + pliron IR），没有 Python
@@ -9026,12 +9307,9 @@
 +            pass
 +    _cache.update({'devf': dev, 'queuef': dev.queue})
 +    return dev, dev.queue
-+
---- /dev/null
+--- a/core/gpu_wgpu_pws.py
 +++ b/core/gpu_wgpu_pws.py
---- 
-+++ 
-@@ -0,0 +1,396 @@
+@@ -0,0 +1,395 @@
 +"""wgpu（跨平台）PWS 叠加：单通道 + 真 CFA 颜色门控 + 两遍 σ-clipping。
 +
 +与旧 `gpu_wgpu.stack_pws`（两档权重近似、无排异、不支持真 CFA）相比：
@@ -9427,12 +9705,9 @@
 +            'coverage': cov_out.astype(np.float32),
 +            'ncov': (cov_out > 0).astype(np.float32),
 +            'rej_rate': rate, 'wmax': 1.0}
-+
---- /dev/null
+--- a/core/gpu_wgpu_cfa_bucket.py
 +++ b/core/gpu_wgpu_cfa_bucket.py
---- 
-+++ 
-@@ -0,0 +1,674 @@
+@@ -0,0 +1,675 @@
 +"""真 CFA 的 wgpu 叠加后端（分桶版）——跨平台、与 CPU 判据一致。
 +
 +思路
@@ -9474,7 +9749,7 @@
 +  y_off: u32, c0: u32, r0: u32, mask: u32,
 +  P: f32, lnc: f32, lns: f32, wa: f32,
 +  wb: f32, has_r: f32, kslot: u32, s_off: u32,
-+  lnt: f32,
++  lnt: f32, beta: f32,
 +}
 +
 +@group(0) @binding(0) var<uniform> Q: Params;
@@ -9522,7 +9797,8 @@
 +      if (wy <= 0.0) { continue; }
 +      let idx = u32(gy) * Q.w_out + u32(kx);
 +      let R = select(0.5, rmap[(u32(gy) + Q.y_off) * Q.w_out + u32(kx)], Q.has_r > 0.5);
-+      let wgt = exp(Q.wa * R * Q.lnc + Q.wb * (1.0 - R) * Q.lns);
++      let wgt = exp(Q.wa * R * Q.lnc +
++                    (Q.wb * (1.0 - R) + Q.beta * R) * Q.lns);
 +      // CPU 的 _scatter_band 用 1/P² 归一（液滴面积），这里同口径；
 +      // 不同帧 kk 略有差异时这一步会改变相对权重。
 +      let w = wgt * wx * wy / (Q.P * Q.P) * exp(Q.lnt);
@@ -9909,7 +10185,7 @@
 +            kk_i = float(kk[i]) if np.isfinite(kk[i]) else 1.0
 +            ks = kk_i
 +            ux, uy = -float(dx[i]), -float(dy[i])
-+            p = np.zeros(28, np.float32)
++            p = np.zeros(29, np.float32)
 +            p[0] = np.float32(s_grid * ks * ct)
 +            p[1] = np.float32(-s_grid * ks * stn)
 +            p[2] = np.float32(s_grid * ux + ox)
@@ -9929,6 +10205,7 @@
 +            _pu[21] = np.uint32(j * plane)
 +            _tv = float(T[j]) if T is not None else 1.0
 +            p[22] = np.float32(float(fp) * math.log(max(_tv, 1e-6)))
++            p[23] = np.float32(float(os.environ.get('DWT_DETAIL_SNR', '0') or 0))
 +            queue.write_buffer(uni, 0, p.tobytes())
 +            enc = dev.create_command_encoder()
 +            cp = enc.begin_compute_pass()
@@ -10106,12 +10383,9 @@
 +    return {'stack': stack, 'cov': cov, 'neff': neff,
 +            'wmax': float(cov.max()), 'rej_rate': 0.0, 'n_used': len(idx),
 +            'plan': plan, 'backend': 'wgpu-bucket'}
-+
---- /dev/null
+--- a/core/gpu_wgpu_cfa_scatter.py
 +++ b/core/gpu_wgpu_cfa_scatter.py
---- 
-+++ 
-@@ -0,0 +1,367 @@
+@@ -0,0 +1,366 @@
 +"""wgpu 真 CFA 的液滴散射后端（方案 A）。
 +
 +与收集式不同，这里按 CPU 的做法逐**源像素**散射：每个源像素在自己的颜色格点上，
@@ -10478,12 +10752,9 @@
 +            'wmax': float(cov_out.max() if cov_out.size else 0.0), 'rej_rate': (rej_hit / rej_tot) if rej_tot else 0.0,
 +            'rej_hit': rej_hit, 'rej_tot': rej_tot, 'n_used': len(idx),
 +            'plan': plan, 'backend': 'wgpu-scatter'}
-+
---- /dev/null
+--- a/core/gpu_wgpu_cfa_fatom.py
 +++ b/core/gpu_wgpu_cfa_fatom.py
---- 
-+++ 
-@@ -0,0 +1,578 @@
+@@ -0,0 +1,577 @@
 +"""真·散射累加后端（float32 原子加）。
 +
 +与分桶后端的区别：不保存样本，直接对输出像素做原子累加，显存只占 6 个画布大小的
@@ -11061,12 +11332,9 @@
 +        log('[wgpu] 剔除率 %.3f%%（%d / %d 个 tap）' % (_rate, _bad, _tot))
 +    return {'stack': stack, 'cov': cov, 'neff': neff, 'rej_rate': float(_rate) / 100.0,   # 接口约定是 0~1 小数，日志里才是百分数
 +            'wmax': float(cov.max()) if cov.size else 0.0}
-+
---- /dev/null
+--- a/gui.py
 +++ b/gui.py
---- 
-+++ 
-@@ -0,0 +1,1419 @@
+@@ -0,0 +1,1698 @@
 +# -*- coding: utf-8 -*-
 +"""DWT + Drizzle 图形界面
 +
@@ -11086,6 +11354,11 @@
 +import tkinter as tk
 +from pathlib import Path
 +from tkinter import filedialog, messagebox, simpledialog, ttk
++
++try:
++    import ui_round
++except Exception:      # 缺文件时退回原生控件
++    ui_round = None
 +
 +try:
 +    import help_page as _hp
@@ -11130,18 +11403,46 @@
 +             else Path(os.environ.get("APPDATA", str(Path.home()))))
 +CFG = _CFG_HOME / "DWT_Drizzle" / "settings.json"
 +
-+BG = "#eef1f5"
++BG = "#f5f9fc"
 +CARD = "#ffffff"
-+BORDER = "#d8dee6"
-+ACCENT = "#0f766e"
-+ACCENT_D = "#0b5c56"
-+FG = "#1f2937"
++BORDER = "#d8e6f2"
++ACCENT = "#0e6fb8"
++ACCENT_D = "#0a5a96"
++FG = "#0d2233"
++FG2 = "#5c7488"
++CYAN = "#21a7c4"   # 青色点缀（分隔线 / 运行中状态）
 +
 +import sys as _sys
 +_FONT_FAMILY = ("PingFang SC" if _sys.platform == "darwin"
 +                else "Microsoft YaHei UI" if _sys.platform.startswith("win")
 +                else "Noto Sans CJK SC")
-+FONT = (_FONT_FAMILY, 10)
++def _ui_scale(root) -> float:
++    """按屏幕 DPI 给字号/间距做缩放（96 dpi = 1.0）。"""
++    try:
++        dpi = float(root.winfo_fpixels("1i"))
++    except Exception:
++        dpi = 96.0
++    sc = max(0.85, min(2.0, dpi / 96.0))
++    try:
++        root.tk.call("tk", "scaling", dpi / 72.0)
++    except Exception:
++        pass
++    return sc
++
++
++_UI = [1.0]          # 运行时缩放系数（_build_style 里写入）
++
++
++def _f(size):
++    """字号按 DPI 缩放（返回整数磅值）。"""
++    return max(8, int(round(size * _UI[0])))
++
++
++def _px(n):
++    return max(1, int(round(n * _UI[0])))
++
++
++FONT = (_FONT_FAMILY, _f(10))
 +FONT_S = (_FONT_FAMILY, 9)
 +
 +# 界面布局清单：把分组名从一张表挪到另一张，就换到另一个标签页（改这一处即可）
@@ -11277,6 +11578,8 @@
 +        argv += ["--cfa-weights", c["cfa_weights"]]
 +    if c.get("cfa_grid", "shared") != "shared":
 +        argv += ["--cfa-grid", c["cfa_grid"]]
++    if c.get("cfa_align", "auto") != "auto":
++        argv += ["--cfa-align", c["cfa_align"]]
 +    if int(c.get("ref_k", 0) or 0) > 0:
 +        argv += ["--ref-k", str(int(c["ref_k"]))]
 +    if c.get("cfa_ref"):
@@ -11306,6 +11609,8 @@
 +
 +        self.cfg = load_cfg()
 +        self.proc: subprocess.Popen | None = None
++        self._log_fh = None
++        self._log_path: Path | None = None
 +        self.mon = None
 +        self._mon_buf = []          # 监控窗的日志/事件缓冲，窗口被关掉重开时回放
 +        self.q: queue.Queue = queue.Queue()
@@ -11331,53 +11636,96 @@
 +            style.theme_use("clam")
 +        except Exception:
 +            pass
-+        style.configure(".", font=FONT, background=BG)
++        _UI[0] = _ui_scale(self)
++        global FONT, FONT_S, FONT_B, FONT_T
++        FONT = (_FONT_FAMILY, _f(10))
++        FONT_S = (_FONT_FAMILY, _f(9))
++        FONT_B = (_FONT_FAMILY, _f(10), "bold")
++        FONT_T = (_FONT_FAMILY, _f(15), "bold")
++
++        style.configure(".", font=FONT, background=BG, foreground=FG)
 +        style.configure("TFrame", background=BG)
-+        style.configure("TLabel", background=BG, foreground=FG)
-+        style.configure("TCheckbutton", background=BG, foreground=FG)
-+        style.configure("TRadiobutton", background=BG, foreground=FG)
++        style.configure("Card.TFrame", background=CARD)
++        style.configure("TLabel", background=CARD, foreground=FG)
++        style.configure("Card.TLabel", background=CARD, foreground=FG)
++        style.configure("Hint.TLabel", background=CARD, foreground=FG2,
++                        font=FONT_S)
++        style.configure("TCheckbutton", background=CARD, foreground=FG,
++                        focusthickness=0, padding=(0, _px(2)))
++        style.map("TCheckbutton", background=[("active", CARD)])
++        style.configure("TRadiobutton", background=CARD, foreground=FG,
++                        focusthickness=0)
++        style.map("TRadiobutton", background=[("active", CARD)])
++        # 卡片：白底、无边框、留出内边距（圆润感来自留白与圆角标题条）
 +        style.configure("TLabelframe", background=CARD, bordercolor=BORDER,
++                        lightcolor=BORDER, darkcolor=BORDER,
 +                        relief="solid", borderwidth=1)
-+        style.configure("TLabelframe.Label", background=BG, foreground=ACCENT_D,
-+                        font=FONT_B)
-+        style.configure("TNotebook", background=BG, borderwidth=0)
-+        style.configure("TNotebook.Tab", padding=(16, 7), font=FONT,
-+                        background="#e5e7eb", foreground="#374151")
++        style.configure("TLabelframe.Label", background=CARD, foreground=FG2,
++                        font=FONT_S)
++        style.configure("TNotebook", background=BG, borderwidth=0,
++                        tabmargins=(_px(2), _px(6), _px(2), 0))
++        style.configure("TNotebook.Tab", padding=(_px(18), _px(8)), font=FONT,
++                        background=BG, foreground=FG2, borderwidth=0)
 +        style.map("TNotebook.Tab",
-+                  background=[("selected", CARD)], foreground=[("selected", ACCENT_D)])
-+        style.configure("TButton", padding=(12, 6), background="#ffffff",
-+                        bordercolor=BORDER, focusthickness=1, font=FONT)
++                  background=[("selected", CARD)],
++                  foreground=[("selected", FG)],
++                  expand=[("selected", (0, 0, 0, 0))])
++        style.configure("TButton", padding=(_px(14), _px(8)), background=CARD,
++                        bordercolor=BORDER, focusthickness=0, font=FONT,
++                        relief="flat")
 +        style.map("TButton",
-+                  background=[("active", "#eef2f7"), ("pressed", "#e2e8f0")])
-+        style.configure("Run.TButton", font=FONT_B, padding=(18, 8),
-+                        background=ACCENT, foreground="#ffffff", bordercolor=ACCENT)
++                  background=[("active", "#f0f0f3"), ("pressed", "#e8e8ed")])
++        style.configure("Run.TButton", font=FONT_B, padding=(_px(22), _px(10)),
++                        background=ACCENT, foreground="#ffffff", bordercolor=ACCENT,
++                        relief="flat")
 +        style.map("Run.TButton",
 +                  background=[("active", ACCENT_D), ("pressed", ACCENT_D),
-+                              ("disabled", "#b9c6c4")],
-+                  foreground=[("disabled", "#f1f5f9")])
-+        style.configure("TEntry", padding=4, fieldbackground="#ffffff")
-+        style.configure("TSpinbox", padding=3, fieldbackground="#ffffff")
-+        style.configure("TCombobox", padding=3)
-+        style.configure("TScrollbar", background="#dbe2ea", troughcolor=BG,
-+                        bordercolor=BG, arrowcolor="#64748b")
++                              ("disabled", "#c7c7cc")],
++                  foreground=[("disabled", "#ffffff")])
++        style.configure("Stop.TButton", font=FONT_B, padding=(_px(18), _px(10)),
++                        background="#ffffff", foreground="#ff3b30",
++                        bordercolor=BORDER, relief="flat")
++        style.map("Stop.TButton",
++                  background=[("active", "#fff1f0"), ("pressed", "#ffe4e1")])
++        style.configure("TEntry", padding=_px(6), fieldbackground="#ffffff",
++                        bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER,
++                        relief="flat")
++        style.configure("TSpinbox", padding=_px(5), fieldbackground="#ffffff",
++                        bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER,
++                        relief="flat")
++        style.configure("TCombobox", padding=_px(5), fieldbackground="#ffffff",
++                        bordercolor=BORDER, relief="flat")
++        style.map("TCombobox", fieldbackground=[("readonly", "#ffffff")])
++        style.configure("TScrollbar", background="#d9d9de", troughcolor=BG,
++                        bordercolor=BG, arrowcolor="#8e8e93", relief="flat")
 +
 +    def _build_ui(self):
 +        # 顶栏
-+        top = tk.Frame(self, bg="#171e29", height=64)
++        top = tk.Frame(self, bg=CARD, height=_px(74))
 +        top.pack(fill="x")
 +        top.pack_propagate(False)
-+        tk.Label(top, text="DWT", bg="#171e29", fg="#2dd4bf",
-+                 font=(_FONT_FAMILY, 18, "bold")).pack(side="left", padx=(20, 8))
-+        tk.Label(top, text="分区加权叠加  +  Drizzle 几何重采样", bg="#171e29",
-+                 fg="#cbd5e1", font=(_FONT_FAMILY, 11)).pack(side="left", pady=22)
-+        self.lab_state = tk.Label(top, text="空闲", bg="#171e29", fg="#94a3b8", font=FONT)
-+        self.lab_state.pack(side="right", padx=20)
++        tk.Frame(self, bg=BORDER, height=1).pack(fill="x", pady=(0, _px(6)))
++        # 徽标：深海军蓝圆角块 + 青色下划线
++        _lg = tk.Canvas(top, width=_px(98), height=_px(42), bg=CARD, highlightthickness=0)
++        _lg.pack(side="left", padx=(_px(22), _px(12)), pady=_px(16))
++        if ui_round:
++            ui_round.round_rect(_lg, 0, 0, _px(98), _px(42), _px(10),
++                                fill="#0b3350", outline="")
++            ui_round.round_rect(_lg, _px(12), _px(31), _px(86), _px(35), _px(2),
++                                fill=CYAN, outline="")
++        _lg.create_text(_px(49), _px(17), text="DWT", fill="#eaf7ff",
++                        font=(_FONT_FAMILY, 15, "bold"))
++        tk.Frame(top, bg=CYAN, width=_px(3), height=_px(20)).pack(side="left", pady=_px(27))
++        tk.Label(top, text="  分区加权叠加  ·  Drizzle 几何重采样", bg=CARD, fg=FG,
++                 font=(_FONT_FAMILY, _f(11))).pack(side="left")
++        self.lab_state = tk.Label(top, text="空闲", bg=CARD, fg=FG2, font=FONT)
++        self.lab_state.pack(side="right", padx=_px(22))
 +
 +        # 操作栏先占住底部，再让 Notebook 去抢剩余空间（否则会被挤掉）
 +        self.bar = tk.Frame(self, bg=BG)
 +        self.bar.pack(side="bottom", fill="x", padx=10, pady=(0, 8))
 +
-+        self.nb = ttk.Notebook(self)
++        self.nb = ui_round.SegTabs(self)
 +        self.nb.pack(fill="both", expand=True, padx=10, pady=(8, 10))
 +
 +        # 小屏幕/高 DPI 下内容放不下 → 整页可滚动（滚轮 + 右侧滚动条）
@@ -11395,8 +11743,12 @@
 +            win = cv.create_window((0, 0), window=bd, anchor="nw")
 +            bd.bind("<Configure>", lambda e, c=cv: c.configure(
 +                scrollregion=c.bbox("all")))
-+            cv.bind("<Configure>", lambda e, c=cv, w=win: c.itemconfigure(
-+                w, width=e.width))
++            def _fit_page(e, c=cv, w=win):
++                # 正文最大 _px(1100) 并水平居中：大屏不再把输入框拉成一整条
++                _wd = min(e.width, _px(1280))
++                c.coords(w, max(0, (e.width - _wd) // 2), 0)
++                c.itemconfigure(w, width=_wd)
++            cv.bind("<Configure>", _fit_page)
 +            for wdg in (cv, bd):
 +                wdg.bind("<MouseWheel>", self._wheel)
 +            bd.columnconfigure(0, weight=1)
@@ -11418,7 +11770,7 @@
 +        body_log = _body_of("日志")
 +
 +        # 路径
-+        p = ttk.Labelframe(body, text=" 素材与输出 ", padding=10)
++        p = ui_round.RoundCard(body, text="素材与输出", padding=_px(16), radius=_px(18)) if ui_round else ttk.Labelframe(body, text=" 素材与输出 ", padding=10)
 +        p.pack(fill="x")
 +        p.columnconfigure(1, weight=1)
 +
@@ -11451,37 +11803,47 @@
 +                  foreground="#6b7280", font=FONT_S).grid(row=3, column=0, columnspan=3,
 +                                                         sticky="w", pady=(2, 0))
 +
-+        bar2 = tk.Frame(p)
-+        bar2.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(6, 0))
-+        ttk.Button(bar2, text="扫描通道", width=10,
-+                   command=self._scan_channels).pack(side="left")
-+        ttk.Button(bar2, text="全选", width=5,
-+                   command=lambda: self._check_all(True)).pack(side="left", padx=(6, 0))
-+        ttk.Button(bar2, text="全不选", width=6,
-+                   command=lambda: self._check_all(False)).pack(side="left", padx=(4, 0))
++        bar2 = tk.Frame(p, bg="#f2f2f5")
++        bar2.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 4), ipady=_px(4))
++        ui_round.RoundButton(bar2, text="扫描通道", command=self._scan_channels,
++                             pad_x=_px(16), pad_y=_px(7),
++                             font=(_FONT_FAMILY, _f(9))).pack(side="left", padx=(_px(8), 0))
++        ui_round.RoundButton(bar2, text="全选", command=lambda: self._check_all(True),
++                             pad_x=_px(14), pad_y=_px(7),
++                             font=(_FONT_FAMILY, _f(9))).pack(side="left", padx=(_px(8), 0))
++        ui_round.RoundButton(bar2, text="全不选", command=lambda: self._check_all(False),
++                             pad_x=_px(14), pad_y=_px(7),
++                             font=(_FONT_FAMILY, _f(9))).pack(side="left", padx=(_px(8), 0))
++        ui_round.RoundButton(bar2, text="重新合成 RGB…", command=self._recompose_rgb,
++                             pad_x=_px(16), pad_y=_px(7),
++                             font=(_FONT_FAMILY, _f(9))).pack(side="left", padx=(_px(8), 0))
 +        self.lab_ch = tk.Label(bar2, text="先扫描，再在下面选要叠的通道（不选 = 全部）",
-+                               bg=BG, fg="#6b7280", font=FONT_S)
++                               bg="#f2f2f5", fg="#6b7280", font=FONT_S)
 +        self.lab_ch.pack(side="left", padx=10)
 +
-+        fr_lb = tk.Frame(p)
++        fr_lb = tk.Frame(p, bg=CARD)
 +        fr_lb.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(4, 0))
-+        self.cv_ch = tk.Canvas(fr_lb, height=108, highlightthickness=0, bg=BG)
++        self.cv_ch = tk.Canvas(fr_lb, height=96, highlightthickness=0, bg=CARD)
 +        sb = ttk.Scrollbar(fr_lb, orient="vertical", command=self.cv_ch.yview)
 +        self.cv_ch.configure(yscrollcommand=sb.set)
 +        self.cv_ch.pack(side="left", fill="x", expand=True)
 +        sb.pack(side="right", fill="y")
-+        self.fr_ch = tk.Frame(self.cv_ch, bg=BG)
++        self.fr_ch = tk.Frame(self.cv_ch, bg=CARD)
 +        self.ch_win = self.cv_ch.create_window((0, 0), window=self.fr_ch, anchor="nw")
 +        self.fr_ch.bind("<Configure>",
 +                        lambda e: self.cv_ch.configure(scrollregion=self.cv_ch.bbox("all")))
 +        self.cv_ch.bind("<Configure>",
 +                        lambda e: self.cv_ch.itemconfigure(self.ch_win, width=e.width))
++        self._ch_hint = tk.Label(self.fr_ch, bg=CARD, fg="#9aa0a6",
++                                 text="点「扫描通道」列出可叠的通道（不选 = 全部）",
++                                 font=FONT_S, anchor="w")
++        self._ch_hint.grid(row=0, column=0, sticky="w", padx=2, pady=4)
 +        self.ch_names: list = []
 +        self.ch_vars: list = []
 +
 +        # 参数
-+        g = ttk.Labelframe(body, text=" 叠加参数 ", padding=10)
-+        g.pack(fill="x", pady=(10, 0))
++        g = ui_round.RoundCard(body, text="叠加参数", padding=_px(16), radius=_px(18)) if ui_round else ttk.Labelframe(body, text=" 叠加参数 ", padding=10)
++        g.pack(fill="x", pady=(_px(2), _px(10)))
 +        self.v_A = tk.StringVar()
 +        self.v_rejk = tk.StringVar()
 +        self.v_nstar = tk.StringVar()
@@ -11496,14 +11858,14 @@
 +                row=1, column=col * 2, columnspan=2, sticky="w")
 +
 +        cell(g, 0, "清晰度 A", self.v_A, 8,
-+             "彩机建议 10（等效帧数更高、噪声低）；黑白建议 20（更锐）；14 折中")
++             "彩机建议 6（等效帧数更高、噪声低）；黑白建议 20（更锐）；14 折中")
 +        cell(g, 1, "排异 κ", self.v_rejk, 8, "3.5σ，越大越保守")
 +        cell(g, 2, "星点数", self.v_nstar, 8, "120，视场大可以加")
 +        cell(g, 3, "限帧", self.v_limit, 8, "只用前 N 帧；0 = 全部")
 +
 +        # Drizzle
-+        d = ttk.Labelframe(body_dz, text=" Drizzle ", padding=10)
-+        d.pack(fill="x", pady=(10, 0))
++        d = ui_round.RoundCard(body_dz, text="Drizzle", padding=_px(16), radius=_px(18)) if ui_round else ttk.Labelframe(body_dz, text=" Drizzle ", padding=10)
++        d.pack(fill="x", pady=(_px(2), _px(10)))
 +        self.v_drz = tk.BooleanVar()
 +        self.v_scale = tk.StringVar()
 +        self.v_pix = tk.StringVar()
@@ -11538,7 +11900,7 @@
 +
 +
 +        # 高级
-+        adv = ttk.Labelframe(body_adv, text=" 高级 ", padding=10)
++        adv = ui_round.RoundCard(body_adv, text="高级参数", padding=_px(16), radius=_px(18)) if ui_round else ttk.Labelframe(body_adv, text=" 高级 ", padding=10)
 +        adv.pack(fill="x", pady=(10, 0))
 +        adv.columnconfigure(1, weight=1)
 +        self.v_bgdeg = tk.StringVar()
@@ -11635,12 +11997,25 @@
 +        arow(18, "参考像帧数", _sp_refk,
 +             "0=自动（G 用 8，R/B 用 16）：R/B 采样少，帧数给小了 σ_psf 会估糊")
 +        self.v_cfag = tk.StringVar()
++        self.v_cfaa = tk.StringVar(value='自动判断')
++        self._auto_paths = {}          # 记录上次自动填的路径，手工改过就不再覆盖
++        try:
++        # 手动输入 / 粘贴路径时也重新搜（防抖）
++            self._photos_trace = self.v_photos.trace_add("write", self._schedule_autofill)
++        except Exception:
++            self._photos_trace = None
 +        _cb_cfag = ttk.Combobox(
 +            adv, state="readonly", width=12, textvariable=self.v_cfag,
 +            values=["共用画布", "逐通道画布"])
 +        _cb_cfag.grid(row=16, column=1, sticky="w", padx=4, pady=2)
 +        arow(16, "彩机画布", _cb_cfag,
 +             "共用画布：三通道像素级对齐（推荐）；逐通道：各通道按自己的配准定画布")
++        _cb_cfaa = ttk.Combobox(
++            adv, state="readonly", width=12, textvariable=self.v_cfaa,
++            values=["自动判断", "共用几何", "逐通道独立"])
++        _cb_cfaa.grid(row=17, column=3, sticky="w", padx=4, pady=2)
++        arow(17, "彩机对齐", _cb_cfaa,
++             "共用几何：三通道共用一次配准（快，约省 90 s/通道）；逐通道独立：能补色差但慢；自动：首帧色差 >0.15px 时切逐通道")
 +        arow(17, "并行进程", ttk.Spinbox(adv, from_=0, to=32, increment=1, width=6,
 +                                    textvariable=self.v_jobs),
 +             "0 = 自动（核数一半、最多 8）；内存带宽紧张时调小更稳（实测 6 最好，11 反而慢）")
@@ -11688,23 +12063,36 @@
 +
 +        # 操作（固定在窗口底部，两个标签页都能点到）
 +        bar = self.bar
-+        self.btn_run = ttk.Button(bar, text="▶  开始叠加", style="Run.TButton",
-+                                  command=self.start)
-+        self.btn_run.pack(side="left")
-+        self.btn_stop = ttk.Button(bar, text="■ 停止", command=self.stop, state="disabled")
-+        self.btn_stop.pack(side="left")
-+        ttk.Button(bar, text="存为默认", width=10, command=self.save_default).pack(
-+            side="left", padx=(16, 0))
-+        ttk.Button(bar, text="查看权重场", width=12,
-+                   command=self.show_maps).pack(side="left", padx=(8, 0))
-+        ttk.Button(bar, text="运行监控", width=10,
-+                   command=self.show_monitor).pack(side="left", padx=(8, 0))
-+        ttk.Button(bar, text="使用说明", width=10,
-+                   command=self.show_help).pack(side="left", padx=(8, 0))
-+        ttk.Button(bar, text="关于", width=6,
-+                   command=self.show_about).pack(side="left", padx=(8, 0))
-+        ttk.Button(bar, text="自动调参", width=10,
-+                   command=self.start_tune).pack(side="left", padx=(8, 0))
++        if ui_round is not None:
++            self.btn_run = ui_round.RoundButton(
++                bar, "开始叠加", command=self.start, kind='primary',
++                font=(_FONT_FAMILY, _f(10), "bold"), pad_x=_px(24), pad_y=_px(10))
++            self.btn_run.pack(side="left")
++            self.btn_stop = ui_round.RoundButton(
++                bar, "停止", command=self.stop, kind='danger',
++                font=(_FONT_FAMILY, _f(10), "bold"), pad_x=_px(18), pad_y=_px(10))
++            self.btn_stop.pack(side="left", padx=(_px(8), 0))
++        else:
++            self.btn_run = ttk.Button(bar, text="开始叠加", style="Run.TButton",
++                                      command=self.start)
++            self.btn_run.pack(side="left")
++            self.btn_stop = ttk.Button(bar, text="停止", command=self.stop,
++                                       state="disabled")
++            self.btn_stop.pack(side="left")
++        for _txt, _cmd in (("存为默认", self.save_default),
++                           ("查看权重场", self.show_maps),
++                           ("运行监控", self.show_monitor),
++                           ("使用说明", self.show_help),
++                           ("关于", self.show_about),
++                           ("自动调参", self.start_tune)):
++            if ui_round is not None:
++                ui_round.RoundButton(bar, _txt, command=_cmd,
++                                     font=(_FONT_FAMILY, _f(9)),
++                                     pad_x=_px(14), pad_y=_px(9)).pack(
++                    side="left", padx=(_px(8), 0))
++            else:
++                ttk.Button(bar, text=_txt, width=10, command=_cmd).pack(
++                    side="left", padx=(8, 0))
 +        self.pb = ttk.Progressbar(bar, mode="determinate", value=0, length=180)
 +        self.pb.pack(side="left", padx=16)
 +        self.lab_time = tk.Label(bar, text="用时 00:00", bg=BG, fg="#4b5563", font=FONT)
@@ -11713,9 +12101,9 @@
 +        self.lab_stage.pack(side="right", padx=16)
 +
 +        # 日志
-+        lg = ttk.Labelframe(body_log, text=" 日志 ", padding=6)
-+        lg.pack(fill="both", expand=True, pady=(10, 0))
-+        self.txt = tk.Text(lg, height=16, bg="#0f172a", fg="#cbd5e1", insertbackground="#cbd5e1",
++        lg = ui_round.RoundCard(body_log, text="日志", padding=_px(12), radius=_px(18), dark=True) if ui_round else ttk.Labelframe(body_log, text=" 日志 ", padding=6)
++        lg.pack(fill="both", expand=True, padx=_px(0), pady=(_px(10), 0))
++        self.txt = tk.Text(lg, height=16, bg="#0f1520", fg="#cbd5e1", insertbackground="#cbd5e1",
 +                           font=("Consolas", 9), relief="flat", wrap="none", padx=8, pady=6)
 +        vs = ttk.Scrollbar(lg, orient="vertical", command=self.txt.yview)
 +        self.txt.configure(yscrollcommand=vs.set)
@@ -11830,6 +12218,8 @@
 +        self.v_refk.set(str(c.get("ref_k", 0)))
 +        self.v_cfag.set({"shared": "共用画布", "own": "逐通道画布"}.get(
 +            str(c.get("cfa_grid", "shared")), "共用画布"))
++        self.v_cfaa.set({"shared": "共用几何", "own": "逐通道独立"}.get(
++            str(c.get("cfa_align", "auto")), "自动判断"))
 +        self.v_cfaw.set({"shared": "共用", "own": "逐通道"}.get(
 +            c.get("cfa_weights", "shared"), "共用"))
 +        self.v_cfaraw.set({"auto": "自动", "on": "强制开",
@@ -11887,6 +12277,9 @@
 +                        "混合（G 真 CFA + R/B 插值）": "hybrid"}.get(
 +                            self.v_cfaraw.get(), "auto"),
 +            "ref_k": int(self.v_refk.get().strip() or 0),
++            "cfa_align": {"自动判断": "auto", "共用几何": "shared",
++                          "逐通道独立": "own"}.get(
++                self.v_cfaa.get(), "auto"),
 +            "cfa_grid": {"共用画布": "shared", "逐通道画布": "own"}.get(
 +                self.v_cfag.get().strip(), "shared"),
 +            "cfa": {"关": "off", "自动识别": "auto"}.get(self.v_cfa.get().strip(),
@@ -11971,9 +12364,14 @@
 +            self.ch_names.append(c["name"])
 +            v = tk.BooleanVar(value=(not _want) or (c["name"] in _want))
 +            self.ch_vars.append(v)
-+            ttk.Checkbutton(self.fr_ch, text="☑ %s   ·   %d 帧" % (c["label"], c["n"]),
-+                            variable=v,
-+                            command=self._sync_check_glyph).pack(anchor="w", padx=2)
++            _lab = str(c["label"])
++            if _lab.isdigit() or not _lab.strip():
++                _lab = "通道 %s" % _lab if _lab.isdigit() else "未标滤镜"
++            tk.Checkbutton(self.fr_ch, text="%s   ·   %d 帧" % (_lab, c["n"]),
++                           variable=v, command=self._sync_check_glyph,
++                           bg=CARD, activebackground=CARD, selectcolor="#ffffff",
++                           anchor="w", relief="flat", bd=0, highlightthickness=0,
++                           font=FONT, fg=FG).pack(anchor="w", padx=_px(4), pady=_px(1))
 +        self._sync_check_glyph()
 +        self.fr_ch.update_idletasks()
 +        self.cv_ch.configure(scrollregion=self.cv_ch.bbox("all"))
@@ -12073,25 +12471,130 @@
 +            return None
 +        return "break"
 +
-+    def _autofill_related(self):
-+        """选好 calibrated 后，自动找同一 WBPP 输出目录下的 registered（放 .xdrz）。"""
++    def _schedule_autofill(self, *_a):
++        try:
++            if getattr(self, "_af_job", None):
++                self.after_cancel(self._af_job)
++        except Exception:
++            pass
++
++        def _run():
++            self._af_job = None
++            self._autofill_related()
++
++        try:
++            self._af_job = self.after(500, _run)
++        except Exception:
++            self._af_job = None
++
++    def _autofill_related(self, _evt=None):
++        """选了亮场主路径后，自动找同级的 registered（几何目录）与 debayered（彩机参考）。
++
++        每次改主路径都会重新找一遍；只要对应输入框还是「空」或「上次自动填的值」，
++        就跟着刷新（手工改过的不会被覆盖）。
++        """
 +        src = self.v_photos.get().strip()
 +        if not src:
 +            return
 +        p = Path(src)
-+        cands = []
-+        if p.name.lower().startswith("calibrat"):
-+            cands.append(p.parent / "registered")
-+        cands.extend([p.parent / "registered", p / "registered"])
-+        for c in cands:
++        roots = []
++        if p.name.lower().startswith(("calibrat", "light")):
++            roots.append(p.parent)
++        roots.append(p.parent)
++        roots.append(p)
++        for var, key, names, hint in (
++            (self.v_xdrz, "xdrz", ("registered",),
++             "几何目录"),
++            (self.v_cfa_ref, "cfa_ref", ("debayered", "Debayered"),
++             "彩机参考目录"),
++        ):
++            found = None
++            for root in roots:
++                for nm in names:
++                    cands = [root / nm, root / (nm.lower())]
++                    for c in cands:
++                        try:
++                            if c.is_dir() and any(c.iterdir()):
++                                found = c
++                                break
++                        except Exception:
++                            continue
++                    if found is not None:
++                        break
++                if found is not None:
++                    break
++            cur = var.get().strip()
++            prev = self._auto_paths.get(key, "")
++            if found is not None:
++                if cur == "" or cur == prev:
++                    var.set(str(found))
++                    self._auto_paths[key] = str(found)
++                    self._log_line("[界面] 已自动识别并填入%s：%s" % (hint, found))
++            elif cur and cur == prev:
++                var.set("")
++                self._auto_paths.pop(key, None)
++                self._log_line("[界面] 没找到%s，已清空（原来自动填的）：%s" % (hint, cur))
++
++    def _recompose_rgb(self):
++        """选 R/G/B 三个成品重新合成 RGB（不做白平衡；可选按天空对齐）。"""
++        out_dir = self.v_out.get().strip() or str(HERE)
++        picks = []
++        for ch in ("R", "G", "B"):
++            f = filedialog.askopenfilename(
++                title="选择 %s 通道成品（PWS_*_%s.xisf）" % (ch, ch),
++                initialdir=out_dir,
++                filetypes=[("XISF", "*.xisf"), ("所有文件", "*.*")])
++            if not f:
++                return
++            picks.append(f)
++        tag = self.v_tag.get().strip() or "RGB"
++        default = str(Path(out_dir) / ("PWS_%s_RGB.xisf" % tag))
++        out = filedialog.asksaveasfilename(
++            title="RGB 保存为", initialdir=out_dir, initialfile=Path(default).name,
++            defaultextension=".xisf", filetypes=[("XISF", "*.xisf")])
++        if not out:
++            return
++        sky = messagebox.askyesno(
++            "白平衡", "要把 R/B 的天空亮度对齐到 G 吗？\n\n"
++                     "选「否」= 完全保持原始比例（默认，不做白平衡）")
++        script = HERE / "recompose_rgb.py"
++        if not script.exists():
++            messagebox.showerror("缺少脚本", "包里找不到 recompose_rgb.py")
++            return
++        argv = [sys.executable, str(script),
++                "--r", picks[0], "--g", picks[1], "--b", picks[2], "--out", out]
++        if sky:
++            argv.append("--sky-match")
++        argv += ["--preview", str(Path(out).with_suffix(".png"))]
++        self._log_line("[合成] R=%s" % picks[0])
++        self._log_line("[合成] G=%s" % picks[1])
++        self._log_line("[合成] B=%s" % picks[2])
++        self._log_line("[合成] 输出 %s（白平衡：%s）" % (out, "按天空对齐" if sky else "不做"))
++
++        def _run():
 +            try:
-+                if c.is_dir() and next(c.rglob("*.xdrz"), None) is not None:
-+                    if not self.v_xdrz.get().strip():
-+                        self.v_xdrz.set(str(c))
-+                        self._log_line("[界面] 已自动识别并填入几何目录：%s" % c)
-+                    return
-+            except Exception:
-+                continue
++                env = dict(os.environ)
++                env["PYTHONPATH"] = os.pathsep.join(
++                    [str(HERE / "pydeps"), str(HERE), str(HERE / "core"),
++                     str(HERE / "gpudeps")])
++                pr = subprocess.Popen(argv, cwd=str(HERE), env=env,
++                                      stdout=subprocess.PIPE,
++                                      stderr=subprocess.STDOUT)
++                for raw in pr.stdout:
++                    try:
++                        line = raw.decode("gbk")
++                    except Exception:
++                        line = raw.decode("utf-8", "replace")
++                    line = line.rstrip()
++                    if line:
++                        self.after(0, self._log_line, "[合成] " + line)
++                code = pr.wait()
++                self.after(0, self._log_line,
++                           "[合成] 完成（退出码 %d）：%s" % (code, out))
++            except Exception as e:
++                self.after(0, self._log_line, "[合成] 失败：%s: %s" % (type(e).__name__, e))
++
++        threading.Thread(target=_run, daemon=True).start()
 +
 +    def _open_out(self):
 +        p = self.v_out.get().strip()
@@ -12170,7 +12673,7 @@
 +        """关于：方法与原文出处（PWS，D.Cikey）"""
 +        messagebox.showinfo(
 +            "关于 DWT · Drizzle",
-+            "DWT · Drizzle 2.7.40-C\n\n" + LICENSE_TEXT)
++            "DWT · Drizzle 2.7.58-D\n\n" + LICENSE_TEXT)
 +
 +    def show_help(self):
 +        """打开内置使用说明（不依赖浏览器 / 外部程序）"""
@@ -12272,7 +12775,7 @@
 +        try:
 +            if self.v_cfa.get().strip() in ("", "关"):
 +                return
-+            self._log("[界面] 提示：彩机建议清晰度 A=10（等效帧数更高、噪声更低）；"
++            self._log("[界面] 提示：彩机建议清晰度 A=6（等效帧数更高、噪声更低）；"
 +                      "黑白建议 A=20。当前值不会被自动修改。")
 +        except Exception:
 +            pass
@@ -12303,6 +12806,7 @@
 +        env["PYTHONUNBUFFERED"] = "1"
 +
 +        self.txt.delete("1.0", "end")
++        self._open_run_log(c, argv)
 +        self._log("命令：" + " ".join(argv) + "\n", "dim")
 +        try:
 +            self.proc = subprocess.Popen(
@@ -12319,7 +12823,7 @@
 +        self.pb.start(12)
 +        self.btn_run.configure(state="disabled")
 +        self.btn_stop.configure(state="normal")
-+        self.lab_state.configure(text="运行中", fg="#34d399")
++        self.lab_state.configure(text="运行中", fg=CYAN)
 +        self.reader = threading.Thread(target=self._read, args=(self.proc,), daemon=True)
 +        self.reader.start()
 +
@@ -12388,13 +12892,57 @@
 +                     "drizzle": "配准"}.get(m.group(1), m.group(1))
 +            self.lab_stage.configure(text=f"阶段：{stage}")
 +
++    def _open_run_log(self, c, argv):
++        """把本次叠加日志写到输出目录（与成品同目录）。"""
++        self._close_run_log()
++        try:
++            out_s = str(c.get("out") or "").strip()
++            if not out_s:
++                return
++            out = Path(out_s).expanduser()
++            out.mkdir(parents=True, exist_ok=True)
++            tag = (str(c.get("tag") or "stack").strip() or "stack")
++            stamp = time.strftime("%Y%m%d-%H%M%S")
++            self._log_path = out / ("%s_叠加日志_%s.txt" % (tag, stamp))
++            self._log_fh = open(self._log_path, "w", encoding="utf-8")
++            self._log_fh.write("DWT-Drizzle 叠加日志" + chr(10))
++            self._log_fh.write("开始时间：%s" % time.strftime("%Y-%m-%d %H:%M:%S") + chr(10))
++            self._log_fh.write("命令：%s" % " ".join(argv) + chr(10))
++            self._log_fh.write("=" * 60 + chr(10))
++            self._log_fh.flush()
++            self._log("[界面] 日志同时保存到 %s" % self._log_path + chr(10), "dim")
++        except Exception as e:
++            self._log_fh = None
++            self._log_path = None
++            self._log("[界面] 日志文件创建失败（不影响叠加）：%s" % e + chr(10), "warn")
++
++    def _close_run_log(self, code=None):
++        try:
++            if self._log_fh:
++                self._log_fh.write("=" * 60 + chr(10))
++                if code is not None:
++                    self._log_fh.write("结束时间：%s" % time.strftime("%Y-%m-%d %H:%M:%S") + chr(10))
++                    self._log_fh.write("退出码：%s" % code + chr(10))
++                self._log_fh.flush()
++                self._log_fh.close()
++        except Exception:
++            pass
++        self._log_fh = None
++
 +    def _log(self, s: str, tag: str = ""):
++        try:
++            if self._log_fh is not None:
++                self._log_fh.write(s)
++                self._log_fh.flush()
++        except Exception:
++            pass
 +        at_bottom = self.txt.yview()[1] > 0.98
 +        self.txt.insert("end", s, tag)
 +        if at_bottom:
 +            self.txt.see("end")
 +
 +    def _finish(self, code: int):
++        self._close_run_log(code if self._log_path else None)
 +        try:
 +            if self.mon is not None and self.mon.winfo_exists():
 +                self.mon.finish(code)
@@ -12485,12 +13033,9 @@
 +
 +if __name__ == "__main__":
 +    main()
-+
---- /dev/null
+--- a/eval_page.py
 +++ b/eval_page.py
---- 
-+++ 
-@@ -0,0 +1,428 @@
+@@ -0,0 +1,427 @@
 +# -*- coding: utf-8 -*-
 +"""叠加评价页：对一张 drizzle 成品做「质量体检」。
 +
@@ -12918,12 +13463,9 @@
 +
 +        panel(pad_t, fw, "FWHM (px)   vs   到画幅中心的半径", "#0f766e", res["fwhm"])
 +        panel(pad_t + hh + gap, ba, "轴比 b/a   vs   半径", "#b45309", 1.0)
-+
---- /dev/null
+--- a/maps_page.py
 +++ b/maps_page.py
---- 
-+++ 
-@@ -0,0 +1,586 @@
+@@ -0,0 +1,585 @@
 +# -*- coding: utf-8 -*-
 +
 +"""分区权重场 / 等效帧数查看页。
@@ -13509,12 +14051,9 @@
 +
 +        self.lab_hint.configure(text="已写出 " + out)
 +
-+
---- /dev/null
+--- a/monitor.py
 +++ b/monitor.py
---- 
-+++ 
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,246 @@
 +# -*- coding: utf-8 -*-
 +"""叠加进度监控：单独窗口——阶段、进度、用时、被排除的帧、实时日志、SNR 对比。
 +
@@ -13761,12 +14300,9 @@
 +                        "" if items else "  —— 没有被排除的帧"))
 +        else:
 +            self.lab_sum.configure(text="被排除 %d 帧" % len(items))
-+
---- /dev/null
+--- a/help_page.py
 +++ b/help_page.py
---- 
-+++ 
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,201 @@
 +# -*- coding: utf-8 -*-
 +"""软件内置「使用说明」：把 使用说明.md 渲染成可滚动的只读窗口。
 +
@@ -13968,12 +14504,9 @@
 +            ch.lift()
 +            return ch
 +    return HelpWindow(app)
-+
---- /dev/null
+--- a/verify_gpu.py
 +++ b/verify_gpu.py
---- 
-+++ 
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,193 @@
 +"""GPU 加速验收脚本（可复跑）。
 +
 +它不读程序自己的"我用了 GPU"日志，而是同时用四路证据判断：
@@ -14167,12 +14700,9 @@
 +
 +if __name__ == '__main__':
 +    sys.exit(main())
-+
---- /dev/null
+--- a/fix_bounds.py
 +++ b/fix_bounds.py
---- 
-+++ 
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,42 @@
 +# -*- coding: utf-8 -*-
 +"""把已有 XISF 的 bounds 改成真实数据范围（旧版成品在 PI 里显示全白时用）。
 +
@@ -14215,4 +14745,1077 @@
 +
 +if __name__ == '__main__':
 +    raise SystemExit(main())
+--- a/ui_round.py
++++ b/ui_round.py
+@@ -0,0 +1,319 @@
++# -*- coding: utf-8 -*-
++"""分支 D 的圆角卡片（纯 tkinter）。
 +
++实现要点：卡片本身是 tk.Frame（原有 grid/pack 代码照常工作），
++在它上面先 place 一个 Canvas 画圆角白底；后创建的控件自然叠在画布之上。
++"""
++from __future__ import annotations
++
++import tkinter as tk
++
++BG = '#f5f9fc'
++CARD = '#ffffff'
++CARD_DARK = '#0a1b2a'
++BORDER = '#d8e6f2'
++FG = '#0d2233'
++FG2 = '#5c7488'
++CYAN = '#21a7c4'
++ACCENT = '#0e6fb8'
++ACCENT_D = '#0a5a96'
++
++
++def round_rect(cv: tk.Canvas, x0, y0, x1, y1, r, **kw):
++    """用平滑多边形画圆角矩形。"""
++    r = max(1, min(int(r), (x1 - x0) // 2, (y1 - y0) // 2))
++    pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r,
++           x1, y1 - r, x1, y1, x1 - r, y1, x0 + r, y1,
++           x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
++    return cv.create_polygon(pts, smooth=True, splinesteps=24, **kw)
++
++
++class RoundCard(tk.Frame):
++    """白底圆角卡片；`card` 本身就是内容容器。"""
++
++    def __init__(self, master, text: str = '', padding: int = 14,
++                 radius: int = 16, dark: bool = False, **kw):
++        parent_bg = BG
++        try:
++            parent_bg = master.cget('bg')
++        except Exception:
++            pass
++        super().__init__(master, bg=parent_bg, bd=0, highlightthickness=0, **kw)
++        self._pad = padding
++        self._radius = radius
++        self._title = (text or '').strip()
++        self._dark = dark
++        self._fill = CARD_DARK if dark else CARD
++        self._cv = tk.Canvas(self, bg=parent_bg, highlightthickness=0, bd=0)
++        self._cv.place(x=0, y=0, relwidth=1, relheight=1)
++        tk.Misc.lower(self._cv)   # Canvas.lower 是「降低画布内元素」，控件层级要用 Misc.lower
++        self.body = self
++        self._tid = None
++        self._seen = set()
++        self._spaced = False
++        self.bind('<Configure>', self._redraw)
++        self.after(120, self._pad_children)
++
++    def _pad_children(self):
++        """给卡片内的控件加内边距（tk 没有 padding，只能逐个 grid/pack 调）。"""
++        try:
++            kids = [w for w in self.winfo_children() if w is not self._cv]
++            if not kids:
++                self.after(120, self._pad_children)
++                return
++            if not self._spaced and self._title:
++                # 标题单独占第 0 行，其它控件整体下移一行
++                for w in kids:
++                    gi = w.grid_info()
++                    if gi:
++                        w.grid_configure(row=int(gi['row']) + 1)
++                lb = tk.Label(self, text=self._title, bg=self._fill,
++                              fg=('#9aa4b2' if self._dark else FG2),
++                              font=('Segoe UI Variable Display', 9))
++                lb.grid(row=0, column=0, columnspan=8, sticky='w',
++                        padx=self._pad + 2, pady=(self._pad, 2))
++                self._seen.add(lb)
++                self._spaced = True
++            for w in kids:
++                if w in self._seen:
++                    continue
++                self._seen.add(w)
++                gi = w.grid_info()
++                if gi:
++                    _c = int(gi.get('column', 0))
++                    w.grid_configure(padx=(self._pad if _c == 0 else 8,
++                                           self._pad if _c >= 2 else 8),
++                                     pady=4)
++                else:
++                    w.pack_configure(padx=self._pad, pady=(self._pad, 4))
++            self.after(150, self._pad_children)
++        except Exception:
++            pass
++
++    def _redraw(self, _ev=None):
++        w = max(40, self.winfo_width())
++        h = max(40, self.winfo_height())
++        self._cv.delete('bg')
++        round_rect(self._cv, 1, 1, w - 1, h - 1, self._radius,
++                   fill=self._fill,
++                   outline='#1c2431' if self._dark else BORDER,
++                   width=1, tags='bg')
++        # 标题改用真正的 Label（见 _pad_children），画在 Canvas 上会被 spacer 盖住
++
++
++class RoundButton(tk.Canvas):
++    """圆角按钮（悬停/按下反馈）。"""
++
++    def __init__(self, master, text: str, command=None, kind: str = 'plain',
++                 radius: int = 10, pad_x: int = 18, pad_y: int = 9,
++                 font=None, width: int = 0, **kw):
++        bg = BG
++        try:
++            bg = master.cget('bg')
++        except Exception:
++            pass
++        super().__init__(master, bg=bg, highlightthickness=0, bd=0, **kw)
++        self._cmd = command
++        self._kind = kind
++        self._hover = False
++        f = font or ('Segoe UI Variable Display', 10)
++        self._txt = self.create_text(pad_x, pad_y, text=text, anchor='nw',
++                                     fill=self._fg(), font=f)
++        bb = self.bbox(self._txt) or (0, 0, pad_x * 2, pad_y * 2)
++        w, h = bb[2] + pad_x, bb[3] + pad_y
++        if width:
++            w = max(w, width)
++        self.configure(width=w, height=h)
++        self._shape = round_rect(self, 0, 0, w, h, radius,
++                                 fill=self._fill(), outline=self._outline(), width=1)
++        self.tag_lower(self._shape)
++        # 凸起感：顶部一条亮线 + 底部一条暗线
++        self._hi = self.create_line(0, 0, 0, 0, width=1, fill=self._hi_col())
++        self._lo = self.create_line(0, 0, 0, 0, width=1, fill=self._lo_col())
++        self._bevel()
++        self.bind('<Enter>', self._on_enter)
++        self.bind('<Leave>', self._on_leave)
++        self.bind('<Button-1>', self._on_press)
++        self.bind('<ButtonRelease-1>', self._on_release)
++
++    def _fill(self):
++        if self._kind == 'primary':
++            return ACCENT_D if self._hover else ACCENT
++        if self._kind == 'danger':
++            return '#fff1f0' if self._hover else CARD
++        return '#ececf0' if self._hover else '#f6f6f8'
++
++    def _fg(self):
++        if self._kind == 'primary':
++            return '#ffffff'
++        if self._kind == 'danger':
++            return '#ff3b30'
++        return FG
++
++    def _outline(self):
++        return ACCENT if self._kind == 'primary' else '#d2d2d8'
++
++    def _hi_col(self):
++        if self._kind == 'primary':
++            return '#5aa9dd'
++        if self._kind == 'danger':
++            return '#ffffff'
++        return '#ffffff'
++
++    def _lo_col(self):
++        if self._kind == 'primary':
++            return '#084b7d'
++        if self._kind == 'danger':
++            return '#e6c7c7'
++        return '#c8d7e6'
++
++    def _bevel(self):
++        bb = self.bbox(self._shape)
++        if not bb:
++            return
++        x0, y0, x1, y1 = bb
++        r = 8
++        self.coords(self._hi, x0 + r, y0 + 2, x1 - r, y0 + 2)
++        self.coords(self._lo, x0 + r, y1 - 2, x1 - r, y1 - 2)
++
++    def _repaint(self):
++        self.itemconfigure(self._shape, fill=self._fill())
++        self.itemconfigure(self._txt, fill=self._fg())
++        self.itemconfigure(self._hi, fill=self._hi_col())
++        self.itemconfigure(self._lo, fill=self._lo_col())
++        self._bevel()
++
++    def _on_enter(self, _e):
++        self._hover = True
++        self._repaint()
++
++    def _on_leave(self, _e):
++        self._hover = False
++        self._repaint()
++
++    def _on_press(self, _e):
++        self.move(self._txt, 0, 1)
++
++    def _on_release(self, _e):
++        self.move(self._txt, 0, -1)
++        if self._cmd:
++            self._cmd()
++
++    def set_text(self, s: str):
++        self.itemconfigure(self._txt, text=s)
++
++    def set_state(self, enabled: bool):
++        self.configure(cursor='' if enabled else 'arrow')
++        self.itemconfigure(self._txt, fill=self._fg() if enabled else '#c7c7cc')
++
++
++class SegTabs(tk.Frame):
++    """分段控件（胶囊）+ 内容区，替代 ttk.Notebook。
++
++    用法与 Notebook 对齐：add(page, text=...)、select(page)。
++    page 必须是本控件的子控件（gui.py 里就是 `tk.Frame(self.nb)`）。
++    """
++
++    def __init__(self, master, bg=None, **kw):
++        _bg = bg or BG
++        super().__init__(master, bg=_bg, **kw)
++        self._bg = _bg
++        try:
++            self._s = max(1.0, self.winfo_fpixels('1i') / 96.0)
++        except Exception:
++            self._s = 1.0
++        self._pages = []          # [(page, title, seg_index)]
++        self._cur = None
++        self._bar = tk.Canvas(self, bg=_bg, highlightthickness=0, height=self._p(46))
++        self._bar.pack(fill='x', padx=self._p(10), pady=(self._p(6), self._p(2)))
++        self._bar.bind('<Button-1>', self._on_click)
++        self._hot = -1
++        self._last_w = 0
++        self._bar.bind('<Motion>', self._on_motion)
++        self._bar.bind('<Configure>', self._on_resize)
++
++    def _p(self, v):
++        return int(round(v * self._s))
++
++    def _fn(self, v):
++        return max(7, int(round(v * self._s)))
++
++    # --- 数据 -------------------------------------------------------
++    def add(self, page, text=''):
++        self._pages.append([page, text, 0])
++        page.pack_forget()
++        if self._cur is None:
++            self.select(page)
++        self._draw()
++        return page
++
++    def select(self, page=None):
++        if page is None:
++            return self._cur
++        for p, _t, _i in self._pages:
++            if p is page:
++                self._cur = p
++                for q, _t2, _i2 in self._pages:
++                    if q is not p:
++                        q.pack_forget()
++                p.pack(fill='both', expand=True, padx=self._p(10), pady=(0, self._p(10)))
++        self._draw()
++        return page
++
++    # --- 绘制 -------------------------------------------------------
++    def _geom(self):
++        W = max(self._bar.winfo_width(), 200)
++        n = max(1, len(self._pages))
++        pad = self._p(4)
++        seg_w = min(self._p(150), max(self._p(96), (W - pad * 2) // n))
++        h = self._p(36)
++        y0 = (self._p(46) - h) // 2
++        return W, n, pad, seg_w, h, y0
++
++    def _on_resize(self, e):
++        # 只在宽度真正变化时重画，避免「画内容 → 触发 Configure → 再画」的死循环
++        if abs(e.width - self._last_w) >= 2:
++            self._last_w = e.width
++            self._draw()
++
++    def _draw(self):
++        c = self._bar
++        c.delete('all')
++        if not self._pages:
++            return
++        W, n, pad, seg_w, h, y0 = self._geom()
++        total = seg_w * n
++        cx0 = max(0, (W - total) // 2)
++        round_rect(c, cx0, y0, cx0 + total, y0 + h, self._p(10),
++                   fill='#ececf0', outline=BORDER, width=1)
++        cur = next((i for i, (_p, _t, _) in enumerate(self._pages) if _p is self._cur), 0)
++        for i, (_p, title, _x) in enumerate(self._pages):
++            x0 = cx0 + i * seg_w
++            if i == cur:
++                round_rect(c, x0 + 2, y0 + 2, x0 + seg_w - 2, y0 + h - 2, self._p(9),
++                           fill=CARD, outline='#d8d8dd', width=1)
++            elif i == self._hot:
++                round_rect(c, x0 + 2, y0 + 2, x0 + seg_w - 2, y0 + h - 2, self._p(9),
++                           fill='#f4f4f7', outline='', width=0)
++            c.create_text(x0 + seg_w / 2, y0 + h / 2, text=title,
++                          fill=(FG if i == cur else FG2),
++                          font=('Segoe UI Variable Display', self._fn(9)))
++
++    def _hit(self, x):
++        W, n, pad, seg_w, h, y0 = self._geom()
++        total = seg_w * n
++        cx0 = max(0, (W - total) // 2)
++        if x < cx0 or x >= cx0 + total:
++            return -1
++        return min(n - 1, int((x - cx0) // seg_w))
++
++    def _on_motion(self, e):
++        i = self._hit(e.x)
++        if i != self._hot:
++            self._hot = i
++            self._draw()
++
++    def _on_click(self, e):
++        i = self._hit(e.x)
++        if 0 <= i < len(self._pages):
++            self.select(self._pages[i][0])
+--- a/recompose_rgb.py
++++ b/recompose_rgb.py
+@@ -0,0 +1,124 @@
++"""把已有的三个单通道成品重新合成一张彩色 XISF（不做白平衡）。
++
++用途：单通道已经叠好（甚至各自在 PI 里处理过）之后，想重新合一次色；
++或者想用不同的通道重新组合。合成只做三件事：
++
++1. 几何对齐检查（三张必须同尺寸；不同则报错退出，不猜）
++2. 可选 `--sky-match`：把 R/B 的天空中位数拉到 G 的水平（默认关）
++3. 写 XISF（H×W×3、Normal 存储、bounds 按数据实际范围）
++
++**不做白平衡/色彩校正**——按用户要求，通道比例保持原样。
++
++用法：
++    python recompose_rgb.py --r PWS_x_R.xisf --g PWS_x_G.xisf --b PWS_x_B.xisf \
++        --out PWS_x_RGB.xisf [--sky-match] [--preview 预览.png]
++"""
++from __future__ import annotations
++
++import argparse
++import contextlib
++import io
++import sys
++from pathlib import Path
++
++import numpy as np
++
++
++def _load(path: str) -> np.ndarray:
++    from xisf_io import read_xisf
++    with contextlib.redirect_stdout(io.StringIO()):
++        im = read_xisf(str(path))[0]
++    d = np.asarray(im.data, dtype=np.float32)
++    if d.ndim == 3:
++        d = d[:, :, 0]
++    return d
++
++
++def _sky(a: np.ndarray) -> float:
++    v = a[np.isfinite(a)]
++    return float(np.median(v)) if v.size else float('nan')
++
++
++def main(argv=None) -> int:
++    ap = argparse.ArgumentParser(description='三通道重新合成彩色 XISF（不做白平衡）')
++    ap.add_argument('--r', required=True)
++    ap.add_argument('--g', required=True)
++    ap.add_argument('--b', required=True)
++    ap.add_argument('--out', required=True)
++    ap.add_argument('--sky-match', action='store_true',
++                    help='把 R/B 的天空中位数拉到 G 的水平（默认关，保持原始比例）')
++    ap.add_argument('--preview', default='', help='可选：同时输出一张 PNG 预览')
++    a = ap.parse_args(argv)
++
++    chans = []
++    for name, p in (('R', a.r), ('G', a.g), ('B', a.b)):
++        if not Path(p).exists():
++            print(f'[错误] {name} 通道文件不存在：{p}')
++            return 2
++        chans.append(_load(p))
++    shapes = {c.shape for c in chans}
++    if len(shapes) != 1:
++        print('[错误] 三张尺寸不一致：%s' % ', '.join(str(c.shape) for c in chans))
++        print('       请先用同一画布重叠，或在 PI 里裁齐后再合成。')
++        return 2
++
++    R, G, B = chans
++    if a.sky_match:
++        sg = _sky(G)
++        for name, arr in (('R', R), ('B', B)):
++            s = _sky(arr)
++            if np.isfinite(s) and np.isfinite(sg) and s > 0:
++                k = sg / s
++                arr *= np.float32(k)
++                print('[天空] %s 通道 ×%.5f（%.4e → %.4e）' % (name, k, s, s * k))
++    else:
++        print('[天空] 未做通道平衡（保持原始比例）')
++
++    rgb = np.stack([R, G, B], axis=-1)
++    finite = np.isfinite(rgb)
++    lo = float(np.nanmin(rgb)) if finite.any() else 0.0
++    hi = float(np.nanmax(rgb)) if finite.any() else 1.0
++    if not (hi > lo):
++        hi = lo + 1.0
++
++    from xisf_io import XISFImage, write_xisf
++    h, w, _ = rgb.shape
++    img = XISFImage()
++    img.data = np.ascontiguousarray(rgb, dtype=np.float32)
++    img.sample_format = 'Float32'
++    img.geometry = (w, h, 3)
++    img.color_space = 'RGB'
++    img.pixel_storage = 'Normal'
++    img.bounds = (lo, hi)
++    out = Path(a.out)
++    out.parent.mkdir(parents=True, exist_ok=True)
++    write_xisf(str(out), img)
++    print('[输出] %s  %d×%d×3  bounds=(%.4g, %.4g)' % (out, w, h, lo, hi))
++
++    if a.preview:
++        try:
++            # 用包内自带的 PNG 编码器（maps_page._to_png），不依赖 Pillow
++            from maps_page import _to_png
++            # 预览用「中位 ± MAD」定标（和成品预览一致）；边界值会被饱和星点撑到 1，
++            # 按 bounds 拉伸整幅会几乎全黑。
++            _lo = np.zeros(3, np.float32); _hi = np.zeros(3, np.float32)
++            for _c in range(3):
++                _v = rgb[..., _c]
++                _m = float(np.median(_v))
++                _d = float(np.median(np.abs(_v - _m))) * 1.4826
++                _lo[_c] = max(0.0, _m - 2.8 * _d)
++                _hi[_c] = _m + 60.0 * _d
++            x = np.clip((rgb - _lo) / np.maximum(_hi - _lo, 1e-12), 0, 1)
++            x = np.arcsinh(x * 18.0) / np.arcsinh(18.0)
++            u8 = (x * 255).astype(np.uint8)
++            sg = max(1, int(np.ceil(max(h, w) / 1200.0)))
++            u8 = u8[::sg, ::sg]
++            Path(a.preview).write_bytes(_to_png(u8))
++            print('[预览] %s  %d×%d（抽样 %d）' % (a.preview, u8.shape[1], u8.shape[0], sg))
++        except Exception as e:
++            print('[预览] 生成失败（不影响 XISF）：%s' % e)
++    return 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())
+--- a/compare_ref.py
++++ b/compare_ref.py
+@@ -0,0 +1,153 @@
++"""和 WBPP 标准图逐通道比对（成图质量验收）。
++
++用法：
++    python compare_ref.py <我们的输出目录> [--refs <WBPP 目录>] [--tag <成品名>]
++
++约定：全量叠加验收跑 1× 网格（`--drizzle-scale 1 --drizzle-pix 1.0`），并用
++`--frame <WBPP 的 G 标准图>` 把画布对齐到 WBPP，这样两边像素一一对应。
++
++每个通道输出：
++    背景（天空中位）、噪声（MAD）、信噪比、相关性、信号通量比、FWHM
++判定：噪声比 > 1.40、|通量比-1| > 0.10、corr < 0.95、FWHM 比 > 1.10 任一触发即 WARN。
++"""
++from __future__ import annotations
++
++import argparse
++import glob
++import os
++import sys
++
++import numpy as np
++
++sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "pydeps"))
++
++REF_DEFAULT = r"G:\M81\master"
++REF_PAT = "masterLight_BIN-1_6248x4176_EXPOSURE-300.00s_FILTER-1__%s_drizzle_1x_autocrop.xisf"
++
++
++def _load(path):
++    from xisf_io import read_xisf
++    return np.asarray(read_xisf(path)[0].data, np.float32)
++
++
++def _mad(x):
++    return float(np.median(np.abs(x - np.median(x))) * 1.4826)
++
++
++def _fwhm(img, n=300):
++    from scipy import ndimage
++    m = float(np.median(img))
++    s = _mad(img)
++    sm = ndimage.gaussian_filter(img, 1.0)
++    pk = (sm == ndimage.maximum_filter(sm, 5)) & (sm > m + 20 * s)
++    ys, xs = np.nonzero(pk)
++    out = []
++    for y, x in zip(ys, xs):
++        if y < 6 or x < 6 or y > img.shape[0] - 7 or x > img.shape[1] - 7:
++            continue
++        p = img[y - 5:y + 6, x - 5:x + 6].astype(np.float64)
++        p = p - np.median(p)
++        if p.sum() <= 0:
++            continue
++        yy, xx = np.mgrid[0:11, 0:11]
++        cy = (p * yy).sum() / p.sum()
++        cx = (p * xx).sum() / p.sum()
++        vy = (p * (yy - cy) ** 2).sum() / p.sum()
++        vx = (p * (xx - cx) ** 2).sum() / p.sum()
++        f = 2.3548 * float(np.sqrt(max((vx + vy) / 2, 0.0)))
++        if 1.0 < f < 8.0:
++            out.append(f)
++        if len(out) >= n:
++            break
++    return float(np.median(out)) if out else float("nan")
++
++
++def _period_score(img):
++    h = img.shape[0]
++    rows = img[h // 6:h // 6 + min(1500, h - h // 6)].mean(axis=1)
++    rows = rows - rows.mean()
++    if rows.size < 64:
++        return 0.0
++    f = np.abs(np.fft.rfft(rows))[1:]
++    return float(f.max() / rows.size)
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("outdir")
++    ap.add_argument("--tag", default=None)
++    ap.add_argument("--refs", default=REF_DEFAULT)
++    a = ap.parse_args()
++
++    rows = []
++    bad = []
++    for ch in "RGB":
++        cand = sorted(glob.glob(os.path.join(a.outdir, "*_%s.xisf" % ch)))
++        if not cand:
++            print("缺少 %s 通道输出" % ch)
++            continue
++        ours = _load(cand[0])
++        refp = os.path.join(a.refs, REF_PAT % ch)
++        if not os.path.exists(refp):
++            print("缺少标准图 %s" % refp)
++            continue
++        ref = _load(refp)
++        n = min(ours.shape[0], ref.shape[0])
++        m = min(ours.shape[1], ref.shape[1])
++        A = ours[:n, :m].astype(np.float64)
++        B = ref[:n, :m].astype(np.float64)
++        ok = (A > 0) & (B > 0)
++        if ok.sum() < 10000:
++            print("%s 通道可用像素太少（%d）" % (ch, ok.sum()))
++            continue
++        A2 = A - np.median(A[ok])
++        B2 = B - np.median(B[ok])
++        A, B = A2[ok], B2[ok]
++        corr = float(np.corrcoef(A, B)[0, 1])
++        # 全局增益：两边的绝对标定不同（WBPP 会按自身口径归一），所以先估一个
++        # 稳健的增益比,再在「同一增益」下比噪声与通量——否则会把标定差当成画质差。
++        bright = B > 20.0 * _mad(B)
++        gain = float(np.median(A[bright] / B[bright])) if bright.sum() > 1000 else 1.0
++        An = A / gain if gain else A
++        
++        # 通量比只在「参考图有明显信号」的像素上算：天空区的残差梯度会把整体
++        # 通量比抬到 1.2 以上，那是背景结构不是信号。
++        nb = _mad(B)
++        sig = B > 5.0 * nb
++        flux = float(An[sig].sum() / B[sig].sum()) if sig.sum() > 1000 else float("nan")
++        # 背景梯度残差：128×128 块中位的标准差（越大说明背景没抹平）
++        bh, bw = 128, 128
++        blk = []
++        for yy in range(0, n - bh, bh):
++            for xx in range(0, m - bw, bw):
++                blk.append(np.median(A2[yy:yy + bh, xx:xx + bw]))
++        grad = float(np.std(blk)) if blk else 0.0
++        nr = float(_mad(An) / _mad(B))
++        fa, fb = _fwhm(ours[:n, :m]), _fwhm(ref[:n, :m])
++        per = _period_score(ours[:n, :m])
++        flag = []
++        if nr > 1.40:
++            flag.append("噪声 %.2f×" % nr)
++        if abs(flux - 1) > 0.10:
++            flag.append("通量 %.3f" % flux)
++        if corr < 0.95:
++            flag.append("corr %.3f" % corr)
++        if fa == fa and fb == fb and fa / fb > 1.10:
++            flag.append("FWHM %.2f vs %.2f" % (fa, fb))
++        rows.append((ch, corr, flux, nr, fa, fb, per, grad, gain))
++        if flag:
++            bad.append("%s：%s" % (ch, "、".join(flag)))
++
++    print("%-3s %8s %8s %8s %8s %8s %10s %8s %6s" % ("ch", "corr", "flux", "noise", "FWHM", "ref", "period", "bggrad", "gain"))
++    for ch, corr, flux, nr, fa, fb, per, grad, gain in rows:
++        print("%-3s %8.4f %8.4f %8.3f %8.3f %8.3f %10.2e %8.2e %6.3f" % (ch, corr, flux, nr, fa, fb, per, grad, gain))
++    if bad:
++        print("\nWARN：" + "；".join(bad))
++        print("QUALITY: FAIL")
++        return 1
++    print("\nQUALITY: PASS")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+--- a/gpu_probe.py
++++ b/gpu_probe.py
+@@ -0,0 +1,150 @@
++# -*- coding: utf-8 -*-
++"""只测量「叠加那一段」的 GPU 占用，不跑 CPU 对照。
++
++用法：
++    python gpu_probe.py                       # 8 帧全幅，2× pixfrac 0.8
++    python gpu_probe.py --limit 60            # 60 帧（约 15 s 窗口）
++    python gpu_probe.py --limit 60 --crop 1600
++
++它做的事：
++ 1. 起一个子进程跑 main.py --cli（--gpu wgpu），日志实时读；
++ 2. 同时每 100 ms 采一次 `nvidia-smi --query-gpu=utilization.gpu,utilization.memory,memory.used`；
++ 3. 只保留 `[wgpu][start]` 与 `[wgpu][done]` 之间的采样，按 epoch 时间戳对齐；
++ 4. 打印窗口长度、采样数、均值/P50/P90/最大值，以及 backend / fallbacks / wall_s；
++ 5. 若窗口内均值 < 40% 或出现 fallback，退出码为 1。
++
++这个数字才是「GPU 到底忙不忙」的证据：窗口外的读帧/配准与 GPU 无关，
++把它们算进平均只会把结论摊薄（这也是之前判断失误的地方）。
++"""
++import argparse, subprocess, sys, time, os, re, shutil, threading
++
++class _Smi:
++    """常驻 nvidia-smi：--loop-ms 让驱动每 N 毫秒吐一行，避免每次起进程的 1 s 开销。"""
++    def __init__(self, ms=100):
++        self.proc = None
++        exe = shutil.which('nvidia-smi')
++        if exe:
++            self.proc = subprocess.Popen(
++                [exe, '--query-gpu=utilization.gpu,utilization.memory,memory.used',
++                 '--format=csv,noheader,nounits', '--loop-ms=%d' % ms],
++                stdout=subprocess.PIPE, text=True, bufsize=1)
++
++    def read(self):
++        """返回 (util, mem_util, mem_used)；无数据时 (None, None, None)。"""
++        if not self.proc:
++            return None, None, None
++        line = self.proc.stdout.readline()
++        if not line:
++            return None, None, None
++        try:
++            g, m, used = [x.strip() for x in line.strip().split(',')]
++            return float(g), float(m), float(used)
++        except Exception:
++            return None, None, None
++
++    def close(self):
++        if self.proc:
++            try:
++                self.proc.terminate()
++            except Exception:
++                pass
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument('--photos', default='G:/M81/calibrated')
++    ap.add_argument('--out', default='G:/M81/_probe')
++    ap.add_argument('--limit', type=int, default=8)
++    ap.add_argument('--crop', type=int, default=0)
++    ap.add_argument('--scale', type=float, default=2.0)
++    ap.add_argument('--pixfrac', type=float, default=0.8)
++    ap.add_argument('--rej', type=float, default=3.5)
++    ap.add_argument('--band', type=int, default=0)
++    ap.add_argument('--min-util', type=float, default=40.0)
++    ap.add_argument('--min-p90', type=float, default=90.0)
++    a = ap.parse_args()
++
++    exe = sys.executable
++    root = os.path.dirname(os.path.abspath(__file__))
++    cmd = [exe, os.path.join(root, 'main.py'), '--cli', '--photos', a.photos,
++           '--out', a.out, '--tag', 'probe', '--cfa', 'auto', '--cfa-raw', 'on',
++           '--drizzle', '--drizzle-scale', str(a.scale), '--drizzle-pix', str(a.pixfrac),
++           '--limit', str(a.limit), '--crop', str(a.crop), '--A', '10', '--B', '2',
++           '--rej-k', str(a.rej), '--gpu', 'wgpu']
++    env = dict(os.environ, PYTHONPATH=os.pathsep.join(
++        [os.path.join(root, 'pydeps'), root, os.path.join(root, 'core'),
++         os.path.join(root, 'gpudeps')]), DWT_CFA_CHANNELS='G')
++    if a.band:
++        env['DWT_BAND'] = str(a.band)
++
++    print('[probe] 启动：' + ' '.join(cmd[1:]), flush=True)
++    p = subprocess.Popen(cmd, cwd=root, env=env, stdout=subprocess.PIPE,
++                         stderr=subprocess.STDOUT, text=True, encoding='gbk', errors='replace')
++    smi = _Smi(100)
++    samples = []
++    _stop = threading.Event()
++
++    def _sampler():
++        while not _stop.is_set():
++            g, mu, used = smi.read()
++            if g is not None:
++                samples.append((time.time(), g, mu, used))
++
++    th = threading.Thread(target=_sampler, daemon=True)
++    th.start()
++    t_start, t_done, backend, wall, fallbacks = None, None, '', None, 0
++    for line in p.stdout:
++        now = time.time()
++        if line.startswith('[wgpu][start]'):
++            t_start = now
++            m = re.search(r'backend=(\w+)', line)
++            backend = m.group(1) if m else ''
++            print('[probe] ' + line.rstrip(), flush=True)
++        elif line.startswith('[wgpu][done]'):
++            t_done = now
++            m = re.search(r'wall_s=([0-9.]+)', line)
++            wall = float(m.group(1)) if m else None
++            print('[probe] ' + line.rstrip(), flush=True)
++        elif line.startswith('[wgpu][fallback]'):
++            fallbacks += 1
++            print('[probe] ' + line.rstrip(), flush=True)
++
++        if t_done and len(samples) > 5:
++            pass
++    p.wait()
++    _stop.set()
++    smi.close()
++
++    # 只取窗口内的采样
++    win = [s for s in samples if (t_start is None or s[0] >= t_start) and (t_done is None or s[0] <= t_done)]
++    if not win:
++        print('[probe] 没采到窗口内样本，无法判定', flush=True)
++        return 2
++
++    util = sorted(s[1] for s in win)
++    memu = sorted(s[2] for s in win)
++    n = len(util)
++    q = lambda v, f: v[min(n - 1, int(f * n))]
++    avg = sum(util) / n
++    print('', flush=True)
++    print('窗口        %.2f s（%d 个采样 / 100 ms）' % ((t_done - t_start) if t_start and t_done else 0, n), flush=True)
++    print('backend     %s   wall_s=%s   fallbacks=%d' % (backend, wall, fallbacks), flush=True)
++    print('GPU 占用    均值 %.1f%%  P50 %.1f%%  P90 %.1f%%  峰值 %.0f%%' % (avg, q(util, .5), q(util, .9), util[-1]), flush=True)
++    print('显存带宽    均值 %.1f%%  P90 %.1f%%' % (sum(memu) / n, q(memu, .9)), flush=True)
++    print('显存占用    %.0f MiB（峰值）' % max(s[3] for s in win), flush=True)
++    if samples:
++        tot = (samples[-1][0] - samples[0][0]) or 1e-9
++        busy = sum(t[1] / 100.0 * 0.1 for t in samples)
++        print('整进程      %.1f s，其中 GPU 忙碌约 %.1f s（%.1f%%；含 R 场/叠加等所有 GPU 段）'
++              % (tot, busy, 100.0 * busy / tot), flush=True)
++
++    ok = (q(util, .9) >= a.min_p90) and fallbacks == 0 and backend == 'canvas'
++    print('', flush=True)
++    print('GPU-PROBE: %s' % ('PASS' if ok else 'FAIL'), flush=True)
++    if not ok:
++        print('  判据：P90 ≥ %.0f%%、backend=canvas、fallbacks=0' % a.min_p90, flush=True)
++    return 0 if ok else 1
++
++
++if __name__ == '__main__':
++    sys.exit(main())
+--- a/selftest_disk_guard.py
++++ b/selftest_disk_guard.py
+@@ -0,0 +1,92 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++"""磁盘预检自测（随包发布）：不需要素材，几秒钟跑完。
++
++用法：  python selftest_disk_guard.py
++"""
++import pathlib
++import shutil
++import sys
++
++HERE = pathlib.Path(__file__).resolve().parent
++sys.path[:0] = [str(HERE / "pydeps"), str(HERE), str(HERE / "core"),
++                str(HERE / "gpudeps")]
++
++import pws  # noqa: E402
++
++
++class _Log:
++    def __init__(self):
++        self.msgs = []
++
++    def __call__(self, m):
++        self.msgs.append(str(m))
++
++
++def _with_free(bytes_free, fn):
++    real = shutil.disk_usage
++    shutil.disk_usage = lambda p: shutil._ntuple_diskusage(  # noqa: SLF001
++        9 * 2 ** 30, 9 * 2 ** 30 - bytes_free, bytes_free)
++    try:
++        return fn()
++    finally:
++        shutil.disk_usage = real
++
++
++def main() -> int:
++    ok = True
++    frames = [str(pathlib.Path(__file__).resolve())]   # 任意存在的文件
++    out = HERE
++
++    # 1) 空间充足：不报错，且日志里带「个平面」
++    log = _Log()
++    try:
++        _with_free(50 * 2 ** 30, lambda: pws._check_disk_space(
++            frames, out, 1.0, log, n_ch=3, px=26_000_000))
++        line = log.msgs[-1]
++        print("  空间充足 ->", line)
++        if "个平面" not in line or "可用" not in line:
++            print("  [FAIL] 日志格式不符合预期")
++            ok = False
++    except SystemExit as e:
++        print("  [FAIL] 空间充足却报错：", e)
++        ok = False
++
++    # 2) 空间不足：必须拦截，且提示里带需要的 GB 与平面数
++    log = _Log()
++    try:
++        _with_free(1 * 2 ** 30, lambda: pws._check_disk_space(
++            frames, out, 2.0, log, n_ch=3, px=26_000_000))
++        print("  [FAIL] 空间不足没有拦截")
++        ok = False
++    except SystemExit as e:
++        msg = str(e)
++        print("  空间不足 ->", msg.splitlines()[0])
++        if "磁盘空间不足" not in msg or "个平面" not in msg:
++            print("  [FAIL] 提示内容不符合预期")
++            ok = False
++
++    # 3) 通道数确实参与估算：1 个平面 vs 6 个平面，需求应差约 4 倍
++    def need(n_ch):
++        log = _Log()
++        try:
++            _with_free(500 * 2 ** 30, lambda: pws._check_disk_space(
++                frames, out, 2.0, log, n_ch=n_ch, px=26_000_000,
++                rgb=(n_ch > 1)))
++        except SystemExit:
++            pass
++        txt = log.msgs[-1]
++        return float(txt.split("预计需要 ")[1].split(" GB")[0])
++
++    n1, n6 = need(1), need(3)
++    print("  估算：1 平面 %.2f GB，6 平面 %.2f GB" % (n1, n6))
++    if not (n6 > n1 * 2.5):
++        print("  [FAIL] 平面数没有体现在估算里")
++        ok = False
++
++    print("DISK-GUARD-OK" if ok else "DISK-GUARD-FAIL")
++    return 0 if ok else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+--- a/selftest_mono_isolation.py
++++ b/selftest_mono_isolation.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++"""彩机 ↔ 黑白隔离自测（随包发布）：不需要素材，几秒钟跑完。
++
++检查三件事：
++  1. 黑白流程里「满月帧补偿」(detail_snr) 一律为 0；
++  2. 彩机流程里它照常生效；
++  3. 离开彩机流程会清掉 CFA 相关环境变量。
++
++用法：  python selftest_mono_isolation.py
++"""
++import os
++import pathlib
++import sys
++
++HERE = pathlib.Path(__file__).resolve().parent
++sys.path[:0] = [str(HERE / "pydeps"), str(HERE), str(HERE / "core"),
++                str(HERE / "gpudeps")]
++
++import pws  # noqa: E402
++
++
++class _P:
++    detail_snr = 1.0
++
++
++def main() -> int:
++    ok = True
++    saved = dict(pws._CFA)
++
++    # 1) 黑白：pattern 为空 -> beta 必须为 0
++    pws._CFA['pattern'] = None
++    b_mono = pws._detail_beta(_P())
++    print("  黑白 detail_snr=1 -> beta = %.3f" % b_mono)
++    if b_mono != 0.0:
++        print("  [FAIL] 黑白流程仍然吃到了 beta")
++        ok = False
++
++    # 2) 彩机：pattern 非空 -> 照常生效
++    pws._CFA['pattern'] = 'RGGB'
++    b_cfa = pws._detail_beta(_P())
++    print("  彩机 detail_snr=1 -> beta = %.3f" % b_cfa)
++    if abs(b_cfa - 1.0) > 1e-12:
++        print("  [FAIL] 彩机流程里 beta 没生效")
++        ok = False
++
++    # 3) 环境变量清理
++    keys = ("DWT_DETAIL_SNR", "DWT_CFA_CHANNELS", "DWT_CFA_K", "DWT_CFA_RAW")
++    for k in keys:
++        os.environ[k] = "1"
++    pws._clear_cfa_env()
++    left = [k for k in keys if k in os.environ]
++    print("  清理后残留：", left or "无")
++    if left:
++        print("  [FAIL] 环境变量没清干净")
++        ok = False
++
++    pws._CFA.update(saved)
++    print("MONO-ISOLATION-OK" if ok else "MONO-ISOLATION-FAIL")
++    return 0 if ok else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+--- a/core/gpu_wgpu_img.py
++++ b/core/gpu_wgpu_img.py
+@@ -0,0 +1,151 @@
++"""R 场的可分离滤波搬到 wgpu（box / max / gauss）。
++
++R 场本身是平滑的支撑掩膜，真正贵的是三个邻域原语（全幅 6248×4176 时各约 1~3 s，
++叠加起来占 `build_r_field` 的大头）。它们都是可分离的：先横一遍再竖一遍。
++这里用同一个 WGSL 内核（kind 0=box、1=max、2=gauss）跑两遍，省掉 scipy 的
++内存来回拷贝，也让 GPU 在配准之后、叠加之前就有活干。
++
++对外只暴露三个函数，入参出参都是 float32 ndarray、形状不变；
++任何异常都抛给调用方，由 `core/pws.py` 决定是否回退到 scipy。
++"""
++
++from __future__ import annotations
++
++import math
++import os
++import sys
++from pathlib import Path
++from typing import Optional
++
++import numpy as np
++
++_GPUD = Path(__file__).resolve().parent.parent / 'gpudeps'
++if _GPUD.is_dir() and str(_GPUD) not in sys.path:
++    sys.path.insert(0, str(_GPUD))
++
++_WGSL = """
++struct Q { w: u32, h: u32, r: u32, kind: u32, vert: u32, p0: u32, p1: u32, p2: u32 };
++
++@group(0) @binding(0) var<uniform> Q_: Q;
++@group(0) @binding(1) var<storage, read> src: array<f32>;
++@group(0) @binding(2) var<storage, read_write> dst: array<f32>;
++@group(0) @binding(3) var<storage, read> wt: array<f32>;
++
++@compute @workgroup_size(64)
++fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
++  let n = Q_.w * Q_.h;
++  let i = gid.x;
++  if (i >= n) { return; }
++  let y = i / Q_.w;
++  let x = i % Q_.w;
++  let r = i32(Q_.r);
++  var s = 0.0;
++  var m = src[i];
++  let horiz = Q_.vert == 0u;
++  for (var k = -r; k <= r; k = k + 1) {
++    var yy = i32(y);
++    var xx = i32(x);
++    if (horiz) { xx = clamp(xx + k, 0, i32(Q_.w) - 1); }
++    else { yy = clamp(yy + k, 0, i32(Q_.h) - 1); }
++    let v = src[u32(yy) * Q_.w + u32(xx)];
++    if (Q_.kind == 0u) { s = s + v; }
++    else if (Q_.kind == 1u) { m = max(m, v); }
++    else { s = s + v * wt[u32(k + r)]; }
++  }
++  if (Q_.kind == 0u) { dst[i] = s / f32(2 * r + 1); }
++  else if (Q_.kind == 1u) { dst[i] = m; }
++  else { dst[i] = s; }
++}
++"""
++
++_cache = {}
++
++
++def _dev():
++    if 'dev' in _cache:
++        return _cache['dev'], _cache['queue'], _cache['pipe'], _cache['bgl']
++    import wgpu
++    ad = wgpu.gpu.request_adapter_sync(power_preference='high-performance')
++    dev = ad.request_device_sync()
++    sm = dev.create_shader_module(code=_WGSL)
++    bgl = dev.create_bind_group_layout(entries=[
++        {'binding': 0, 'visibility': wgpu.ShaderStage.COMPUTE,
++         'buffer': {'type': wgpu.BufferBindingType.uniform}},
++        {'binding': 1, 'visibility': wgpu.ShaderStage.COMPUTE,
++         'buffer': {'type': wgpu.BufferBindingType.read_only_storage}},
++        {'binding': 2, 'visibility': wgpu.ShaderStage.COMPUTE,
++         'buffer': {'type': wgpu.BufferBindingType.storage}},
++        {'binding': 3, 'visibility': wgpu.ShaderStage.COMPUTE,
++         'buffer': {'type': wgpu.BufferBindingType.read_only_storage}},
++    ])
++    pipe = dev.create_compute_pipeline(layout=dev.create_pipeline_layout(bind_group_layouts=[bgl]),
++                                       compute={'module': sm, 'entry_point': 'main'})
++    _cache.update(dev=dev, queue=dev.queue, pipe=pipe, bgl=bgl)
++    return dev, dev.queue, pipe, bgl
++
++
++def _run(a: np.ndarray, radius: int, kind: int, vert: bool,
++         wt: Optional[np.ndarray] = None) -> np.ndarray:
++    import wgpu
++    a = np.ascontiguousarray(a, np.float32)
++    h, w = a.shape
++    n = h * w
++    dev, queue, pipe, bgl = _dev()
++    U = wgpu.BufferUsage
++
++    def sbuf(size):
++        return dev.create_buffer(size=max(16, int(size)), usage=U.STORAGE | U.COPY_SRC | U.COPY_DST)
++
++    bs = sbuf(n * 4); queue.write_buffer(bs, 0, memoryview(a))
++    bd = sbuf(n * 4)
++    r = int(radius)
++    wk = wt if wt is not None else np.zeros(1, np.float32)
++    bw = sbuf(max(16, len(wk) * 4)); queue.write_buffer(bw, 0, memoryview(np.ascontiguousarray(wk, np.float32)))
++    q = np.zeros(8, np.uint32)
++    q[0], q[1], q[2], q[3] = w, h, r, kind
++    q[4] = 1 if vert else 0
++    bu = dev.create_buffer(size=32, usage=U.UNIFORM | U.COPY_DST)
++    queue.write_buffer(bu, 0, memoryview(q))
++
++    bg = dev.create_bind_group(layout=bgl, entries=[
++        {'binding': 0, 'resource': {'buffer': bu, 'offset': 0, 'size': 32}},
++        {'binding': 1, 'resource': {'buffer': bs, 'offset': 0, 'size': n * 4}},
++        {'binding': 2, 'resource': {'buffer': bd, 'offset': 0, 'size': n * 4}},
++        {'binding': 3, 'resource': {'buffer': bw, 'offset': 0, 'size': max(16, len(wk) * 4)}},
++    ])
++    enc = dev.create_command_encoder()
++    cp = enc.begin_compute_pass()
++    cp.set_pipeline(pipe)
++    cp.set_bind_group(0, bg)
++    cp.dispatch_workgroups(max(1, (n + 63) // 64))
++    cp.end()
++    queue.submit([enc.finish()])
++    out = np.frombuffer(dev.queue.read_buffer(bd), np.float32, count=n).reshape(h, w)
++    return np.array(out, np.float32, copy=True)
++
++
++def box_blur(a: np.ndarray, radius: int) -> np.ndarray:
++    return _run(_run(a, radius, 0, False), radius, 0, True)
++
++
++def max_filter(a: np.ndarray, radius: int) -> np.ndarray:
++    return _run(_run(a, radius, 1, False), radius, 1, True)
++
++
++def gauss_blur(a: np.ndarray, sigma: float) -> np.ndarray:
++    sig = float(max(1e-3, sigma))
++    r = int(max(1, math.ceil(3.0 * sig)))
++    x = np.arange(-r, r + 1, dtype=np.float64)
++    k = np.exp(-0.5 * (x / sig) ** 2)
++    k /= k.sum()
++    return _run(_run(a, r, 2, False, k.astype(np.float32)),
++                r, 2, True, k.astype(np.float32))
++
++
++def available() -> bool:
++    try:
++        import wgpu  # noqa: F401
++        _dev()
++        return True
++    except Exception:
++        return False
