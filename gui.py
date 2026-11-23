@@ -241,6 +241,8 @@ def _argv_common(c) -> list:
         argv += ["--cfa-weights", c["cfa_weights"]]
     if c.get("cfa_grid", "shared") != "shared":
         argv += ["--cfa-grid", c["cfa_grid"]]
+    if c.get("rgb_balance", "off") != "off":
+        argv += ["--rgb-balance", c["rgb_balance"]]
     if c.get("cfa_align", "auto") != "auto":
         argv += ["--cfa-align", c["cfa_align"]]
     if int(c.get("ref_k", 0) or 0) > 0:
@@ -739,6 +741,11 @@ class App(tk.Tk):
              tk.Checkbutton(adv, text="细节区也按 1/σ² 加权（β=1）",
                             variable=self.v_moon),
              "满月帧超过总帧数的 1/3、或满月那晚明显更锐时再勾；否则保持不勾")
+        self.v_rgbbl = tk.StringVar(value='不平（与 WBPP 一致）')
+        arow(25, "彩色平衡", ttk.Combobox(
+            adv, state="readonly", width=16, textvariable=self.v_rgbbl,
+            values=["不平（与 WBPP 一致）", "加性平衡", "乘性平衡"]),
+             "三通道原来各自归一化，天空水平不同；不平最保色彩，乘性会让饱和星出彩边")
         self.v_twopass = tk.StringVar()
         arow(23, "两遍加权", ttk.Combobox(
             adv, state="readonly", width=16, textvariable=self.v_twopass,
@@ -900,6 +907,8 @@ class App(tk.Tk):
             c.get("cfa_debayer", "bilinear"), "双线性"))
         self.v_jobs.set(str(c.get("jobs", "0")))
         self.v_refk.set(str(c.get("ref_k", 0)))
+        self.v_rgbbl.set({"off": "不平（与 WBPP 一致）", "add": "加性平衡",
+                         "mul": "乘性平衡"}.get(str(c.get("rgb_balance", "off")), "不平（与 WBPP 一致）"))
         self.v_cfag.set({"shared": "共用画布", "own": "逐通道画布"}.get(
             str(c.get("cfa_grid", "shared")), "共用画布"))
         self.v_cfaa.set({"shared": "共用几何", "own": "逐通道独立"}.get(
@@ -964,6 +973,9 @@ class App(tk.Tk):
             "cfa_align": {"自动判断": "auto", "共用几何": "shared",
                           "逐通道独立": "own"}.get(
                 self.v_cfaa.get(), "auto"),
+            "rgb_balance": {"不平（与 WBPP 一致）": "off", "加性平衡": "add",
+                            "乘性平衡": "mul"}.get(
+                self.v_rgbbl.get(), "off"),
             "cfa_grid": {"共用画布": "shared", "逐通道画布": "own"}.get(
                 self.v_cfag.get().strip(), "shared"),
             "cfa": {"关": "off", "自动识别": "auto"}.get(self.v_cfa.get().strip(),
@@ -1365,7 +1377,7 @@ class App(tk.Tk):
         """关于：方法与原文出处（PWS，D.Cikey）"""
         messagebox.showinfo(
             "关于 DWT · Drizzle",
-            "DWT · Drizzle 2.7.80-D\n\n" + LICENSE_TEXT)
+            "DWT · Drizzle 2.7.81-D\n\n" + LICENSE_TEXT)
 
     def show_help(self):
         """打开内置使用说明（不依赖浏览器 / 外部程序）"""

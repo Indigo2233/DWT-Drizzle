@@ -2336,6 +2336,10 @@ def _ca_from_ref(ref: Path, log, n_frames: int = 5):
     return oR, oB
 
 
+class _SkipMerge(Exception):
+    pass
+
+
 def _merge_cfa_rgb(out_dir, stem: str, log) -> None:
     """CFA 三通道成品合成一张 3 通道 XISF（H×W×3，Planar）。
 
@@ -2356,7 +2360,7 @@ def _merge_cfa_rgb(out_dir, stem: str, log) -> None:
             d = d[:, :, 0]
         planes.append(d)
     # ---- 通道间亚像素对齐（色差校正）----
-    if str(os.environ.get('DWT_CFA_CA', '1')).lower() not in ('0', 'off', 'false', 'no') and len(planes) == 3:
+    if (not getattr(_merge_cfa_rgb, '_skip_ca', False)) and             str(os.environ.get('DWT_CFA_CA', '1')).lower() not in ('0', 'off', 'false', 'no') and len(planes) == 3:
         try:
             # 以「成品上量的偏移」为准：参考目录的帧是未叠加的，量不到堆叠引入的
             # 那一部分（实测 R 在成品上还多出 +0.38px 的 x 偏移）。参考目录只作对照。
@@ -2389,13 +2393,23 @@ def _merge_cfa_rgb(out_dir, stem: str, log) -> None:
     # 全剔掉就会出现），np.percentile/median 就会整体返回 NaN，接着
     # R×NaN 把整层 R/B 抹成 NaN（x43 那次三通道只剩 G，就是这个）。
     _sky = [float(np.nanpercentile(p, 25)) for p in planes]
-    if all(np.isfinite(_sky)) and _sky[1] > 1e-12:
+    _bal = str(getattr(_merge_cfa_rgb, '_balance', 'off') or 'off').lower()
+    if _bal == 'mul' and all(np.isfinite(_sky)) and _sky[1] > 1e-12:
+        # 乘性平衡：把 R/B 的天空拉到 G。注意这会同时放大星点——
+        # 若三个通道的饱和星本就都在 1.0 附近，放大后 R/B 会超过 G，
+        # 不同半径先后被显示裁切，星点就出现彩色边（logtest9 那次）。
         _fac = [_sky[1] / max(_sky[i], 1e-12) if i != 1 else 1.0 for i in range(3)]
         planes = [np.asarray(p * _fac[i], dtype=np.float32) for i, p in enumerate(planes)]
-        log(f'[CFA] 通道平衡（天空对齐 G）：R×{_fac[0]:.3f}  B×{_fac[2]:.3f}'
+        log(f'[CFA] 通道平衡（乘性，天空对齐 G）：R×{_fac[0]:.3f}  B×{_fac[2]:.3f}'
+            f'（原始天空 R {_sky[0]:.3e} G {_sky[1]:.3e} B {_sky[2]:.3e}）')
+    elif _bal == 'add' and all(np.isfinite(_sky)):
+        _g = _sky[1]
+        planes = [np.asarray(p - _sky[i] + _g, dtype=np.float32) for i, p in enumerate(planes)]
+        log(f'[CFA] 通道平衡（加性，天空对齐 G）：R{_g - _sky[0]:+.3e}  B{_g - _sky[2]:+.3e}'
             f'（原始天空 R {_sky[0]:.3e} G {_sky[1]:.3e} B {_sky[2]:.3e}）')
     else:
-        log(f'[CFA] 通道平衡跳过（天空估计无效：{_sky}）')
+        log(f'[CFA] 通道平衡关闭（保持各通道原始亮度，与 WBPP 的 ChannelCombination 一致；'
+            f'天空 R {_sky[0]:.3e} G {_sky[1]:.3e} B {_sky[2]:.3e}）')
     # 共同有效区：真 CFA 下 R/B 的覆盖天生比 G 稀，边界上容易「G 有、B 没有」，
     # 直接合并就是一条绿边。三个通道的 _ncov.npy 都在，取交集，谁没覆盖到
     # 就三个通道一起置 NaN（后续自动裁边会把它裁掉）。
@@ -2823,8 +2837,19 @@ def _run(p: PwsParams) -> Dict:
             })
             if multi or cfa_pat:
                 res['stack'] = None      # 成品已落盘；别把每组成品都攒在内存里
-        if cfa_pat:
+        if cfa_pat or _INPUT_FLAGS.get('per_channel'):
             try:
+                # 按通道拆分的输入：每组只叠出一个通道，等三张都在了再合成
+                _pc = bool(_INPUT_FLAGS.get('per_channel'))
+                if _pc:
+                    _mstem = stem[:-2] if stem[-2:] in ('_R', '_G', '_B') else stem
+                    _missing = [c for c in 'RGB'
+                                if not (Path(out_dir) / ('%s_%s.xisf' % (_mstem, c))).exists()]
+                    if _missing:
+                        log('[CFA] 还缺通道 %s，本组先不合成 RGB' % ''.join(_missing))
+                        raise _SkipMerge()
+                else:
+                    _mstem = stem
                 # 彩机参考目录（WBPP debayered）：有就用它估色差，比在成品上估更干净
                 _ref = None
                 try:
@@ -2852,7 +2877,14 @@ def _run(p: PwsParams) -> Dict:
                 if _grid_own:
                     log('[CFA] 逐通道画布：按最小画布裁齐后合成 RGB'
                         '（像素级对齐仍以各通道自己的配准为准）')
-                _merge_cfa_rgb(out_dir, stem, log)
+                _merge_cfa_rgb._skip_ca = bool(_pc)
+                _merge_cfa_rgb._balance = str(getattr(p, 'rgb_balance', 'off') or 'off')
+                if _pc:
+                    log('[CFA] 输入已按通道拆分：合成时跳过色差平移'
+                        '（WBPP 已对齐，再平移会糊边）')
+                _merge_cfa_rgb(out_dir, _mstem, log)
+            except _SkipMerge:
+                pass
             except Exception as e:
                 log(f'[CFA] RGB 合成失败（不影响三个单通道成品）：{e}')
         _CFA['ch'], _CFA['pattern'] = None, None

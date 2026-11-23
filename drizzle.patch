@@ -1412,7 +1412,7 @@
      img.pixel_storage = 'Planar'
      img.fits_keywords = [
          {'name': 'TOTALEXP', 'value': round(sum(m['exptime'] for m in metas), 1),
-@@ -1383,6 +2144,485 @@
+@@ -1383,6 +2144,499 @@
          f'元数据：关键字 {len(img.fits_keywords)}  Property {len(prop_raws)}')
  
  
@@ -1608,6 +1608,10 @@
 +    return oR, oB
 +
 +
++class _SkipMerge(Exception):
++    pass
++
++
 +def _merge_cfa_rgb(out_dir, stem: str, log) -> None:
 +    """CFA 三通道成品合成一张 3 通道 XISF（H×W×3，Planar）。
 +
@@ -1628,7 +1632,7 @@
 +            d = d[:, :, 0]
 +        planes.append(d)
 +    # ---- 通道间亚像素对齐（色差校正）----
-+    if str(os.environ.get('DWT_CFA_CA', '1')).lower() not in ('0', 'off', 'false', 'no') and len(planes) == 3:
++    if (not getattr(_merge_cfa_rgb, '_skip_ca', False)) and             str(os.environ.get('DWT_CFA_CA', '1')).lower() not in ('0', 'off', 'false', 'no') and len(planes) == 3:
 +        try:
 +            # 以「成品上量的偏移」为准：参考目录的帧是未叠加的，量不到堆叠引入的
 +            # 那一部分（实测 R 在成品上还多出 +0.38px 的 x 偏移）。参考目录只作对照。
@@ -1661,13 +1665,23 @@
 +    # 全剔掉就会出现），np.percentile/median 就会整体返回 NaN，接着
 +    # R×NaN 把整层 R/B 抹成 NaN（x43 那次三通道只剩 G，就是这个）。
 +    _sky = [float(np.nanpercentile(p, 25)) for p in planes]
-+    if all(np.isfinite(_sky)) and _sky[1] > 1e-12:
++    _bal = str(getattr(_merge_cfa_rgb, '_balance', 'off') or 'off').lower()
++    if _bal == 'mul' and all(np.isfinite(_sky)) and _sky[1] > 1e-12:
++        # 乘性平衡：把 R/B 的天空拉到 G。注意这会同时放大星点——
++        # 若三个通道的饱和星本就都在 1.0 附近，放大后 R/B 会超过 G，
++        # 不同半径先后被显示裁切，星点就出现彩色边（logtest9 那次）。
 +        _fac = [_sky[1] / max(_sky[i], 1e-12) if i != 1 else 1.0 for i in range(3)]
 +        planes = [np.asarray(p * _fac[i], dtype=np.float32) for i, p in enumerate(planes)]
-+        log(f'[CFA] 通道平衡（天空对齐 G）：R×{_fac[0]:.3f}  B×{_fac[2]:.3f}'
++        log(f'[CFA] 通道平衡（乘性，天空对齐 G）：R×{_fac[0]:.3f}  B×{_fac[2]:.3f}'
++            f'（原始天空 R {_sky[0]:.3e} G {_sky[1]:.3e} B {_sky[2]:.3e}）')
++    elif _bal == 'add' and all(np.isfinite(_sky)):
++        _g = _sky[1]
++        planes = [np.asarray(p - _sky[i] + _g, dtype=np.float32) for i, p in enumerate(planes)]
++        log(f'[CFA] 通道平衡（加性，天空对齐 G）：R{_g - _sky[0]:+.3e}  B{_g - _sky[2]:+.3e}'
 +            f'（原始天空 R {_sky[0]:.3e} G {_sky[1]:.3e} B {_sky[2]:.3e}）')
 +    else:
-+        log(f'[CFA] 通道平衡跳过（天空估计无效：{_sky}）')
++        log(f'[CFA] 通道平衡关闭（保持各通道原始亮度，与 WBPP 的 ChannelCombination 一致；'
++            f'天空 R {_sky[0]:.3e} G {_sky[1]:.3e} B {_sky[2]:.3e}）')
 +    # 共同有效区：真 CFA 下 R/B 的覆盖天生比 G 稀，边界上容易「G 有、B 没有」，
 +    # 直接合并就是一条绿边。三个通道的 _ncov.npy 都在，取交集，谁没覆盖到
 +    # 就三个通道一起置 NaN（后续自动裁边会把它裁掉）。
@@ -1898,7 +1912,7 @@
  def run(p: PwsParams, on_log=None, on_progress=None, should_cancel=None) -> Dict:
      """PWS 引擎的对外唯一入口（界面与命令行都调它）
  
-@@ -1391,6 +2631,7 @@
+@@ -1391,6 +2645,7 @@
      """
      set_hooks(on_log, on_progress, should_cancel)
      try:
@@ -1906,7 +1920,7 @@
          return _run(p)
      finally:
          set_hooks()
-@@ -1406,7 +2647,7 @@
+@@ -1406,7 +2661,7 @@
      photos = (p.photos or '').strip()
      if not photos:
          raise SystemExit('请选择素材（目录或单张帧）')
@@ -1915,7 +1929,7 @@
      if not (p.out or '').strip():
          raise SystemExit('请选择输出目录（不放在素材目录里，避免成品被当成帧）')
      out_dir = Path(p.out)
-@@ -1414,34 +2655,312 @@
+@@ -1414,34 +2669,330 @@
  
      _emit('读帧', 0.0, '读头分组')
      groups = group_frames_by_filter(frames)
@@ -2099,8 +2113,19 @@
 +            })
 +            if multi or cfa_pat:
 +                res['stack'] = None      # 成品已落盘；别把每组成品都攒在内存里
-+        if cfa_pat:
++        if cfa_pat or _INPUT_FLAGS.get('per_channel'):
 +            try:
++                # 按通道拆分的输入：每组只叠出一个通道，等三张都在了再合成
++                _pc = bool(_INPUT_FLAGS.get('per_channel'))
++                if _pc:
++                    _mstem = stem[:-2] if stem[-2:] in ('_R', '_G', '_B') else stem
++                    _missing = [c for c in 'RGB'
++                                if not (Path(out_dir) / ('%s_%s.xisf' % (_mstem, c))).exists()]
++                    if _missing:
++                        log('[CFA] 还缺通道 %s，本组先不合成 RGB' % ''.join(_missing))
++                        raise _SkipMerge()
++                else:
++                    _mstem = stem
 +                # 彩机参考目录（WBPP debayered）：有就用它估色差，比在成品上估更干净
 +                _ref = None
 +                try:
@@ -2128,7 +2153,14 @@
 +                if _grid_own:
 +                    log('[CFA] 逐通道画布：按最小画布裁齐后合成 RGB'
 +                        '（像素级对齐仍以各通道自己的配准为准）')
-+                _merge_cfa_rgb(out_dir, stem, log)
++                _merge_cfa_rgb._skip_ca = bool(_pc)
++                _merge_cfa_rgb._balance = str(getattr(p, 'rgb_balance', 'off') or 'off')
++                if _pc:
++                    log('[CFA] 输入已按通道拆分：合成时跳过色差平移'
++                        '（WBPP 已对齐，再平移会糊边）')
++                _merge_cfa_rgb(out_dir, _mstem, log)
++            except _SkipMerge:
++                pass
 +            except Exception as e:
 +                log(f'[CFA] RGB 合成失败（不影响三个单通道成品）：{e}')
 +        _CFA['ch'], _CFA['pattern'] = None, None
@@ -2240,7 +2272,7 @@
  
  def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 out_dir: Path, stem: str) -> Dict:
-@@ -1449,10 +2968,12 @@
+@@ -1449,10 +3000,12 @@
      完整流程（读帧→星表→R 场→叠加→导出），成品文件主名由 stem 给出。"""
      # 参数别名：算法体统一从 PwsParams 取值
      A, B = float(p.A), float(p.B)
@@ -2253,7 +2285,7 @@
      rej_gate = float(p.rej_gate)                  # 剔除比例上限（默认 1/3）
      limit = int(p.limit) or None
      crop, keep_frames, frames_dir = int(p.crop), bool(p.keep_frames), p.frames_dir
-@@ -1463,9 +2984,46 @@
+@@ -1463,9 +3016,46 @@
  
      # ---- 阶段 0：读帧 + 帧级归一（自动选驻留 / memmap）----
      center = resolve_center(frames, crop, parse_center(p.center))
@@ -2302,7 +2334,7 @@
      metas = fs.metas
      skies = fs.skies
      # 量纲回乘：内部一切计算都在 EXPTIME_REF 基准上（权重/排异全是比值，不受影响），
-@@ -1479,6 +3037,18 @@
+@@ -1479,6 +3069,18 @@
      # S_i = σ_中位 / σ_i（归一化后测 → 曝光差异已被吸收，可直接跨帧比）
      sig = fs.sigma
      S = np.median(sig) / np.maximum(sig, 1e-30)
@@ -2321,7 +2353,7 @@
      sig_out = sig * scale_out          # 展示与落盘量纲 = 成品量纲（内部仍用 sig 算比值）
      log(f'[S] 单帧信噪比权重（σ_中位/σ_i）{S.min():.3f}~{S.max():.3f}  中位 {np.median(S):.3f}')
      log(f'[σ] 逐帧噪声 {sig_out.min():.4e}~{sig_out.max():.4e}'
-@@ -1486,40 +3056,165 @@
+@@ -1486,40 +3088,165 @@
  
      # ---- 阶段 A：C_i（星点 FWHM，开源 fit_fwhm）----
      # 先用最干净的一帧建固定星表（星表位置对全部帧共用）
@@ -2493,7 +2525,7 @@
          f' {np.nanmin(fwhms):.2f}~{np.nanmax(fwhms):.2f}px  中位 {fmed:.2f}px  '
          f'{time.perf_counter() - t1:.1f}s')
      log(f'[C] 清晰度权重（FWHM_中位/FWHM_i）{C.min():.3f}~{C.max():.3f}')
-@@ -1556,9 +3251,22 @@
+@@ -1556,9 +3283,22 @@
                  _check_cancel()
                  lam1[i], pas[i] = fs.trail(i, stars, sigma_psf)
  
@@ -2517,7 +2549,7 @@
      idx = np.argsort(np.nan_to_num(fwhms, nan=1e9))[:k]
  
      if star_grow_pct > 0:
-@@ -1586,88 +3294,1015 @@
+@@ -1586,88 +3326,1015 @@
      else:
          log('[拖线] 星点锐帧扩展已关闭（0%）')
  
@@ -3591,7 +3623,7 @@
      log(f'[W] 单帧最大权重（条带均值）{np.mean(wmax):.3f}  '
          f'等权份额 = {1.0:.3f} → 最大独占约 {np.mean(wmax):.1f}× 份额')
      log(f'[叠加] 完成 {time.perf_counter() - t2:.1f}s  排异剔除率 {rej_rate:.3%}')
-@@ -1688,11 +4323,56 @@
+@@ -1688,11 +4355,56 @@
          log(f'[读数] {name:<18} 占 {msk.mean():6.2%}  N_eff 中位 '
              f'{np.median(neff[msk]):5.2f}  σ {sd:.4e}')
  
@@ -3651,7 +3683,7 @@
  
      res = {
          'n': n, 'shape': Stk.shape, 'fwhms': fwhms, 'C': C, 'S': S, 'sigma': sig_out,
-@@ -1700,27 +4380,146 @@
+@@ -1700,27 +4412,146 @@
          'R_info': rinfo, 'neff': neff, 'rej_rate': float(rej_rate),
          'A': A, 'B': B, 'rej_k': rej_k, 'stars': stars,
          'metas': metas, 'skies': skies, 'scale_out': float(scale_out),
@@ -3802,7 +3834,7 @@
  
      log(f'[时] 总计 {time.perf_counter() - t_start:.1f}s')
      _emit('输出', 1.0, '完成')
-@@ -1750,13 +4549,23 @@
+@@ -1750,13 +4581,23 @@
                              choices=[v for _, v in prm.choices], help=text)
          else:
              ap.add_argument(flag, default=default, help=text)
@@ -3826,7 +3858,7 @@
      try:
          run(p)
      except Cancelled:
-@@ -1764,5 +4573,82 @@
+@@ -1764,5 +4605,82 @@
      return 0
  
  
@@ -3925,7 +3957,7 @@
      frames_dir: str = ''
      keep_frames: bool = False
  
-@@ -54,21 +60,71 @@
+@@ -54,21 +60,72 @@
      crop: int = 0
      center: str = ''
      B: float = 2.0
@@ -3947,6 +3979,7 @@
 +    cfa_ref: str = ''               # 彩机参考目录（WBPP debayered），空=自动扫描
 +    cfa_raw: str = 'auto'           # auto|on|off：真 CFA（不插值，按颜色投样本）
 +    cfa_align: str = 'auto'
++    rgb_balance: str = 'off'
 +    cfa_grid: str = 'shared'
 +    ref_k: int = 0   # shared=三通道共用画布；own=各通道自己定画布         # auto|shared|own：彩机三通道对齐方式
 +
@@ -3998,7 +4031,7 @@
            '用「添加目录 / 添加单张」加入多个来源（一行一个，行尾「×」移除，「清空」一键移除）；'
            '重复声明的文件只算一帧。同一目标不同夜晚的帧可以混叠。'
            '混合滤镜的素材会按文件头（FILTER）自动分组，各滤镜独立叠加、各自出一张成品。'),
-@@ -85,9 +141,24 @@
+@@ -85,9 +142,24 @@
            '细节区愿意用多少信噪比换解析力',
            '唯一需要标定的参数，也是本方法唯一"可调风格"的旋钮。'
            'R=1 处的权重为 C^A，A 越大越偏向锐帧。'
@@ -4024,7 +4057,7 @@
      Param('rej_k', '排异强度 k', 'float', '标准',
            '剔除单帧异常像元（卫星、宇宙线、热噪）',
            '逐像素跨帧|偏差|超过 阈值 = k×1.4826×MAD + m·R·信号（信号 = 比较基准−天空）的帧判为离群剔除；'
-@@ -101,6 +172,28 @@
+@@ -101,6 +173,28 @@
            '0 = 全部（正式出图用这个）。>0 用于先在小样本上试参数，'
            '注意这不是"挑好帧"：帧的取舍由权重在叠加内部完成。',
            lo=0, hi=100000, step=1),
@@ -4053,7 +4086,7 @@
      Param('frames_dir', '帧落盘目录', 'dir', '标准',
            '帧多到装不进内存时的临时帧文件位置',
            '留空 = 自动挑盘（需 1.25× 余量）：优先软件所在目录 _DWT_frames'
-@@ -113,6 +206,54 @@
+@@ -113,6 +207,54 @@
            '注意：无论是否勾选，每次叠加都会重新读取源帧并重新落盘，勾选并不省落盘时间。'),
  
      # ---------------- 高级 ----------------
@@ -4108,7 +4141,7 @@
      Param('crop', '裁剪边长', 'int', '高级',
            '只叠画面中间 N×N 像素',
            '0 = 全幅（正式出图）。>0 只用于快速试参数：裁剪后帧小、跑得快，'
-@@ -142,6 +283,65 @@
+@@ -142,6 +284,71 @@
            '把 R 收得更紧',
            '1.0 即推荐值。>1 收窄支撑（R 更贴核心），<1 放宽。',
            lo=0.25, hi=4.0, step=0.05, dec=2),
@@ -4142,6 +4175,12 @@
 +    Param('ref_k', '参考像帧数', 'int', '高级', '建 R 场参考像用的最锐帧数（0=自动：G 用 8，R/B 用 16）',
 +          '参考像越干净，σ_psf 量得越准；R/B 采样少，帧数给小了会把 PSF 估糊、成品发虚。',
 +          lo=0, hi=64, step=1),
++    Param('rgb_balance', '彩色通道平衡', 'choice', '高级',
++          '三个通道各自归一化叠加，天空水平天然不同，合色时要不要拉平',
++          'off=不平，与 WBPP 的 ChannelCombination 一致，星点颜色最稳（默认）；'
++          'add=加性平到 G 的天空，星点亮度不变，适合需要背景中性时用；'
++          'mul=乘性平（天空与星点一起放大），饱和星容易出现彩色边，慎用。',
++          choices=(('不平（与 WBPP 一致）', 'off'), ('加性平衡', 'add'), ('乘性平衡', 'mul'))),
 +    Param('cfa_grid', '彩机画布', 'choice', '高级',
 +          '共用画布 = 三通道像素级对齐（推荐）；逐通道画布 = 各通道按自己的配准定画布',
 +          '逐通道画布下三通道画布尺寸/原点可能差 1~2 像素，本版不做 RGB 合成，'
@@ -4174,7 +4213,7 @@
      Param('star_grow_pct', '星点锐帧扩展', 'float', '高级',
            '按实测拖线长度自动外扩星点锐帧区',
            '100% = 用实测值（默认）：逐帧量星点长轴方差，相减得到拖线长度，'
-@@ -160,12 +360,114 @@
+@@ -160,12 +367,114 @@
            '在信噪比最好的一帧上一次性选星（未饱和、孤立、最亮），'
            '之后所有帧量同一批位置。中位数在 100 颗以上已稳定；星太少的视场可调小。',
            lo=20, hi=600, step=10),
@@ -11934,7 +11973,7 @@
 +            'wmax': float(cov.max()) if cov.size else 0.0}
 --- a/gui.py
 +++ b/gui.py
-@@ -0,0 +1,1727 @@
+@@ -0,0 +1,1739 @@
 +# -*- coding: utf-8 -*-
 +"""DWT + Drizzle 图形界面
 +
@@ -12178,6 +12217,8 @@
 +        argv += ["--cfa-weights", c["cfa_weights"]]
 +    if c.get("cfa_grid", "shared") != "shared":
 +        argv += ["--cfa-grid", c["cfa_grid"]]
++    if c.get("rgb_balance", "off") != "off":
++        argv += ["--rgb-balance", c["rgb_balance"]]
 +    if c.get("cfa_align", "auto") != "auto":
 +        argv += ["--cfa-align", c["cfa_align"]]
 +    if int(c.get("ref_k", 0) or 0) > 0:
@@ -12676,6 +12717,11 @@
 +             tk.Checkbutton(adv, text="细节区也按 1/σ² 加权（β=1）",
 +                            variable=self.v_moon),
 +             "满月帧超过总帧数的 1/3、或满月那晚明显更锐时再勾；否则保持不勾")
++        self.v_rgbbl = tk.StringVar(value='不平（与 WBPP 一致）')
++        arow(25, "彩色平衡", ttk.Combobox(
++            adv, state="readonly", width=16, textvariable=self.v_rgbbl,
++            values=["不平（与 WBPP 一致）", "加性平衡", "乘性平衡"]),
++             "三通道原来各自归一化，天空水平不同；不平最保色彩，乘性会让饱和星出彩边")
 +        self.v_twopass = tk.StringVar()
 +        arow(23, "两遍加权", ttk.Combobox(
 +            adv, state="readonly", width=16, textvariable=self.v_twopass,
@@ -12837,6 +12883,8 @@
 +            c.get("cfa_debayer", "bilinear"), "双线性"))
 +        self.v_jobs.set(str(c.get("jobs", "0")))
 +        self.v_refk.set(str(c.get("ref_k", 0)))
++        self.v_rgbbl.set({"off": "不平（与 WBPP 一致）", "add": "加性平衡",
++                         "mul": "乘性平衡"}.get(str(c.get("rgb_balance", "off")), "不平（与 WBPP 一致）"))
 +        self.v_cfag.set({"shared": "共用画布", "own": "逐通道画布"}.get(
 +            str(c.get("cfa_grid", "shared")), "共用画布"))
 +        self.v_cfaa.set({"shared": "共用几何", "own": "逐通道独立"}.get(
@@ -12901,6 +12949,9 @@
 +            "cfa_align": {"自动判断": "auto", "共用几何": "shared",
 +                          "逐通道独立": "own"}.get(
 +                self.v_cfaa.get(), "auto"),
++            "rgb_balance": {"不平（与 WBPP 一致）": "off", "加性平衡": "add",
++                            "乘性平衡": "mul"}.get(
++                self.v_rgbbl.get(), "off"),
 +            "cfa_grid": {"共用画布": "shared", "逐通道画布": "own"}.get(
 +                self.v_cfag.get().strip(), "shared"),
 +            "cfa": {"关": "off", "自动识别": "auto"}.get(self.v_cfa.get().strip(),
@@ -13302,7 +13353,7 @@
 +        """关于：方法与原文出处（PWS，D.Cikey）"""
 +        messagebox.showinfo(
 +            "关于 DWT · Drizzle",
-+            "DWT · Drizzle 2.7.80-D\n\n" + LICENSE_TEXT)
++            "DWT · Drizzle 2.7.81-D\n\n" + LICENSE_TEXT)
 +
 +    def show_help(self):
 +        """打开内置使用说明（不依赖浏览器 / 外部程序）"""

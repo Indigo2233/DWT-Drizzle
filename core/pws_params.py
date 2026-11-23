@@ -78,6 +78,7 @@ class PwsParams:
     cfa_ref: str = ''               # 彩机参考目录（WBPP debayered），空=自动扫描
     cfa_raw: str = 'auto'           # auto|on|off：真 CFA（不插值，按颜色投样本）
     cfa_align: str = 'auto'
+    rgb_balance: str = 'off'
     cfa_grid: str = 'shared'
     ref_k: int = 0   # shared=三通道共用画布；own=各通道自己定画布         # auto|shared|own：彩机三通道对齐方式
 
@@ -313,6 +314,12 @@ PARAMS: Tuple[Param, ...] = (
     Param('ref_k', '参考像帧数', 'int', '高级', '建 R 场参考像用的最锐帧数（0=自动：G 用 8，R/B 用 16）',
           '参考像越干净，σ_psf 量得越准；R/B 采样少，帧数给小了会把 PSF 估糊、成品发虚。',
           lo=0, hi=64, step=1),
+    Param('rgb_balance', '彩色通道平衡', 'choice', '高级',
+          '三个通道各自归一化叠加，天空水平天然不同，合色时要不要拉平',
+          'off=不平，与 WBPP 的 ChannelCombination 一致，星点颜色最稳（默认）；'
+          'add=加性平到 G 的天空，星点亮度不变，适合需要背景中性时用；'
+          'mul=乘性平（天空与星点一起放大），饱和星容易出现彩色边，慎用。',
+          choices=(('不平（与 WBPP 一致）', 'off'), ('加性平衡', 'add'), ('乘性平衡', 'mul'))),
     Param('cfa_grid', '彩机画布', 'choice', '高级',
           '共用画布 = 三通道像素级对齐（推荐）；逐通道画布 = 各通道按自己的配准定画布',
           '逐通道画布下三通道画布尺寸/原点可能差 1~2 像素，本版不做 RGB 合成，'
