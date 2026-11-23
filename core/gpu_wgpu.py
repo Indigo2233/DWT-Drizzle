@@ -110,6 +110,14 @@ def _device():
     adapter = wgpu.gpu.request_adapter_sync(power_preference='high-performance')
     if adapter is None:
         raise RuntimeError('wgpu 找不到可用显卡')
+    # 没有独显/集显时，Windows 的 WARP、Linux 的 lavapipe 这类**软件适配器**也会被枚举到。
+    # 它们在 CPU 上跑模拟 GPU，比直接走我们的 numpy 分带还慢一个数量级，必须拒绝。
+    try:
+        _at = str((adapter.info or {}).get('adapter_type', '')).lower()
+    except Exception:
+        _at = ''
+    if _at in ('cpu', 'software', 'virtual_cpu') or not _at:
+        raise RuntimeError('只找到软件适配器（%s），没有可用的硬件 GPU' % (_at or '未知'))
     dev = adapter.request_device_sync()
     mod = dev.create_shader_module(code=_WGSL)
     pipe = dev.create_compute_pipeline(
