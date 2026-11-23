@@ -588,8 +588,21 @@ class App(tk.Tk):
                                             pady=(0 if r == 0 else 6, 0))
             widget.grid(row=r, column=1, sticky="ew" if r >= 4 else "w",
                         pady=(0 if r == 0 else 6, 0))
-            ttk.Label(adv, text=tip, foreground="#9ca3af", font=FONT_S).grid(
-                row=r, column=2, sticky="w", padx=12, pady=(0 if r == 0 else 6, 0))
+            _tl = ttk.Label(adv, text=tip, foreground="#9ca3af", font=FONT_S,
+                            wraplength=_px(430), justify="left")
+            _tl.grid(row=r, column=2, sticky="w", padx=12, pady=(0 if r == 0 else 6, 0))
+            try:
+                adv.grid_columnconfigure(0, weight=0)
+                adv.grid_columnconfigure(1, weight=1, minsize=_px(200))
+                adv.grid_columnconfigure(2, weight=0)
+            except Exception:
+                pass
+
+        def _pathrow(parent):
+            _f = ttk.Frame(parent)
+            _f.grid_columnconfigure(0, weight=1)
+            _f.grid_columnconfigure(1, weight=0)
+            return _f
 
         sp_bg = ttk.Spinbox(adv, from_=0, to=2, increment=1, width=6, textvariable=self.v_bgdeg)
         arow(0, "背景梯度", sp_bg, "0 关 / 1 平面（推荐）/ 2 二阶")
@@ -600,13 +613,15 @@ class App(tk.Tk):
              "空/0 = 全场；2 = 只作用星点")
         arow(3, "FWHM 上限", ttk.Entry(adv, textvariable=self.v_fwhm, width=8),
              "0/空 = 不筛（一般用 A 就够）")
-        fr_x = ttk.Frame(adv)
-        ttk.Entry(fr_x, textvariable=self.v_xdrz).pack(side="left", fill="x", expand=True)
-        ttk.Button(fr_x, text="浏览…", width=8, command=self._pick_xdrz).pack(side="left", padx=(8, 0))
+        fr_x = _pathrow(adv)
+        _bx = ttk.Button(fr_x, text="浏览…", width=8, command=self._pick_xdrz)
+        _bx.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        ttk.Entry(fr_x, textvariable=self.v_xdrz).grid(row=0, column=0, sticky="ew")
         arow(4, "几何目录", fr_x, "WBPP 的 .xdrz 目录（跨夜旋转建议填）")
-        fr_m = ttk.Frame(adv)
-        ttk.Entry(fr_m, textvariable=self.v_match).pack(side="left", fill="x", expand=True)
-        ttk.Button(fr_m, text="浏览…", width=8, command=self._pick_match).pack(side="left", padx=(8, 0))
+        fr_m = _pathrow(adv)
+        _bm = ttk.Button(fr_m, text="浏览…", width=8, command=self._pick_match)
+        _bm.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        ttk.Entry(fr_m, textvariable=self.v_match).grid(row=0, column=0, sticky="ew")
         arow(5, "裁切参考", fr_m, "可选：叠完另存 _match.xisf")
         sp_fl = ttk.Spinbox(adv, from_=0, to=4, increment=0.5, width=6,
                             textvariable=self.v_flux)
@@ -619,10 +634,10 @@ class App(tk.Tk):
         sp_bgr = ttk.Spinbox(adv, from_=0, to=4, increment=2, width=6, textvariable=self.v_bgr)
         arow(8, "径向背景", sp_bgr,
              "0 关 / 2 拟 r² / 4 拟 r²+r⁴（抓渐晕与平场残差）")
-        fr_fr = ttk.Frame(adv)
-        ttk.Entry(fr_fr, textvariable=self.v_frame).pack(side="left", fill="x", expand=True)
-        ttk.Button(fr_fr, text="浏览…", width=8,
-                   command=self._pick_frame).pack(side="left", padx=(8, 0))
+        fr_fr = _pathrow(adv)
+        _bf = ttk.Button(fr_fr, text="载入…", width=8, command=self._pick_frame)
+        _bf.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        ttk.Entry(fr_fr, textvariable=self.v_frame).grid(row=0, column=0, sticky="ew")
         arow(9, "输出网格", fr_fr,
              "填 master：成品宽高/朝向与它一致（不用再事后裁切）")
         cb_gpu = ttk.Combobox(adv, values=["自动", "只用 CPU", "只用 GPU（CUDA）",
@@ -689,10 +704,10 @@ class App(tk.Tk):
                                     textvariable=self.v_jobs),
              "0 = 自动（核数一半、最多 8）；内存带宽紧张时调小更稳（实测 6 最好，11 反而慢）")
         self.v_cfa_ref = tk.StringVar()
-        _rf = tk.Frame(adv, bg=BG)
-        ttk.Entry(_rf, textvariable=self.v_cfa_ref).pack(side="left", fill="x", expand=True)
-        ttk.Button(_rf, text="浏览...", width=8,
-                   command=self._pick_cfa_ref).pack(side="left", padx=(6, 0))
+        _rf = _pathrow(adv)
+        _brf = ttk.Button(_rf, text="浏览...", width=8, command=self._pick_cfa_ref)
+        _brf.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        ttk.Entry(_rf, textvariable=self.v_cfa_ref).grid(row=0, column=0, sticky="ew")
         arow(18, "彩机参考目录", _rf,
              "WBPP 的 debayered 目录，留空自动扫描；只用来估通道色差，叠加仍用原始 CFA 帧")
         self.v_cfaraw = tk.StringVar()
@@ -1350,7 +1365,7 @@ class App(tk.Tk):
         """关于：方法与原文出处（PWS，D.Cikey）"""
         messagebox.showinfo(
             "关于 DWT · Drizzle",
-            "DWT · Drizzle 2.7.60-D\n\n" + LICENSE_TEXT)
+            "DWT · Drizzle 2.7.61-D\n\n" + LICENSE_TEXT)
 
     def show_help(self):
         """打开内置使用说明（不依赖浏览器 / 外部程序）"""
