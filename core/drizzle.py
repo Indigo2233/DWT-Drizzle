@@ -212,7 +212,7 @@ def _robust(v: np.ndarray) -> Tuple[float, np.ndarray]:
     return float(np.median(v[k])), k
 
 
-def _detect_stars(img, n: int = 80, bin_: int = 2) -> np.ndarray:
+def _detect_stars(img, n: int = 240, bin_: int = 2) -> np.ndarray:
     """快速星点检测（2× 分箱，够用于角度测量）→ (n,2) 的 (x, y)，本机像素"""
     from photutils.detection import DAOStarFinder
     a = np.asarray(img, np.float32)
@@ -242,6 +242,16 @@ def _detect_stars(img, n: int = 80, bin_: int = 2) -> np.ndarray:
     x = np.asarray(t[cx_], np.float64)
     y = np.asarray(t[cy_], np.float64)
     p = np.asarray(t['peak'], np.float64)
+    # 只用「能当锚点」的星：贴边的（越界、warp 后不可靠）和全场最亮的一撮
+    # （饱和、拖尾、两块混合）都要剔掉。少这步时锚点全是最亮星，质心偏差
+    # 直接进匹配，稀疏场里会把「错开几像素」的解也凑成够数（就是双影的来源）。
+    hh0, ww0 = a.shape
+    _m = (x > 4) & (x < ww0 - 5) & (y > 4) & (y < hh0 - 5)
+    if len(p):
+        _pm = float(np.max(p))
+        if _pm > 0:
+            _m &= (p < 0.90 * _pm)
+    x, y, p = x[_m], y[_m], p[_m]
     o = np.argsort(p)[::-1][:n]
     # 分箱图上第 i 块的中心对应原图 (i+0.5)·bin−0.5；少了这半步，检测点相对
     # 质心(_centroid) 恒偏 −0.5px，正交帧之间会被放大成 1px 系统偏差

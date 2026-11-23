@@ -124,6 +124,13 @@ def solve(src_pts, ref_pts, max_pts=48, tol=0.03, inlier_px=2.5, log=None,
     if best is None:
         return None
     n_in, s, R, t = best
+    # 同一套光学的两帧之间不可能有 2% 以上的尺度差；历史上出现过 0.4348 这种
+    # 伪解（三角形碰巧相似），它一旦被采纳，整帧会被当成放大/缩小 2.3 倍对齐，
+    # 叠出来就是星点脱线。宁可不认，交给平移兜底。
+    if not (0.98 <= float(s) <= 1.02):
+        if log:
+            log('  [三角] 尺度 %.4f 不符合同一光路（应在 1±2%%），放弃该解' % float(s))
+        return None
     # 用内点重解一次，收紧精度
     q = (s * (R @ src_pts.T)).T + t
     d, idx = cKDTree(ref_all).query(q, distance_upper_bound=inlier_px)

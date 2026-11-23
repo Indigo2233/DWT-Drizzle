@@ -4397,7 +4397,7 @@
 +    return bool(detect_pattern(meta))
 --- a/core/drizzle.py
 +++ b/core/drizzle.py
-@@ -0,0 +1,2223 @@
+@@ -0,0 +1,2233 @@
 +"""Drizzle 重采样层（PWS 的几何层）
 +
 +把 PWS 阶段 C 的"唯一一次加权平均（式 12）"换成**带权 drizzle 累积**，从而在
@@ -4612,7 +4612,7 @@
 +    return float(np.median(v[k])), k
 +
 +
-+def _detect_stars(img, n: int = 80, bin_: int = 2) -> np.ndarray:
++def _detect_stars(img, n: int = 240, bin_: int = 2) -> np.ndarray:
 +    """快速星点检测（2× 分箱，够用于角度测量）→ (n,2) 的 (x, y)，本机像素"""
 +    from photutils.detection import DAOStarFinder
 +    a = np.asarray(img, np.float32)
@@ -4642,6 +4642,16 @@
 +    x = np.asarray(t[cx_], np.float64)
 +    y = np.asarray(t[cy_], np.float64)
 +    p = np.asarray(t['peak'], np.float64)
++    # 只用「能当锚点」的星：贴边的（越界、warp 后不可靠）和全场最亮的一撮
++    # （饱和、拖尾、两块混合）都要剔掉。少这步时锚点全是最亮星，质心偏差
++    # 直接进匹配，稀疏场里会把「错开几像素」的解也凑成够数（就是双影的来源）。
++    hh0, ww0 = a.shape
++    _m = (x > 4) & (x < ww0 - 5) & (y > 4) & (y < hh0 - 5)
++    if len(p):
++        _pm = float(np.max(p))
++        if _pm > 0:
++            _m &= (p < 0.90 * _pm)
++    x, y, p = x[_m], y[_m], p[_m]
 +    o = np.argsort(p)[::-1][:n]
 +    # 分箱图上第 i 块的中心对应原图 (i+0.5)·bin−0.5；少了这半步，检测点相对
 +    # 质心(_centroid) 恒偏 −0.5px，正交帧之间会被放大成 1px 系统偏差
@@ -7447,7 +7457,7 @@
 +    return info
 --- a/core/trireg.py
 +++ b/core/trireg.py
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,148 @@
 +# -*- coding: utf-8 -*-
 +"""三角形（asterism）配准：对旋转、尺度、平移全免疫，不依赖初始猜测。
 +
@@ -7574,6 +7584,13 @@
 +    if best is None:
 +        return None
 +    n_in, s, R, t = best
++    # 同一套光学的两帧之间不可能有 2% 以上的尺度差；历史上出现过 0.4348 这种
++    # 伪解（三角形碰巧相似），它一旦被采纳，整帧会被当成放大/缩小 2.3 倍对齐，
++    # 叠出来就是星点脱线。宁可不认，交给平移兜底。
++    if not (0.98 <= float(s) <= 1.02):
++        if log:
++            log('  [三角] 尺度 %.4f 不符合同一光路（应在 1±2%%），放弃该解' % float(s))
++        return None
 +    # 用内点重解一次，收紧精度
 +    q = (s * (R @ src_pts.T)).T + t
 +    d, idx = cKDTree(ref_all).query(q, distance_upper_bound=inlier_px)
@@ -12992,7 +13009,7 @@
 +        """关于：方法与原文出处（PWS，D.Cikey）"""
 +        messagebox.showinfo(
 +            "关于 DWT · Drizzle",
-+            "DWT · Drizzle 2.7.68-D\n\n" + LICENSE_TEXT)
++            "DWT · Drizzle 2.7.69-D\n\n" + LICENSE_TEXT)
 +
 +    def show_help(self):
 +        """打开内置使用说明（不依赖浏览器 / 外部程序）"""
