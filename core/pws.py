@@ -424,6 +424,24 @@ def filter_stackable_frames(files: List[Path], allow_aligned: bool = False):
     return keep, n_kind, n_reg
 
 
+_INPUT_FLAGS = {'per_channel': False}
+_CH_PATH_RE = re.compile(r'(?:^|__)([RGB])$')
+
+
+def _channel_from_path(f: Path) -> str:
+    """从路径判断这一帧是不是"已按通道拆分"的单色帧（WBPP registered/__R 之类）。
+
+    这类目录里 R/G/B 各自是独立文件，像素已经是解过马赛克的结果，
+    绝不能再当拜耳马赛克按 2×2 相位取样。
+    """
+    for seg in reversed(f.parts[:-1]):
+        m = _CH_PATH_RE.search(seg)
+        if m:
+            return m.group(1)
+    m = _CH_PATH_RE.search(f.stem)
+    return m.group(1) if m else ''
+
+
 def group_frames_by_filter(files: List[Path]) -> Dict[str, List[Path]]:
     """按帧头滤镜名分组（分组叠加第一步）。
 
@@ -442,6 +460,11 @@ def group_frames_by_filter(files: List[Path]) -> Dict[str, List[Path]]:
             name = read_filter_hint(f)
         except Exception:
             pass
+        if not name:
+            _ch = _channel_from_path(f)
+            if _ch:
+                name = _ch
+                _INPUT_FLAGS['per_channel'] = True
         groups.setdefault(name, []).append(f)
     log(f'[分组] 读头 {len(files)} 帧 {time.perf_counter() - t0:.1f}s → '
         f'{len(groups)} 组：'
@@ -1871,9 +1894,8 @@ def _task_trail(job) -> Tuple[int, float, float]:
 
 def _task_strip(job):
     """一条带的权重 + 排异 + 加权平均（与串行的三段调用完全同序同式）"""
-    y0, y1, Rr, C, S, A, B, rej_k, sky0, rej_gate, T, fp = job
-    _beta = _detail_beta(p)          # 黑白流程恒为 0
-    W = strip_weights(C, S, Rr, A, B, T=T, fp=fp, beta=_beta)
+    y0, y1, Rr, C, S, A, B, rej_k, sky0, rej_gate, T, fp, beta = job
+    W = strip_weights(C, S, Rr, A, B, T=T, fp=fp, beta=float(beta))
     mm, off = _MEM['mm'], _MEM['off']
     D = np.stack([mm[i, y0:y1] - np.float32(off[i]) for i in range(len(C))])
     s, ne, rr = stack_strip(D, W, Rr, sky0, rej_k=rej_k, rej_max_frac=rej_gate)
@@ -2665,7 +2687,12 @@ def _run(p: PwsParams) -> Dict:
             probe_meta, probe_shape = {}, ()
         if len(probe_shape) == 3:
             raise SystemExit('素材已经是 3 通道彩图（解过马赛克），不需要 --cfa')
-        if want_pat in _cfa.PATTERNS:
+        if _INPUT_FLAGS.get('per_channel'):
+            log('[CFA] 输入已按通道拆分（每帧是解过马赛克的单色帧）：各通道单独叠加，'
+                '不再按拜耳马赛克取样（否则 R/B 只能拿到 1/4 样本，出现网格与横纹）')
+            cfa_pat = ''
+            want_pat = ''
+        elif want_pat in _cfa.PATTERNS:
             cfa_pat = want_pat
         else:
             cfa_pat = _cfa.detect_pattern(probe_meta)
@@ -3339,7 +3366,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     # 用 scale=1、pixfrac=1；再上采样等于要 4 倍的帧数，否则信噪比直接掉一半。
     # 实测（M81 12 帧、G 通道）：scale1/pix1 → 原生 FWHM 3.04px、N_eff 7.5；
     # scale2/pix1 → 3.02px、N_eff 4.7（分辨率没涨、等效帧数砍掉 37%）。
-    if bool(getattr(p, 'cfa', 'off') and str(getattr(p, 'cfa', 'off')) != 'off'):
+    if _CFA.get('pattern'):
         if drz_s > 1.0 + 1e-9:
             # 只提示、不再擅自改 pixfrac：pixfrac*scale 才是液滴边长，缩到 1/scale
             # 等于液滴只有 1 个输出像素，CFA 下会留下 3/4 的空洞（覆盖率掉、信噪比塌）。
@@ -4226,8 +4253,9 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 #   map 保序 → 行段落位与两个浮点累加都与串行同序
                 ex = ProcessPoolExecutor(max_workers=nw, initializer=ini, initargs=ini_args)
                 try:
+                    _beta_st = float(_detail_beta(p))
                     jobs = ((y0, min(h, y0 + strip), R[y0:y0 + strip], C, S, A, B, rej_k,
-                             fs.sky0, rej_gate, T, fp)
+                             fs.sky0, rej_gate, T, fp, _beta_st)
                             for y0 in range(0, h, strip))
                     for k, (s, ne, rr, wm) in enumerate(ex.map(_task_strip, jobs, chunksize=1)):
                         _check_cancel()
