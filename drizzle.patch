@@ -11334,7 +11334,7 @@
 +            'wmax': float(cov.max()) if cov.size else 0.0}
 --- a/gui.py
 +++ b/gui.py
-@@ -0,0 +1,1698 @@
+@@ -0,0 +1,1712 @@
 +# -*- coding: utf-8 -*-
 +"""DWT + Drizzle 图形界面
 +
@@ -11847,8 +11847,8 @@
 +        self.v_A = tk.StringVar()
 +        self.v_rejk = tk.StringVar()
 +        self.v_nstar = tk.StringVar()
-+        self.v_limit = tk.StringVar()
-+        self.v_crop = tk.StringVar()
++        self.v_limit = tk.StringVar(value="0")
++        self.v_crop = tk.StringVar(value="0")
 +
 +        def cell(parent, col, label, var, width, tip):
 +            ttk.Label(parent, text=label).grid(row=0, column=col * 2, sticky="w",
@@ -11914,7 +11914,13 @@
 +        self.v_frame = tk.StringVar()
 +        self.v_gpu = tk.StringVar()
 +
++        _rowno = [0]
++
 +        def arow(r, label, widget, tip):
++            # 行号自增，忽略传入的 r：历史上多处手写了重复行号，
++            # 把「几何目录 / 输出网格 / 彩机参考」的浏览按钮盖掉了。
++            r = _rowno[0]
++            _rowno[0] += 1
 +            ttk.Label(adv, text=label).grid(row=r, column=0, sticky="w", padx=(0, 8),
 +                                            pady=(0 if r == 0 else 6, 0))
 +            widget.grid(row=r, column=1, sticky="ew" if r >= 4 else "w",
@@ -12190,8 +12196,8 @@
 +        self.v_A.set(c["A"])
 +        self.v_rejk.set(c["rej_k"])
 +        self.v_nstar.set(c["n_star"])
-+        self.v_limit.set(c["limit"])
-+        self.v_crop.set(c["crop"])
++        self.v_limit.set("0")          # 限帧不记忆：每次启动都从整组开始
++        self.v_crop.set("0")            # 裁剪边长同理，默认整幅
 +        self.v_drz.set(bool(c["drizzle"]))
 +        self.v_scale.set(c["scale"])
 +        self.v_pix.set(c["pix"])
@@ -12525,8 +12531,16 @@
 +                    break
 +            cur = var.get().strip()
 +            prev = self._auto_paths.get(key, "")
++            # 也算「自动值」的情况：路径已不存在，或者它本身就叫 registered/debayered
++            # （重启后 prev 是空的，若不这样判断，换了素材目录也不会刷新）
++            _cur_looks_auto = False
++            if cur:
++                try:
++                    _cur_looks_auto = (not Path(cur).is_dir()) or                         (Path(cur).name.lower() in ("registered", "debayered"))
++                except Exception:
++                    _cur_looks_auto = False
 +            if found is not None:
-+                if cur == "" or cur == prev:
++                if cur == "" or cur == prev or _cur_looks_auto:
 +                    var.set(str(found))
 +                    self._auto_paths[key] = str(found)
 +                    self._log_line("[界面] 已自动识别并填入%s：%s" % (hint, found))
@@ -12673,7 +12687,7 @@
 +        """关于：方法与原文出处（PWS，D.Cikey）"""
 +        messagebox.showinfo(
 +            "关于 DWT · Drizzle",
-+            "DWT · Drizzle 2.7.58-D\n\n" + LICENSE_TEXT)
++            "DWT · Drizzle 2.7.60-D\n\n" + LICENSE_TEXT)
 +
 +    def show_help(self):
 +        """打开内置使用说明（不依赖浏览器 / 外部程序）"""
