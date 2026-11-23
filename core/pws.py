@@ -4150,7 +4150,13 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                                 T=T, fp=float(fp), log=log,
                                 pattern=None, channel=None)
                             try:
-                                _r.setdefault('ncov', _r.get('cov'))
+                                # cropcover.crop_box 要的是「每像素被多少帧覆盖」的计数图；
+                                # fatom 返回的 cov 是权重和（< 帧数、边缘更小），直接当计数
+                                # 会把自动裁边压成几十像素见方。这里按「有样本=满覆盖」构造计数，
+                                # 边缘只 1~2 帧覆盖处也给满值，结果是裁得略宽松（安全方向）。
+                                _st = _r.get('stack')
+                                _n = float(len(dx))
+                                _r['ncov'] = ((np.isfinite(_st) & (_st > 0)).astype(np.float32) * _n)
                                 _r.setdefault('rej_rate', 0.0)
                                 _r.setdefault('wmax', 0.0)
                             except Exception:
