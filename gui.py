@@ -1014,7 +1014,10 @@ class App(tk.Tk):
             self.ch_names.append(c["name"])
             v = tk.BooleanVar(value=(not _want) or (c["name"] in _want))
             self.ch_vars.append(v)
-            tk.Checkbutton(self.fr_ch, text="☑ %s   ·   %d 帧" % (c["label"], c["n"]),
+            _lab = str(c["label"])
+            if _lab.isdigit() or not _lab.strip():
+                _lab = "通道 %s" % _lab if _lab.isdigit() else "未标滤镜"
+            tk.Checkbutton(self.fr_ch, text="%s   ·   %d 帧" % (_lab, c["n"]),
                            variable=v, command=self._sync_check_glyph,
                            bg=CARD, activebackground=CARD, selectcolor="#ffffff",
                            anchor="w", relief="flat", bd=0, highlightthickness=0,
@@ -1320,7 +1323,7 @@ class App(tk.Tk):
         """关于：方法与原文出处（PWS，D.Cikey）"""
         messagebox.showinfo(
             "关于 DWT · Drizzle",
-            "DWT · Drizzle 2.7.55-D\n\n" + LICENSE_TEXT)
+            "DWT · Drizzle 2.7.56-D\n\n" + LICENSE_TEXT)
 
     def show_help(self):
         """打开内置使用说明（不依赖浏览器 / 外部程序）"""
