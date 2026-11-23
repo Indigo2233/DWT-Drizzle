@@ -136,7 +136,7 @@ class RoundButton(tk.Canvas):
             return ACCENT_D if self._hover else ACCENT
         if self._kind == 'danger':
             return '#fff1f0' if self._hover else CARD
-        return '#f0f0f3' if self._hover else CARD
+        return '#ececf0' if self._hover else '#f6f6f8'
 
     def _fg(self):
         if self._kind == 'primary':
@@ -146,7 +146,7 @@ class RoundButton(tk.Canvas):
         return FG
 
     def _outline(self):
-        return ACCENT if self._kind == 'primary' else BORDER
+        return ACCENT if self._kind == 'primary' else '#d2d2d8'
 
     def _repaint(self):
         self.itemconfigure(self._shape, fill=self._fill())
@@ -174,3 +174,115 @@ class RoundButton(tk.Canvas):
     def set_state(self, enabled: bool):
         self.configure(cursor='' if enabled else 'arrow')
         self.itemconfigure(self._txt, fill=self._fg() if enabled else '#c7c7cc')
+
+
+class SegTabs(tk.Frame):
+    """分段控件（胶囊）+ 内容区，替代 ttk.Notebook。
+
+    用法与 Notebook 对齐：add(page, text=...)、select(page)。
+    page 必须是本控件的子控件（gui.py 里就是 `tk.Frame(self.nb)`）。
+    """
+
+    def __init__(self, master, bg=None, **kw):
+        _bg = bg or BG
+        super().__init__(master, bg=_bg, **kw)
+        self._bg = _bg
+        try:
+            self._s = max(1.0, self.winfo_fpixels('1i') / 96.0)
+        except Exception:
+            self._s = 1.0
+        self._pages = []          # [(page, title, seg_index)]
+        self._cur = None
+        self._bar = tk.Canvas(self, bg=_bg, highlightthickness=0, height=self._p(46))
+        self._bar.pack(fill='x', padx=self._p(10), pady=(self._p(6), self._p(2)))
+        self._bar.bind('<Button-1>', self._on_click)
+        self._hot = -1
+        self._last_w = 0
+        self._bar.bind('<Motion>', self._on_motion)
+        self._bar.bind('<Configure>', self._on_resize)
+
+    def _p(self, v):
+        return int(round(v * self._s))
+
+    def _fn(self, v):
+        return max(7, int(round(v * self._s)))
+
+    # --- 数据 -------------------------------------------------------
+    def add(self, page, text=''):
+        self._pages.append([page, text, 0])
+        page.pack_forget()
+        if self._cur is None:
+            self.select(page)
+        self._draw()
+        return page
+
+    def select(self, page=None):
+        if page is None:
+            return self._cur
+        for p, _t, _i in self._pages:
+            if p is page:
+                self._cur = p
+                for q, _t2, _i2 in self._pages:
+                    if q is not p:
+                        q.pack_forget()
+                p.pack(fill='both', expand=True, padx=self._p(10), pady=(0, self._p(10)))
+        self._draw()
+        return page
+
+    # --- 绘制 -------------------------------------------------------
+    def _geom(self):
+        W = max(self._bar.winfo_width(), 200)
+        n = max(1, len(self._pages))
+        pad = self._p(4)
+        seg_w = min(self._p(150), max(self._p(96), (W - pad * 2) // n))
+        h = self._p(36)
+        y0 = (self._p(46) - h) // 2
+        return W, n, pad, seg_w, h, y0
+
+    def _on_resize(self, e):
+        # 只在宽度真正变化时重画，避免「画内容 → 触发 Configure → 再画」的死循环
+        if abs(e.width - self._last_w) >= 2:
+            self._last_w = e.width
+            self._draw()
+
+    def _draw(self):
+        c = self._bar
+        c.delete('all')
+        if not self._pages:
+            return
+        W, n, pad, seg_w, h, y0 = self._geom()
+        total = seg_w * n
+        cx0 = max(0, (W - total) // 2)
+        round_rect(c, cx0, y0, cx0 + total, y0 + h, self._p(10),
+                   fill='#ececf0', outline=BORDER, width=1)
+        cur = next((i for i, (_p, _t, _) in enumerate(self._pages) if _p is self._cur), 0)
+        for i, (_p, title, _x) in enumerate(self._pages):
+            x0 = cx0 + i * seg_w
+            if i == cur:
+                round_rect(c, x0 + 2, y0 + 2, x0 + seg_w - 2, y0 + h - 2, self._p(9),
+                           fill=CARD, outline='#d8d8dd', width=1)
+            elif i == self._hot:
+                round_rect(c, x0 + 2, y0 + 2, x0 + seg_w - 2, y0 + h - 2, self._p(9),
+                           fill='#f4f4f7', outline='', width=0)
+            c.create_text(x0 + seg_w / 2, y0 + h / 2, text=title,
+                          fill=(FG if i == cur else FG2),
+                          font=('Segoe UI Variable Display', self._fn(9)))
+
+    def _hit(self, x):
+        W, n, pad, seg_w, h, y0 = self._geom()
+        total = seg_w * n
+        cx0 = max(0, (W - total) // 2)
+        if x < cx0 or x >= cx0 + total:
+            return -1
+        return min(n - 1, int((x - cx0) // seg_w))
+
+    def _on_motion(self, e):
+        i = self._hit(e.x)
+        if i != self._hot:
+            self._hot = i
+            self._draw()
+
+    def _on_click(self, e):
+        i = self._hit(e.x)
+        if 0 <= i < len(self._pages):
+            self.select(self._pages[i][0])

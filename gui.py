@@ -375,7 +375,7 @@ class App(tk.Tk):
         self.bar = tk.Frame(self, bg=BG)
         self.bar.pack(side="bottom", fill="x", padx=10, pady=(0, 8))
 
-        self.nb = ttk.Notebook(self)
+        self.nb = ui_round.SegTabs(self)
         self.nb.pack(fill="both", expand=True, padx=10, pady=(8, 10))
 
         # 小屏幕/高 DPI 下内容放不下 → 整页可滚动（滚轮 + 右侧滚动条）
@@ -395,7 +395,7 @@ class App(tk.Tk):
                 scrollregion=c.bbox("all")))
             def _fit_page(e, c=cv, w=win):
                 # 正文最大 _px(1100) 并水平居中：大屏不再把输入框拉成一整条
-                _wd = min(e.width, _px(1100))
+                _wd = min(e.width, _px(1280))
                 c.coords(w, max(0, (e.width - _wd) // 2), 0)
                 c.itemconfigure(w, width=_wd)
             cv.bind("<Configure>", _fit_page)
@@ -480,6 +480,10 @@ class App(tk.Tk):
                         lambda e: self.cv_ch.configure(scrollregion=self.cv_ch.bbox("all")))
         self.cv_ch.bind("<Configure>",
                         lambda e: self.cv_ch.itemconfigure(self.ch_win, width=e.width))
+        self._ch_hint = tk.Label(self.fr_ch, bg=CARD, fg="#9aa0a6",
+                                 text="点「扫描通道」列出可叠的通道（不选 = 全部）",
+                                 font=FONT_S, anchor="w")
+        self._ch_hint.grid(row=0, column=0, sticky="w", padx=2, pady=4)
         self.ch_names: list = []
         self.ch_vars: list = []
 
@@ -745,7 +749,7 @@ class App(tk.Tk):
         # 日志
         lg = ui_round.RoundCard(body_log, text="日志", padding=_px(12), radius=_px(18), dark=True) if ui_round else ttk.Labelframe(body_log, text=" 日志 ", padding=6)
         lg.pack(fill="both", expand=True, pady=(10, 0))
-        self.txt = tk.Text(lg, height=16, bg="#0f172a", fg="#cbd5e1", insertbackground="#cbd5e1",
+        self.txt = tk.Text(lg, height=16, bg="#0f1520", fg="#cbd5e1", insertbackground="#cbd5e1",
                            font=("Consolas", 9), relief="flat", wrap="none", padx=8, pady=6)
         vs = ttk.Scrollbar(lg, orient="vertical", command=self.txt.yview)
         self.txt.configure(yscrollcommand=vs.set)
@@ -1310,7 +1314,7 @@ class App(tk.Tk):
         """关于：方法与原文出处（PWS，D.Cikey）"""
         messagebox.showinfo(
             "关于 DWT · Drizzle",
-            "DWT · Drizzle 2.7.53-D\n\n" + LICENSE_TEXT)
+            "DWT · Drizzle 2.7.54-D\n\n" + LICENSE_TEXT)
 
     def show_help(self):
         """打开内置使用说明（不依赖浏览器 / 外部程序）"""
