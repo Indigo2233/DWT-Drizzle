@@ -2575,7 +2575,7 @@
      idx = np.argsort(np.nan_to_num(fwhms, nan=1e9))[:k]
  
      if star_grow_pct > 0:
-@@ -1586,88 +3352,1015 @@
+@@ -1586,88 +3352,1023 @@
      else:
          log('[拖线] 星点锐帧扩展已关闭（0%）')
  
@@ -2881,11 +2881,19 @@
 +            try:
 +                _refv = np.asarray(
 +                    __import__('xisf_io').read_xisf(_frame_ref)[0].data, np.float64)
++                try:
++                    _MISC['ref_median'] = float(np.nanmedian(_refv))
++                except Exception:
++                    pass
 +                if _refv.ndim == 3:
 +                    # WBPP 合过色的 master 是 3 通道；matchref 只吃 2 维，
 +                    # 直接喂进去会抛异常，被外层兜住，「输出网格」就静默失效。
 +                    _refv = _refv.mean(axis=2)
 +                    log('[网格] 参考图是 RGB，按三通道平均折成亮度当网格参考')
++                try:
++                    _MISC['ref_median'] = float(np.nanmedian(_refv))
++                except Exception:
++                    pass
 +                _seed_img = np.asarray(_reg.frame(int(seed)), np.float64)
 +                _c0 = tuple(int(v) for v in _MISC.get('crop_origin', (0, 0)))
 +                _seed_align = _seed_img
@@ -3649,7 +3657,7 @@
      log(f'[W] 单帧最大权重（条带均值）{np.mean(wmax):.3f}  '
          f'等权份额 = {1.0:.3f} → 最大独占约 {np.mean(wmax):.1f}× 份额')
      log(f'[叠加] 完成 {time.perf_counter() - t2:.1f}s  排异剔除率 {rej_rate:.3%}')
-@@ -1688,11 +4381,56 @@
+@@ -1688,11 +4389,56 @@
          log(f'[读数] {name:<18} 占 {msk.mean():6.2%}  N_eff 中位 '
              f'{np.median(neff[msk]):5.2f}  σ {sd:.4e}')
  
@@ -3709,7 +3717,7 @@
  
      res = {
          'n': n, 'shape': Stk.shape, 'fwhms': fwhms, 'C': C, 'S': S, 'sigma': sig_out,
-@@ -1700,27 +4438,146 @@
+@@ -1700,27 +4446,180 @@
          'R_info': rinfo, 'neff': neff, 'rej_rate': float(rej_rate),
          'A': A, 'B': B, 'rej_k': rej_k, 'stars': stars,
          'metas': metas, 'skies': skies, 'scale_out': float(scale_out),
@@ -3746,6 +3754,40 @@
 +        if _vfrac < 0.5:
 +            log('[输出] 注意：只有 %.1f%% 像素有数据，边缘大片为空（前面可加「自动裁边」）'
 +                % (_vfrac * 100.0))
++        # 可选：把成品天空标定到「输出网格」参考图（WBPP master）的同一量级，
++        # 便于和 PI 的成品直接对比亮度。默认关，保持与输入帧同一量纲。
++        _ms = bool(getattr(p, 'match_scale', False))
++        _rm = float(_MISC.get('ref_median', 0.0) or 0.0)
++        if _ms and _rm <= 0:
++            # --aligned 模式不走参考网格匹配，_MISC 里没有 ref_median，
++            # 直接读一次 --frame 指定的参考图拿天空中位。
++            _fr = str(getattr(p, 'frame', '') or '')
++            if _fr:
++                try:
++                    _rv = np.asarray(
++                        __import__('xisf_io').read_xisf(_fr)[0].data, np.float64)
++                    _rm = float(np.nanmedian(_rv))
++                except Exception:
++                    _rm = 0.0
++        if _ms and _rm > 0:
++            try:
++                _om = float(np.nanmedian(Stk[np.isfinite(Stk)]))
++                if _om > 0:
++                    _k = _rm / _om
++                    Stk *= np.float32(_k)
++                    scale_out *= _k
++                    log('[量纲] 按参考图标定：×%.4f（天空 %.6g → %.6g）'
++                        % (_k, _om, _om * _k))
++            except Exception as _e:
++                log('[量纲] 参考图标定跳过（%s）' % _e)
++        try:
++            _sat = int(np.count_nonzero(np.isfinite(Stk) & (Stk >= 0.99)))
++            if _sat:
++                log('[输出] 提示：成品有 %d 个像素 ≥0.99（%.4f%%），这些星点核心在输入帧里'
++                    '已经饱和，叠加无法恢复；可缩短单张曝光或用 --match-scale 与参考图对齐量级'
++                    % (_sat, 100.0 * _sat / float(Stk.size)))
++        except Exception:
++            pass
          save_linear_xisf(p_out, Stk, metas,
                           f'PWS A={A:g} B={B:g} rej_k={rej_k:g}',
                           diag={'A': A, 'B': B, 'RejK': rej_k, 'RejGate': rej_gate,
@@ -3860,7 +3902,7 @@
  
      log(f'[时] 总计 {time.perf_counter() - t_start:.1f}s')
      _emit('输出', 1.0, '完成')
-@@ -1750,13 +4607,23 @@
+@@ -1750,13 +4649,23 @@
                              choices=[v for _, v in prm.choices], help=text)
          else:
              ap.add_argument(flag, default=default, help=text)
@@ -3884,7 +3926,7 @@
      try:
          run(p)
      except Cancelled:
-@@ -1764,5 +4631,82 @@
+@@ -1764,5 +4673,82 @@
      return 0
  
  
@@ -3983,7 +4025,7 @@
      frames_dir: str = ''
      keep_frames: bool = False
  
-@@ -54,21 +60,72 @@
+@@ -54,21 +60,73 @@
      crop: int = 0
      center: str = ''
      B: float = 2.0
@@ -4038,6 +4080,7 @@
 +    ln: bool = False
 +    xdrz: str = ''
 +    match: str = ''
++    match_scale: bool = False
  
  
  # 界面显示顺序 == 本表顺序
@@ -4057,7 +4100,7 @@
            '用「添加目录 / 添加单张」加入多个来源（一行一个，行尾「×」移除，「清空」一键移除）；'
            '重复声明的文件只算一帧。同一目标不同夜晚的帧可以混叠。'
            '混合滤镜的素材会按文件头（FILTER）自动分组，各滤镜独立叠加、各自出一张成品。'),
-@@ -85,9 +142,24 @@
+@@ -85,9 +143,24 @@
            '细节区愿意用多少信噪比换解析力',
            '唯一需要标定的参数，也是本方法唯一"可调风格"的旋钮。'
            'R=1 处的权重为 C^A，A 越大越偏向锐帧。'
@@ -4083,7 +4126,7 @@
      Param('rej_k', '排异强度 k', 'float', '标准',
            '剔除单帧异常像元（卫星、宇宙线、热噪）',
            '逐像素跨帧|偏差|超过 阈值 = k×1.4826×MAD + m·R·信号（信号 = 比较基准−天空）的帧判为离群剔除；'
-@@ -101,6 +173,28 @@
+@@ -101,6 +174,28 @@
            '0 = 全部（正式出图用这个）。>0 用于先在小样本上试参数，'
            '注意这不是"挑好帧"：帧的取舍由权重在叠加内部完成。',
            lo=0, hi=100000, step=1),
@@ -4112,7 +4155,7 @@
      Param('frames_dir', '帧落盘目录', 'dir', '标准',
            '帧多到装不进内存时的临时帧文件位置',
            '留空 = 自动挑盘（需 1.25× 余量）：优先软件所在目录 _DWT_frames'
-@@ -113,6 +207,54 @@
+@@ -113,6 +208,54 @@
            '注意：无论是否勾选，每次叠加都会重新读取源帧并重新落盘，勾选并不省落盘时间。'),
  
      # ---------------- 高级 ----------------
@@ -4167,7 +4210,7 @@
      Param('crop', '裁剪边长', 'int', '高级',
            '只叠画面中间 N×N 像素',
            '0 = 全幅（正式出图）。>0 只用于快速试参数：裁剪后帧小、跑得快，'
-@@ -142,6 +284,71 @@
+@@ -142,6 +285,71 @@
            '把 R 收得更紧',
            '1.0 即推荐值。>1 收窄支撑（R 更贴核心），<1 放宽。',
            lo=0.25, hi=4.0, step=0.05, dec=2),
@@ -4239,7 +4282,7 @@
      Param('star_grow_pct', '星点锐帧扩展', 'float', '高级',
            '按实测拖线长度自动外扩星点锐帧区',
            '100% = 用实测值（默认）：逐帧量星点长轴方差，相减得到拖线长度，'
-@@ -160,12 +367,114 @@
+@@ -160,12 +368,117 @@
            '在信噪比最好的一帧上一次性选星（未饱和、孤立、最亮），'
            '之后所有帧量同一批位置。中位数在 100 颗以上已稳定；星太少的视场可调小。',
            lo=20, hi=600, step=10),
@@ -4313,6 +4356,9 @@
 +          '正好对应原始标定帧的像素，可以拿来直接做 drizzle。'
 +          '留空 = 由 DWT 自己从星点测位移/旋转/尺度。',
 +          lo=0.0, hi=0.0, step=0.0, dec=0),
++    Param('match_scale', '按参考图标定亮度（与 WBPP master 同量级）', 'bool', '高级',
++          '勾选后把成品天空中位缩放到「输出网格」参考图的水平，便于与 PI 成品直接比对',
++          '默认不缩放，保持与输入帧同一量纲。'),
 +    Param('match', '裁切参考（master）', 'file', '高级',
 +          '叠加完成后，按这张图的画幅再裁一版',
 +          '填一张参考图（通常是 WBPP 的 master，如 masterLight_..._autocrop.xisf）。'
@@ -13379,7 +13425,7 @@
 +        """关于：方法与原文出处（PWS，D.Cikey）"""
 +        messagebox.showinfo(
 +            "关于 DWT · Drizzle",
-+            "DWT · Drizzle 2.7.82-D\n\n" + LICENSE_TEXT)
++            "DWT · Drizzle 2.7.83-D\n\n" + LICENSE_TEXT)
 +
 +    def show_help(self):
 +        """打开内置使用说明（不依赖浏览器 / 外部程序）"""

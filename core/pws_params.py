@@ -111,6 +111,7 @@ class PwsParams:
     ln: bool = False
     xdrz: str = ''
     match: str = ''
+    match_scale: bool = False
 
 
 # 界面显示顺序 == 本表顺序
@@ -437,6 +438,9 @@ PARAMS: Tuple[Param, ...] = (
           '正好对应原始标定帧的像素，可以拿来直接做 drizzle。'
           '留空 = 由 DWT 自己从星点测位移/旋转/尺度。',
           lo=0.0, hi=0.0, step=0.0, dec=0),
+    Param('match_scale', '按参考图标定亮度（与 WBPP master 同量级）', 'bool', '高级',
+          '勾选后把成品天空中位缩放到「输出网格」参考图的水平，便于与 PI 成品直接比对',
+          '默认不缩放，保持与输入帧同一量纲。'),
     Param('match', '裁切参考（master）', 'file', '高级',
           '叠加完成后，按这张图的画幅再裁一版',
           '填一张参考图（通常是 WBPP 的 master，如 masterLight_..._autocrop.xisf）。'

@@ -3645,11 +3645,19 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             try:
                 _refv = np.asarray(
                     __import__('xisf_io').read_xisf(_frame_ref)[0].data, np.float64)
+                try:
+                    _MISC['ref_median'] = float(np.nanmedian(_refv))
+                except Exception:
+                    pass
                 if _refv.ndim == 3:
                     # WBPP 合过色的 master 是 3 通道；matchref 只吃 2 维，
                     # 直接喂进去会抛异常，被外层兜住，「输出网格」就静默失效。
                     _refv = _refv.mean(axis=2)
                     log('[网格] 参考图是 RGB，按三通道平均折成亮度当网格参考')
+                try:
+                    _MISC['ref_median'] = float(np.nanmedian(_refv))
+                except Exception:
+                    pass
                 _seed_img = np.asarray(_reg.frame(int(seed)), np.float64)
                 _c0 = tuple(int(v) for v in _MISC.get('crop_origin', (0, 0)))
                 _seed_align = _seed_img
@@ -4471,6 +4479,40 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         if _vfrac < 0.5:
             log('[输出] 注意：只有 %.1f%% 像素有数据，边缘大片为空（前面可加「自动裁边」）'
                 % (_vfrac * 100.0))
+        # 可选：把成品天空标定到「输出网格」参考图（WBPP master）的同一量级，
+        # 便于和 PI 的成品直接对比亮度。默认关，保持与输入帧同一量纲。
+        _ms = bool(getattr(p, 'match_scale', False))
+        _rm = float(_MISC.get('ref_median', 0.0) or 0.0)
+        if _ms and _rm <= 0:
+            # --aligned 模式不走参考网格匹配，_MISC 里没有 ref_median，
+            # 直接读一次 --frame 指定的参考图拿天空中位。
+            _fr = str(getattr(p, 'frame', '') or '')
+            if _fr:
+                try:
+                    _rv = np.asarray(
+                        __import__('xisf_io').read_xisf(_fr)[0].data, np.float64)
+                    _rm = float(np.nanmedian(_rv))
+                except Exception:
+                    _rm = 0.0
+        if _ms and _rm > 0:
+            try:
+                _om = float(np.nanmedian(Stk[np.isfinite(Stk)]))
+                if _om > 0:
+                    _k = _rm / _om
+                    Stk *= np.float32(_k)
+                    scale_out *= _k
+                    log('[量纲] 按参考图标定：×%.4f（天空 %.6g → %.6g）'
+                        % (_k, _om, _om * _k))
+            except Exception as _e:
+                log('[量纲] 参考图标定跳过（%s）' % _e)
+        try:
+            _sat = int(np.count_nonzero(np.isfinite(Stk) & (Stk >= 0.99)))
+            if _sat:
+                log('[输出] 提示：成品有 %d 个像素 ≥0.99（%.4f%%），这些星点核心在输入帧里'
+                    '已经饱和，叠加无法恢复；可缩短单张曝光或用 --match-scale 与参考图对齐量级'
+                    % (_sat, 100.0 * _sat / float(Stk.size)))
+        except Exception:
+            pass
         save_linear_xisf(p_out, Stk, metas,
                          f'PWS A={A:g} B={B:g} rej_k={rej_k:g}',
                          diag={'A': A, 'B': B, 'RejK': rej_k, 'RejGate': rej_gate,
