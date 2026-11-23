@@ -866,6 +866,40 @@ def measure_shifts(fs, stars: Sequence[Tuple[int, int]], ref: int = 0,
                         f'（全星命中 {_hit3}/{_nt3}）')
         if _n_rescue and log:
             log(f'  [位移] 三角配准兜底救回 {_n_rescue} 帧')
+    # 帧间漂移一致性：真实跟踪漂移是平滑的（每帧几像素、方向连续）。某帧的
+    #   (dx,dy) 若与「帧号→位移」的线性趋势差出好几像素，说明它是"验证通过"
+    #   的错配解——叠上去会把同一颗星画两遍（双影/脱线），比少叠一帧更难发现。
+    #   用最小二乘拟合趋势，偏离 > max(3px, 5×MAD) 的帧判坏。
+    try:
+        _gidx = [int(i) for i in range(n) if not bad[i]]
+        if len(_gidx) >= 4:
+            _ii = np.asarray(_gidx, float)
+            _ex = np.asarray([dx[i] for i in _gidx], float)
+            _ey = np.asarray([dy[i] for i in _gidx], float)
+            _A = np.vstack([_ii - _ii.mean(), np.ones_like(_ii)]).T
+
+            def _fit(v):
+                coef, *_ = np.linalg.lstsq(_A, v, rcond=None)
+                return _A @ coef
+
+            _px, _py = _fit(_ex), _fit(_ey)
+            _rx, _ry = _ex - _px, _ey - _py
+            _thr = max(3.0, 5.0 * float(np.median(np.hypot(_rx, _ry))))
+            _n_out = 0
+            for _k, _i in enumerate(_gidx):
+                _dev = float(np.hypot(_rx[_k], _ry[_k]))
+                if _dev > _thr:
+                    bad[_i] = True
+                    _n_out += 1
+                    if log:
+                        log(f'  [位移] 第 {_i} 帧位移偏离帧间漂移 {_dev:.1f}px'
+                            f'（趋势 {_px[_k]:+.1f},{_py[_k]:+.1f} vs '
+                            f'实测 {_ex[_k]:+.1f},{_ey[_k]:+.1f}），判为错配、排除')
+            if _n_out and log:
+                log(f'  [位移] 漂移一致性检查排除 {_n_out} 帧'
+                    f'（这类错配会让星点叠成双影/脱线）')
+    except Exception:
+        pass
     keep = ~bad
     # 补帧：前后可靠的邻帧线性插值（平移与角度一起插），插值必须与该帧
     # 自己的粗测对得上，否则仍判为不可用。
