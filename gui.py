@@ -453,18 +453,22 @@ class App(tk.Tk):
                   foreground="#6b7280", font=FONT_S).grid(row=3, column=0, columnspan=3,
                                                          sticky="w", pady=(2, 0))
 
-        bar2 = tk.Frame(p)
-        bar2.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(6, 0))
-        ttk.Button(bar2, text="扫描通道", width=10,
-                   command=self._scan_channels).pack(side="left")
-        ttk.Button(bar2, text="全选", width=5,
-                   command=lambda: self._check_all(True)).pack(side="left", padx=(6, 0))
-        ttk.Button(bar2, text="全不选", width=6,
-                   command=lambda: self._check_all(False)).pack(side="left", padx=(4, 0))
-        ttk.Button(bar2, text="重新合成 RGB…", width=14,
-                   command=self._recompose_rgb).pack(side="left", padx=(12, 0))
+        bar2 = tk.Frame(p, bg="#f2f2f5")
+        bar2.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 4), ipady=_px(4))
+        ui_round.RoundButton(bar2, text="扫描通道", command=self._scan_channels,
+                             pad_x=_px(16), pad_y=_px(7),
+                             font=(_FONT_FAMILY, _f(9))).pack(side="left", padx=(_px(8), 0))
+        ui_round.RoundButton(bar2, text="全选", command=lambda: self._check_all(True),
+                             pad_x=_px(14), pad_y=_px(7),
+                             font=(_FONT_FAMILY, _f(9))).pack(side="left", padx=(_px(8), 0))
+        ui_round.RoundButton(bar2, text="全不选", command=lambda: self._check_all(False),
+                             pad_x=_px(14), pad_y=_px(7),
+                             font=(_FONT_FAMILY, _f(9))).pack(side="left", padx=(_px(8), 0))
+        ui_round.RoundButton(bar2, text="重新合成 RGB…", command=self._recompose_rgb,
+                             pad_x=_px(16), pad_y=_px(7),
+                             font=(_FONT_FAMILY, _f(9))).pack(side="left", padx=(_px(8), 0))
         self.lab_ch = tk.Label(bar2, text="先扫描，再在下面选要叠的通道（不选 = 全部）",
-                               bg=BG, fg="#6b7280", font=FONT_S)
+                               bg="#f2f2f5", fg="#6b7280", font=FONT_S)
         self.lab_ch.pack(side="left", padx=10)
 
         fr_lb = tk.Frame(p, bg=CARD)
@@ -748,7 +752,7 @@ class App(tk.Tk):
 
         # 日志
         lg = ui_round.RoundCard(body_log, text="日志", padding=_px(12), radius=_px(18), dark=True) if ui_round else ttk.Labelframe(body_log, text=" 日志 ", padding=6)
-        lg.pack(fill="both", expand=True, pady=(10, 0))
+        lg.pack(fill="both", expand=True, padx=_px(0), pady=(_px(10), 0))
         self.txt = tk.Text(lg, height=16, bg="#0f1520", fg="#cbd5e1", insertbackground="#cbd5e1",
                            font=("Consolas", 9), relief="flat", wrap="none", padx=8, pady=6)
         vs = ttk.Scrollbar(lg, orient="vertical", command=self.txt.yview)
@@ -1010,9 +1014,11 @@ class App(tk.Tk):
             self.ch_names.append(c["name"])
             v = tk.BooleanVar(value=(not _want) or (c["name"] in _want))
             self.ch_vars.append(v)
-            ttk.Checkbutton(self.fr_ch, text="☑ %s   ·   %d 帧" % (c["label"], c["n"]),
-                            variable=v,
-                            command=self._sync_check_glyph).pack(anchor="w", padx=2)
+            tk.Checkbutton(self.fr_ch, text="☑ %s   ·   %d 帧" % (c["label"], c["n"]),
+                           variable=v, command=self._sync_check_glyph,
+                           bg=CARD, activebackground=CARD, selectcolor="#ffffff",
+                           anchor="w", relief="flat", bd=0, highlightthickness=0,
+                           font=FONT, fg=FG).pack(anchor="w", padx=_px(4), pady=_px(1))
         self._sync_check_glyph()
         self.fr_ch.update_idletasks()
         self.cv_ch.configure(scrollregion=self.cv_ch.bbox("all"))
@@ -1314,7 +1320,7 @@ class App(tk.Tk):
         """关于：方法与原文出处（PWS，D.Cikey）"""
         messagebox.showinfo(
             "关于 DWT · Drizzle",
-            "DWT · Drizzle 2.7.54-D\n\n" + LICENSE_TEXT)
+            "DWT · Drizzle 2.7.55-D\n\n" + LICENSE_TEXT)
 
     def show_help(self):
         """打开内置使用说明（不依赖浏览器 / 外部程序）"""
