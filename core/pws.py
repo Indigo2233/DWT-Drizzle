@@ -4148,7 +4148,9 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                                 pixfrac=float(drz_p),
                                 band_rows=int(max(64, drz_plan.get('H', 1024))),
                                 T=T, fp=float(fp), log=log,
-                                pattern=None, channel=None)
+                                pattern=None, channel=None,
+                                # 黑白素材永远不用满月帧补偿；显式传 0 以杜绝环境变量串味
+                                beta=float(_detail_beta(p)))
                             try:
                                 # cropcover.crop_box 要的是「每像素被多少帧覆盖」的计数图；
                                 # fatom 返回的 cov 是权重和（< 帧数、边缘更小），直接当计数

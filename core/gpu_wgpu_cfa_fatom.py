@@ -206,7 +206,7 @@ def _pipes(dev):
 
 def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
                     R=None, pixfrac=1.0, band_rows=512, T=None, fp=1.0,
-                    log=None, pattern=None, channel=None, **kw):
+                    log=None, pattern=None, channel=None, beta=None, **kw):
     if not available():
         raise RuntimeError('适配器不支持 shader-float32-atomic')
     dev, queue = G._device_f32()
@@ -251,7 +251,11 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
     p[24] = np.float32(float(os.environ.get('DWT_MGATE', '0.03') or 0.03))
     p[25] = np.float32(float(getattr(fs, 'sky0', 0.0) or 0.0))
     p[26] = np.float32(float(os.environ.get('DWT_SFAC', '1.0') or 1.0))
-    p[27] = np.float32(float(os.environ.get('DWT_DETAIL_SNR', '0') or 0))
+    # 满月帧补偿：由调用方按素材类型显式传入（黑白恒 0），不再从环境变量读，
+    # 否则同一进程内先跑彩机再跑黑白时会串味（2026-11-23 实测确有 0.0007% 均值、
+    # 局部最大 56% 的差异）。
+    p[27] = np.float32(float(beta) if beta is not None
+                       else float(os.environ.get('DWT_DETAIL_SNR', '0') or 0))
     pu = p.view(np.uint32)
     pu[13] = np.uint32(mask2)
     p[14] = np.float32(P)
