@@ -4397,7 +4397,7 @@
 +    return bool(detect_pattern(meta))
 --- a/core/drizzle.py
 +++ b/core/drizzle.py
-@@ -0,0 +1,2233 @@
+@@ -0,0 +1,2292 @@
 +"""Drizzle 重采样层（PWS 的几何层）
 +
 +把 PWS 阶段 C 的"唯一一次加权平均（式 12）"换成**带权 drizzle 累积**，从而在
@@ -5276,6 +5276,65 @@
 +                        f'（全星命中 {_hit3}/{_nt3}）')
 +        if _n_rescue and log:
 +            log(f'  [位移] 三角配准兜底救回 {_n_rescue} 帧')
++    # 链式兜底：直配参考帧仍然失败的帧，先和最近的已成功帧配准（相邻帧位移只有
++    #   几像素，三角形不变量几乎不会错），再把这份相对变换复合回参考帧坐标。
++    #   代价是误差按链路累积（N 跳约 √N 倍随机误差 + 每跳的系统偏差），所以只在
++    #   直配失败时才走，且复合后仍要过全星验证，不过就维持排除。
++    if bad.any():
++        _good = [int(i) for i in range(n) if not bad[i]]
++        _n_chain = 0
++        if len(_good) >= 2:
++            for _i in np.nonzero(bad)[0]:
++                _i = int(_i)
++                try:
++                    _si = _detect_stars(fs.frame(_i))
++                except Exception:
++                    continue
++                if len(_si) < 20:
++                    continue
++                for _j in sorted(_good, key=lambda j: abs(j - _i))[:3]:
++                    try:
++                        _sj = _detect_stars(fs.frame(int(_j)))
++                    except Exception:
++                        continue
++                    if len(_sj) < 20:
++                        continue
++                    try:
++                        _trc = _tri2.solve(np.asarray(_si, float), np.asarray(_sj, float),
++                                           max_pts=40, inlier_px=2.5)
++                    except Exception:
++                        _trc = None
++                    if not _trc or _trc['n_in'] < 12 or _trc['rms'] > 2.0:
++                        continue
++                    _thij, _kij = float(_trc['theta']), float(_trc['scale'])
++                    if not (0.98 <= _kij <= 1.02):
++                        continue
++                    _tij = np.asarray(_trc['t'], np.float64)
++                    # 邻居 j 自己的变换：out = s·(k_j·R(θ_j)·p_j + u_j)
++                    _thj = math.radians(float(theta[_j]))
++                    _cj, _sj_ = math.cos(_thj), math.sin(_thj)
++                    _kj = float(scale[_j]) if np.isfinite(scale[_j]) else 1.0
++                    _uj = np.array([-float(dx[_j]), -float(dy[_j])])
++                    # 复合：p_j = k_ij·R(θ_ij)·p_i + t_ij
++                    _thi = float(theta[_j]) + _thij
++                    _ki = _kj * _kij
++                    _ui = _kj * np.array([_cj * _tij[0] - _sj_ * _tij[1],
++                                          _sj_ * _tij[0] + _cj * _tij[1]]) + _uj
++                    if not (0.9 < _ki < 1.1):
++                        continue
++                    _okc, _hitc, _ntc = _verify_all(s_ref, _si, _thi, _ki, _ui)
++                    if not _okc:
++                        continue
++                    dx[_i], dy[_i], theta[_i] = -_ui[0], -_ui[1], _thi
++                    scale[_i] = _ki
++                    bad[_i] = False
++                    _n_chain += 1
++                    log and log(f'  [位移] 第 {_i} 帧直配失败，链式救回（经第 {_j} 帧，'
++                                f'相对旋转 {_thij:+.2f}° 尺度 {_kij:.4f} 残差 {_trc["rms"]:.2f}px，'
++                                f'全星命中 {_hitc}/{_ntc}）')
++                    break
++        if _n_chain and log:
++            log(f'  [位移] 链式配准兜底救回 {_n_chain} 帧（误差会按链路累积，留意边缘）')
 +    # 帧间漂移一致性：真实跟踪漂移是平滑的（每帧几像素、方向连续）。某帧的
 +    #   (dx,dy) 若与「帧号→位移」的线性趋势差出好几像素，说明它是"验证通过"
 +    #   的错配解——叠上去会把同一颗星画两遍（双影/脱线），比少叠一帧更难发现。
@@ -13009,7 +13068,7 @@
 +        """关于：方法与原文出处（PWS，D.Cikey）"""
 +        messagebox.showinfo(
 +            "关于 DWT · Drizzle",
-+            "DWT · Drizzle 2.7.69-D\n\n" + LICENSE_TEXT)
++            "DWT · Drizzle 2.7.70-D\n\n" + LICENSE_TEXT)
 +
 +    def show_help(self):
 +        """打开内置使用说明（不依赖浏览器 / 外部程序）"""
