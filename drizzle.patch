@@ -367,7 +367,7 @@
  def _safe_seg(s: str) -> str:
      """文件名段安全化：路径非法字符换下划线"""
      return re.sub(r'[\\/:*?"<>|]+', '_', (s or '').strip()).strip()
-@@ -311,12 +495,31 @@
+@@ -311,27 +495,86 @@
      if not crop or crop <= 0 or center is not None:
          return center
      from DWT_DetailCore import locate_extended_source
@@ -398,14 +398,46 @@
 +    log('[裁剪] 自动定位延展源中心 (y,x)=(%d,%d) → %d^2 窗（抽样 %d 帧取中位）'
 +        % (cy, cx, crop, len(idx)))
      return (int(cy), int(cx))
-+
-+
+ 
+ 
+-def pick_frames_dir(need_bytes: int, want: Optional[str] = None) -> Path:
 +_PICK_CACHE: Dict[str, str] = {}
++
++
++def _frames_state_file() -> Path:
++    base = os.environ.get('APPDATA') or os.environ.get('HOME') or '.'
++    return Path(base) / 'DWT_Drizzle' / 'frames_dirs.txt'
++
++
++def _record_frames_dir(p: Path) -> None:
++    """记住用过的 memmap 目录，供下次启动清理崩溃残留（最多 8 条）。"""
++    try:
++        f = _frames_state_file()
++        f.parent.mkdir(parents=True, exist_ok=True)
++        old = []
++        if f.exists():
++            old = [ln.strip() for ln in f.read_text(encoding='utf-8').splitlines() if ln.strip()]
++        cur = str(p)
++        items = [cur] + [x for x in old if x != cur]
++        f.write_text(chr(10).join(items[:8]) + chr(10), encoding='utf-8')
++    except Exception:
++        pass
++
++
++def pick_frames_dir(need_bytes: int, want: Optional[str] = None,
++                    frame_hint: Optional[str] = None) -> Path:
+     """给 memmap 帧文件挑盘：需要 1.25× 余量
  
- 
- def pick_frames_dir(need_bytes: int, want: Optional[str] = None) -> Path:
-@@ -328,6 +531,10 @@
-         ① 用户 --frames-dir  ② 软件所在盘  ③ 系统 TEMP  ④ 其余固定盘按余量降序
+     全幅 166 帧约 166×6388×9576×4B = 40.6 GiB。若目标盘余量不足，会在读完大量帧
+     之后才因空间不足失败，浪费大量时间。故开跑前先按余量选盘，并把选择写入日志。
+       优先级（取**第一个够用**的，不追求余量最大）：
+-        ① 用户 --frames-dir  ② 软件所在盘  ③ 系统 TEMP  ④ 其余固定盘按余量降序
++        ① 用户 --frames-dir
++        ② 素材所在盘（大文件通常就放在这块盘上，余量大；且不会写满系统盘）
++        ③ 软件所在盘  ④ 系统 TEMP  ⑤ 其余固定盘按余量降序
++
++    注意 ② 是 2.7.66 加的：之前默认写软件安装盘，装在 C: 的用户处理
++    20+ GiB 素材时会把系统盘写满（ENOSPC 发生在读了几十 GB 之后，很难受）。
      """
      import shutil
 +    _key = str(want or '')
@@ -415,15 +447,30 @@
      need = int(need_bytes * 1.25)
      head: List[Path] = []
      if want:
-@@ -379,6 +586,7 @@
+         head.append(Path(want))
++    # 素材所在盘：frames_dir 未指定时，按数据盘根目录建临时目录（驱动器根，好找也好清）
++    try:
++        import os as _os
++        _p0 = Path(frame_hint) if frame_hint else None
++        if _p0 is not None:
++            _anchor = Path(_p0.anchor) / '_DWT_frames'
++            if _anchor not in head:
++                head.append(_anchor)
++    except Exception:
++        pass
+     if getattr(sys, 'frozen', False):
+         # 打包版以软件所在位置为先（与源码版一致）：用 exe 所在目录而非 __file__
+         #   （后者在 onedir 下会落进 _internal 依赖目录）
+@@ -379,6 +622,8 @@
                  continue
              log(f'[memmap] 帧文件目录 {p}（该盘余量 {free / 2 ** 30:.1f} GiB，'
                  f'需 {need / 2 ** 30:.1f} GiB）')
 +            _PICK_CACHE[_key] = str(p)
++            _record_frames_dir(p)
              return p
      raise SystemExit(f'没有任何盘能放下 {need / 2 ** 30:.1f} GiB 的 memmap 帧文件'
                       f'（需要 1.25× 余量）。请用 --frames-dir 指到大盘。')
-@@ -419,21 +627,60 @@
+@@ -419,21 +664,60 @@
          self.off = np.zeros(n, dtype=np.float64)
          self.sky0 = 0.0            # 平移后的公共天空水平（排异信号项的零点）
          self.metas: List[Dict] = []
@@ -489,7 +536,7 @@
  
      def stack_strips(self, y0: int, y1: int) -> np.ndarray:
          """条带内所有帧堆成 (n, y1-y0, W) —— 排异与加权平均的唯一输入"""
-@@ -476,6 +723,10 @@
+@@ -476,6 +760,10 @@
              盘都放不下、退回父进程内存 list 时，它记的是进程自己的占用。
          """
          return self.n * self.shape[0] * self.shape[1] * 4 if self.resident else 0
@@ -500,7 +547,7 @@
  
      def close(self, keep: bool = False) -> None:
          if self.mm is not None:
-@@ -491,10 +742,40 @@
+@@ -491,10 +779,40 @@
                  log(f'[memmap] 删除失败（可手动删）：{self.path}  {e}')
  
  
@@ -542,7 +589,7 @@
      """读帧 → 裁剪 → float32 → **曝光归一**（×EXPTIME_REF/t_i），
      同时逐帧量天空中位与噪声尺度；按内存预算自动决定驻留还是落 memmap。
  
-@@ -524,6 +805,13 @@
+@@ -524,13 +842,16 @@
          x0 = max(0, min(cx - half, fw - crop))
      else:
          y0 = x0 = 0
@@ -555,20 +602,28 @@
 +        y0, x0 = _y, _x
  
      need = n * h * w * 4
-     try:
-@@ -541,7 +829,10 @@
+-    try:
+-        import psutil
+-        avail = int(psutil.virtual_memory().available)
+-    except Exception:
+-        avail = 8 * 2 ** 30
++    avail = _avail_bytes()          # 与并行阶段共用同一套预算（含 DWT_AVAIL_MB 覆盖）
+ 
+     # 一律落盘 memmap（见 FrameSet 文档：页文件支撑的共享段在 Windows 上按整段大小
+     #   记入提交量，装不下就 1450/1455；文件支撑的映射不进提交量，页仍在系统缓存里）。
+@@ -541,7 +862,10 @@
      mmpath = None
      arrays: Optional[List[np.ndarray]] = None
      try:
 -        mmpath = pick_frames_dir(need, frames_dir or None) / f'pws_frames_{h}x{w}_{n}.dat'
 +        # 文件名带 pid：上一次崩溃（或并行候选）留下的 .dat 被占用时，
 +        # Windows 会抛 WinError 32 让整个 run 直接失败；换名字即可绕开。
-+        mmpath = pick_frames_dir(need, frames_dir or None) / (
++        mmpath = pick_frames_dir(need, frames_dir or None, str(frames[0]) if frames else None) / (
 +            f'pws_frames_{h}x{w}_{n}_{os.getpid()}.dat')
          mm = np.memmap(str(mmpath), dtype=np.float32, mode='w+', shape=(n, h, w))
      except SystemExit as e:
          log(f'[帧] 没有盘能放下 {need / 2 ** 30:.2f} GiB 的帧文件 → 退回父进程内存'
-@@ -552,7 +843,33 @@
+@@ -552,7 +876,33 @@
          f'可用 {avail / 2 ** 30:.1f} GiB → '
          f'{"父进程内存（串行）" if mm is None else "memmap 流式（并行）"}')
  
@@ -603,7 +658,7 @@
      t0 = time.perf_counter()
      # 逐帧独立（各读各的源文件、各写各的槽位）→ 可分给多进程。
      #   工作进程各自只读打开同一个帧文件，直接写自己那一格，
-@@ -562,24 +879,35 @@
+@@ -562,24 +912,35 @@
      #   + median 内部副本（np.median 对浮点数组会先复制一份）。
      ini_rw, ini_rw_args = fs.writer
      nw = 0 if (not fs.parallelable or _no_parallel()) \
@@ -642,7 +697,7 @@
          else:
              for i, f in enumerate(files):
                  _check_cancel()                     # 读帧阶段也要能终止
-@@ -588,18 +916,37 @@
+@@ -588,18 +949,37 @@
                  d = np.ascontiguousarray(data[y0:y0 + h, x0:x0 + w]).astype(np.float32)
                  del data
                  d *= np.float32(EXPTIME_REF / float(meta['exptime']))
@@ -682,7 +737,7 @@
      except BaseException:
          # 读帧半途失败（终止 / 工作进程异常 / 盘满）都要把半成品临时帧文件清掉，
          #   否则一块几十 GiB 的文件会一直占着盘；清完再把异常往上抛
-@@ -618,6 +965,20 @@
+@@ -618,6 +998,20 @@
          fs.off[:] = 0.0            # 已就地烘焙，读出时不再减
      if mmpath is not None:
          mm.flush()
@@ -703,7 +758,7 @@
      span = float(fs.skies.max() - fs.skies.min())
      log(f'[帧] 耗时 {time.perf_counter() - t0:.1f}s  '
          f'{"父进程内存 " + f"{fs.resident_bytes / 2 ** 30:.2f} GiB" if mm is None else f"盘上 {need / 2 ** 30:.2f} GiB（{mmpath.parent}）"}')
-@@ -654,7 +1015,9 @@
+@@ -654,7 +1048,9 @@
      sky = float(np.median(ref))
      nz = 1.4826 * float(np.median(np.abs(ref - sky)))
      fwhm0 = 6.0
@@ -714,7 +769,7 @@
      if tbl is None or len(tbl) == 0:
          return []
      names = tbl.colnames
-@@ -691,7 +1054,7 @@
+@@ -691,7 +1087,7 @@
  
  
  def _fwhm_each(kut, stars: List[Tuple[int, int]], fwhm_guess: float,
@@ -723,7 +778,7 @@
      """逐星量高斯 PSF FWHM 的公共实现；kut(xi,yi) 给一颗星的小窗（越界给 None）
  
      小窗来源有两处（整帧切片 / 帧后端直接取），两者的数值路径完全相同：
-@@ -699,22 +1062,27 @@
+@@ -699,22 +1095,27 @@
      """
      from photutils.psf import fit_fwhm
      out = np.full(len(stars), np.nan, dtype=np.float64)
@@ -767,7 +822,7 @@
  
  
  def measure_fwhm_each(img: np.ndarray, stars: List[Tuple[int, int]],
-@@ -739,7 +1107,7 @@
+@@ -739,7 +1140,7 @@
  
  def measure_fwhm_frame(mm: np.ndarray, i: int, off: np.ndarray,
                         stars: List[Tuple[int, int]], fwhm_guess: float = 6.0,
@@ -776,7 +831,7 @@
      """从帧后端（memmap）直接取星点小窗量 FWHM 中位 —— **不物化整帧**
  
      一帧 244 MiB，而 120 颗星的小窗合起来才 ~0.5 MiB。先 mm[i] − off 物化整帧
-@@ -756,12 +1124,97 @@
+@@ -756,12 +1157,97 @@
              return None
          return mm[i, yi - half:yi + half + 1, xi - half:xi + half + 1] - offi
  
@@ -880,7 +935,7 @@
  
  def measure_fwhm(img: np.ndarray, stars: List[Tuple[int, int]],
                   fwhm_guess: float = 6.0, half: int = 16,
-@@ -854,7 +1307,9 @@
+@@ -854,7 +1340,9 @@
  # ---------------------------------------------------------------------------
  
  def _r_envelope(sref: np.ndarray, sigma_psf: float, env_win_mult: float = 2.0,
@@ -891,7 +946,7 @@
      """R = **亮度归一包络**：E = (I−sky) / local_max(I−sky, 窗≈4σ_psf)
  
      包络规格由以下约束唯一确定 —— **R 必须在 ≲4σ_psf 内从 1 落到 0**：
-@@ -883,7 +1338,48 @@
+@@ -883,7 +1371,48 @@
      dm = np.maximum(d - sky, 0.0)
      half = int(max(1, round(float(env_win_mult) * max(float(sigma_psf), 0.5))))
      win = 2 * half + 1
@@ -941,7 +996,7 @@
      E = dm / (loc + float(env_eps) * max(sig, 1e-30))
      E = np.clip(E, 0.0, 1.0)
      if env_p and abs(float(env_p) - 1.0) > 1e-9:
-@@ -905,8 +1401,8 @@
+@@ -905,8 +1434,8 @@
      h = int(round(float(radius_px)))
      if h <= 0:
          return R
@@ -952,7 +1007,7 @@
      return np.clip(d, 0.0, 1.0).astype(np.float32)
  
  
-@@ -954,10 +1450,84 @@
+@@ -954,10 +1483,84 @@
      return np.clip(out, 0.0, 1.0)
  
  
@@ -1038,7 +1093,7 @@
                    ) -> Tuple[np.ndarray, Dict]:
      """分区权重 R ∈ [0,1]：此处是"细节型"还是"朦胧型"
  
-@@ -974,17 +1544,28 @@
+@@ -974,17 +1577,28 @@
        σ_psf 与 win 均由测得的 FWHM 得到 → 换目标不改数值也不改含义。
        T 现在只用于报表诊断（info 里的 T_p50…），不参与 R 的计算。
      """
@@ -1070,7 +1125,7 @@
  
      # 星点锐帧区外扩：半径随星点亮度自适应（亮星推到更暗处，暗星不动）
      grow_px = float(star_grow) * max(float(sigma_psf), 0.5)
-@@ -1005,9 +1586,13 @@
+@@ -1005,9 +1619,13 @@
      if r_floor and r_floor > 0:
          f = min(float(r_floor), 0.95)
          R = f + (1.0 - f) * R
@@ -1084,7 +1139,7 @@
          'star_grow': float(star_grow), 'grow_px': float(grow_px),
          'grow_px_mean': float(grow_mean),
          'T_p50': float(np.median(T)), 'T_p90': float(np.percentile(T, 90)),
-@@ -1023,7 +1608,8 @@
+@@ -1023,7 +1641,8 @@
  # ---------------------------------------------------------------------------
  
  def strip_weights(C: np.ndarray, S: np.ndarray, R: np.ndarray,
@@ -1094,7 +1149,7 @@
      """W[i,r] = C_i^(A·R_r) · S_i^(B·(1−R_r))，并逐像素归一使 mean_i(W) = 1
  
      融合式的形状选择依据（式 6、式 7）：
-@@ -1038,10 +1624,16 @@
+@@ -1038,10 +1657,16 @@
      """
      n = len(C)
      a = (A * R)[None, ...]
@@ -1113,7 +1168,29 @@
      W /= np.maximum(W.mean(axis=0), 1e-30)[None]
      return W.astype(np.float32)
  
-@@ -1177,14 +1769,50 @@
+@@ -1102,7 +1727,20 @@
+ 
+ 
+ def _avail_bytes() -> int:
+-    """当前可用物理内存（拿不到就按 8 GiB 保守处理）"""
++    """当前可用物理内存（拿不到就按 8 GiB 保守处理）
++
++    DWT_AVAIL_MB 可覆盖（单位 MiB）：一是给用户「我这台机器请按更保守的预算跑」，
++    二是让我们在大内存机器上模拟 8 GB / 4 GB 机器做兼容性回归。
++    """
++    import os as _os
++    _ov = _os.environ.get('DWT_AVAIL_MB', '').strip()
++    if _ov:
++        try:
++            _v = int(float(_ov) * 2 ** 20)
++            if _v > 64 * 2 ** 20:
++                return _v
++        except Exception:
++            pass
+     try:
+         import psutil
+         return int(psutil.virtual_memory().available)
+@@ -1177,14 +1815,50 @@
      _MEM['off'] = off
  
  
@@ -1166,7 +1243,7 @@
  
  
  def _task_trail(job) -> Tuple[int, float, float]:
-@@ -1196,8 +1824,9 @@
+@@ -1196,8 +1870,9 @@
  
  def _task_strip(job):
      """一条带的权重 + 排异 + 加权平均（与串行的三段调用完全同序同式）"""
@@ -1178,7 +1255,7 @@
      mm, off = _MEM['mm'], _MEM['off']
      D = np.stack([mm[i, y0:y1] - np.float32(off[i]) for i in range(len(C))])
      s, ne, rr = stack_strip(D, W, Rr, sky0, rej_k=rej_k, rej_max_frac=rej_gate)
-@@ -1214,22 +1843,77 @@
+@@ -1214,22 +1889,77 @@
      _MEM['mmw'] = np.memmap(path, dtype=np.float32, mode='r+', shape=(n, h, w))
  
  
@@ -1260,7 +1337,7 @@
  
  
  # ---------------------------------------------------------------------------
-@@ -1357,7 +2041,15 @@
+@@ -1357,7 +2087,15 @@
      img.geometry = (a.shape[1], a.shape[0], 1)      # XISF geometry = 宽:高:通道
      img.sample_format = 'Float32'
      img.color_space = 'Gray'
@@ -1277,7 +1354,7 @@
      img.pixel_storage = 'Planar'
      img.fits_keywords = [
          {'name': 'TOTALEXP', 'value': round(sum(m['exptime'] for m in metas), 1),
-@@ -1383,6 +2075,428 @@
+@@ -1383,6 +2121,485 @@
          f'元数据：关键字 {len(img.fits_keywords)}  Property {len(prop_raws)}')
  
  
@@ -1633,18 +1710,27 @@
 +    """
 +    import time
 +    try:
-+        base = Path(__file__).resolve().parent / "_DWT_frames"
-+        if not base.is_dir():
-+            return 0
++        bases = [Path(__file__).resolve().parent / "_DWT_frames"]
++        try:
++            for ln in _frames_state_file().read_text(encoding='utf-8').splitlines():
++                ln = ln.strip()
++                if ln:
++                    bases.append(Path(ln))
++        except Exception:
++            pass
++        base = bases[0]
 +        cutoff = time.time() - max_age_h * 3600.0
 +        n = 0
-+        for f in base.iterdir():
-+            try:
-+                if f.is_file() and f.stat().st_mtime < cutoff:
-+                    f.unlink()
-+                    n += 1
-+            except Exception:
++        for base in bases:
++            if not base.is_dir():
 +                continue
++            for f in base.iterdir():
++                try:
++                    if f.is_file() and f.stat().st_mtime < cutoff:
++                        f.unlink()
++                        n += 1
++                except Exception:
++                    continue
 +        try:
 +            if not any(base.iterdir()):
 +                base.rmdir()
@@ -1703,10 +1789,66 @@
 +        log("[磁盘] 空间检查跳过（%s: %s）" % (type(_e).__name__, _e))
 +
 +
++_ENV_LOGGED = False
++
++
++def _log_env_once() -> None:
++    """开机一行环境摘要：CPU 核数、可用内存、GPU 后端可用性。
++
++    兼容性工单第一步就要这三样；打在日志开头比让用户去查系统信息快得多。
++    """
++    global _ENV_LOGGED
++    if _ENV_LOGGED:
++        return
++    _ENV_LOGGED = True
++    try:
++        import os
++        ncpu = os.cpu_count() or 0
++        av = _avail_bytes() / 2 ** 30
++        bits = [f'[环境] CPU {ncpu} 核', f'可用内存 {av:.1f} GiB']
++        def _mod(name):
++            """包内/脚本两种导入方式都要能拿到（CLI 常以顶层模块加载）。"""
++            try:
++                return __import__(f'{__package__}.{name}' if __package__ else name,
++                                  fromlist=[name])
++            except Exception:
++                return __import__(name, fromlist=[name])
++
++        try:
++            gpu_dz = _mod('gpu_dz')
++            bits.append('CUDA 可用' if gpu_dz.available() else 'CUDA 不可用')
++        except Exception:
++            bits.append('CUDA 不可用')
++        try:
++            gpu_wgpu = _mod('gpu_wgpu')
++            ok = False
++            why = '未检测'
++            try:
++                ok = bool(gpu_wgpu.available())
++            except Exception as e:
++                why = f'{type(e).__name__}: {e}'
++            bits.append('wgpu 可用' if ok else f'wgpu 不可用（{why}）')
++        except Exception:
++            bits.append('wgpu 不可用')
++        if os.environ.get('DWT_AVAIL_MB'):
++            bits.append(f'内存预算被 DWT_AVAIL_MB={os.environ["DWT_AVAIL_MB"]} 覆盖')
++        log(' | '.join(bits))
++    except Exception:
++        pass
++
++
  def run(p: PwsParams, on_log=None, on_progress=None, should_cancel=None) -> Dict:
      """PWS 引擎的对外唯一入口（界面与命令行都调它）
  
-@@ -1406,7 +2520,7 @@
+@@ -1391,6 +2608,7 @@
+     """
+     set_hooks(on_log, on_progress, should_cancel)
+     try:
++        _log_env_once()
+         return _run(p)
+     finally:
+         set_hooks()
+@@ -1406,7 +2624,7 @@
      photos = (p.photos or '').strip()
      if not photos:
          raise SystemExit('请选择素材（目录或单张帧）')
@@ -1715,7 +1857,7 @@
      if not (p.out or '').strip():
          raise SystemExit('请选择输出目录（不放在素材目录里，避免成品被当成帧）')
      out_dir = Path(p.out)
-@@ -1414,34 +2528,307 @@
+@@ -1414,34 +2632,307 @@
  
      _emit('读帧', 0.0, '读头分组')
      groups = group_frames_by_filter(frames)
@@ -2035,7 +2177,7 @@
  
  def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 out_dir: Path, stem: str) -> Dict:
-@@ -1449,10 +2836,12 @@
+@@ -1449,10 +2940,12 @@
      完整流程（读帧→星表→R 场→叠加→导出），成品文件主名由 stem 给出。"""
      # 参数别名：算法体统一从 PwsParams 取值
      A, B = float(p.A), float(p.B)
@@ -2048,7 +2190,7 @@
      rej_gate = float(p.rej_gate)                  # 剔除比例上限（默认 1/3）
      limit = int(p.limit) or None
      crop, keep_frames, frames_dir = int(p.crop), bool(p.keep_frames), p.frames_dir
-@@ -1463,9 +2852,46 @@
+@@ -1463,9 +2956,46 @@
  
      # ---- 阶段 0：读帧 + 帧级归一（自动选驻留 / memmap）----
      center = resolve_center(frames, crop, parse_center(p.center))
@@ -2097,7 +2239,7 @@
      metas = fs.metas
      skies = fs.skies
      # 量纲回乘：内部一切计算都在 EXPTIME_REF 基准上（权重/排异全是比值，不受影响），
-@@ -1479,6 +2905,18 @@
+@@ -1479,6 +3009,18 @@
      # S_i = σ_中位 / σ_i（归一化后测 → 曝光差异已被吸收，可直接跨帧比）
      sig = fs.sigma
      S = np.median(sig) / np.maximum(sig, 1e-30)
@@ -2116,7 +2258,7 @@
      sig_out = sig * scale_out          # 展示与落盘量纲 = 成品量纲（内部仍用 sig 算比值）
      log(f'[S] 单帧信噪比权重（σ_中位/σ_i）{S.min():.3f}~{S.max():.3f}  中位 {np.median(S):.3f}')
      log(f'[σ] 逐帧噪声 {sig_out.min():.4e}~{sig_out.max():.4e}'
-@@ -1486,40 +2924,165 @@
+@@ -1486,40 +3028,165 @@
  
      # ---- 阶段 A：C_i（星点 FWHM，开源 fit_fwhm）----
      # 先用最干净的一帧建固定星表（星表位置对全部帧共用）
@@ -2288,7 +2430,7 @@
          f' {np.nanmin(fwhms):.2f}~{np.nanmax(fwhms):.2f}px  中位 {fmed:.2f}px  '
          f'{time.perf_counter() - t1:.1f}s')
      log(f'[C] 清晰度权重（FWHM_中位/FWHM_i）{C.min():.3f}~{C.max():.3f}')
-@@ -1556,9 +3119,22 @@
+@@ -1556,9 +3223,22 @@
                  _check_cancel()
                  lam1[i], pas[i] = fs.trail(i, stars, sigma_psf)
  
@@ -2312,7 +2454,7 @@
      idx = np.argsort(np.nan_to_num(fwhms, nan=1e9))[:k]
  
      if star_grow_pct > 0:
-@@ -1586,88 +3162,958 @@
+@@ -1586,88 +3266,959 @@
      else:
          log('[拖线] 星点锐帧扩展已关闭（0%）')
  
@@ -2336,7 +2478,8 @@
 +            # 进程数按物理并发（线程数的一半）自适应：12 核 → 6（实测最优点），
 +            # 16c32t → 16，不再写死上限 8。内存带宽是真正的天花板，
 +            # 用户嫌慢时可用 --jobs 手动加，或 DWT_JOBS 覆盖。
-+            _n = max(2, min(CAP_DRIZZLE, max(2, int(_mp.cpu_count()) // 2)))
++            _cpu = int(_mp.cpu_count() or os.cpu_count() or 4)
++            _n = max(2, min(CAP_DRIZZLE, max(2, _cpu // 2)))
 +            try:
 +                _pj = int(getattr(p, 'jobs', 0) or 0)
 +                if _pj > 0:
@@ -3329,7 +3472,7 @@
      log(f'[W] 单帧最大权重（条带均值）{np.mean(wmax):.3f}  '
          f'等权份额 = {1.0:.3f} → 最大独占约 {np.mean(wmax):.1f}× 份额')
      log(f'[叠加] 完成 {time.perf_counter() - t2:.1f}s  排异剔除率 {rej_rate:.3%}')
-@@ -1688,11 +4134,56 @@
+@@ -1688,11 +4239,56 @@
          log(f'[读数] {name:<18} 占 {msk.mean():6.2%}  N_eff 中位 '
              f'{np.median(neff[msk]):5.2f}  σ {sd:.4e}')
  
@@ -3389,7 +3532,7 @@
  
      res = {
          'n': n, 'shape': Stk.shape, 'fwhms': fwhms, 'C': C, 'S': S, 'sigma': sig_out,
-@@ -1700,27 +4191,133 @@
+@@ -1700,27 +4296,133 @@
          'R_info': rinfo, 'neff': neff, 'rej_rate': float(rej_rate),
          'A': A, 'B': B, 'rej_k': rej_k, 'stars': stars,
          'metas': metas, 'skies': skies, 'scale_out': float(scale_out),
@@ -3527,7 +3670,7 @@
  
      log(f'[时] 总计 {time.perf_counter() - t_start:.1f}s')
      _emit('输出', 1.0, '完成')
-@@ -1750,13 +4347,23 @@
+@@ -1750,13 +4452,23 @@
                              choices=[v for _, v in prm.choices], help=text)
          else:
              ap.add_argument(flag, default=default, help=text)
@@ -3551,7 +3694,7 @@
      try:
          run(p)
      except Cancelled:
-@@ -1764,5 +4371,82 @@
+@@ -1764,5 +4476,82 @@
      return 0
  
  
@@ -6664,7 +6807,7 @@
 +    return coefs, stats
 --- a/core/matchref.py
 +++ b/core/matchref.py
-@@ -0,0 +1,553 @@
+@@ -0,0 +1,574 @@
 +# -*- coding: utf-8 -*-
 +"""把叠加成品对齐并裁切到一张参考图（通常是 WBPP 的 master）的网格上。
 +
@@ -6680,6 +6823,8 @@
 +
 +from pathlib import Path
 +from typing import Optional, Tuple
++
++import os
 +
 +import numpy as np
 +from scipy import ndimage
@@ -7002,18 +7147,37 @@
 +    A = k * np.array([[ck, -sk], [sk, ck]], np.float64)        # (x, y) ra -> ref
 +    tk = np.array([u[0], u[1]], np.float64)
 +
-+    def inv(out_shape):
-+        yy, xx = np.mgrid[0:out_shape[0], 0:out_shape[1]].astype(np.float64)
-+        xy = np.stack([xx, yy], -1)
-+        d = (xy - tk) / k
-+        p_ra = d @ A.T
-+        rc = np.stack([p_ra[..., 1], p_ra[..., 0]], -1)
-+        rc_a = (rc - c_r) @ Rrot + c_a
-+        return rc_a[..., 0], rc_a[..., 1]
++    def _warp_chunk(y0, y1, H, W):
++        """只算 [y0,y1) 这几行的逆映射坐标（float64，但不整幅展开）
 +
-+    mr, mc = inv(ref_shape)
-+    return ndimage.map_coordinates(src, [mr, mc], order=3,
-+                                   mode="constant", cval=0.0).astype(np.float32)
++        原实现用 np.mgrid 一次铺满整张画布：12400×8500 输出要 2×843 MB 的 float64
++        网格 + 5 张同尺寸中间量，小内存机器必然 MemoryError。按行分块后峰值只有
++        chunk×W 的几倍，与原实现逐像素等价。
++        """
++        yy = np.arange(y0, y1, dtype=np.float64)[:, None]
++        xx = np.arange(0, W, dtype=np.float64)[None, :]
++        d0 = (xx - tk[0]) / k
++        d1 = (yy - tk[1]) / k
++        # p_ra = d @ A.T
++        p0 = d0 * A[0, 0] + d1 * A[1, 0]
++        p1 = d0 * A[0, 1] + d1 * A[1, 1]
++        # rc = (p_ra[..., 1], p_ra[..., 0]) - c_r，再 @ Rrot + c_a
++        r0 = p1 - c_r[0]
++        r1 = p0 - c_r[1]
++        cy = r0 * Rrot[0, 0] + r1 * Rrot[1, 0] + c_a[0]
++        cx = r0 * Rrot[0, 1] + r1 * Rrot[1, 1] + c_a[1]
++        return cy, cx
++
++    H, W = int(ref_shape[0]), int(ref_shape[1])
++    _ch = int(os.environ.get("DWT_WARP_CHUNK", "512") or 512)
++    _ch = max(64, min(H, _ch))
++    out = np.empty((H, W), np.float32)
++    for _y0 in range(0, H, _ch):
++        _y1 = min(H, _y0 + _ch)
++        cy, cx = _warp_chunk(_y0, _y1, H, W)
++        out[_y0:_y1] = ndimage.map_coordinates(
++            src, [cy, cx], order=3, mode="constant", cval=0.0).astype(np.float32)
++    return out
 +
 +
 +def _tri_align(src: np.ndarray, ref: np.ndarray, sr: np.ndarray, log=print):
@@ -12765,7 +12929,7 @@
 +        """关于：方法与原文出处（PWS，D.Cikey）"""
 +        messagebox.showinfo(
 +            "关于 DWT · Drizzle",
-+            "DWT · Drizzle 2.7.65-D\n\n" + LICENSE_TEXT)
++            "DWT · Drizzle 2.7.66-D\n\n" + LICENSE_TEXT)
 +
 +    def show_help(self):
 +        """打开内置使用说明（不依赖浏览器 / 外部程序）"""

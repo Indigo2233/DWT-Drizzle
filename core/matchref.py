@@ -14,6 +14,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional, Tuple
 
+import os
+
 import numpy as np
 from scipy import ndimage
 from scipy.signal import fftconvolve
@@ -335,18 +337,37 @@ def _resample_rot(src, ref_shape, rot_deg, k, th_deg, u):
     A = k * np.array([[ck, -sk], [sk, ck]], np.float64)        # (x, y) ra -> ref
     tk = np.array([u[0], u[1]], np.float64)
 
-    def inv(out_shape):
-        yy, xx = np.mgrid[0:out_shape[0], 0:out_shape[1]].astype(np.float64)
-        xy = np.stack([xx, yy], -1)
-        d = (xy - tk) / k
-        p_ra = d @ A.T
-        rc = np.stack([p_ra[..., 1], p_ra[..., 0]], -1)
-        rc_a = (rc - c_r) @ Rrot + c_a
-        return rc_a[..., 0], rc_a[..., 1]
+    def _warp_chunk(y0, y1, H, W):
+        """只算 [y0,y1) 这几行的逆映射坐标（float64，但不整幅展开）
 
-    mr, mc = inv(ref_shape)
-    return ndimage.map_coordinates(src, [mr, mc], order=3,
-                                   mode="constant", cval=0.0).astype(np.float32)
+        原实现用 np.mgrid 一次铺满整张画布：12400×8500 输出要 2×843 MB 的 float64
+        网格 + 5 张同尺寸中间量，小内存机器必然 MemoryError。按行分块后峰值只有
+        chunk×W 的几倍，与原实现逐像素等价。
+        """
+        yy = np.arange(y0, y1, dtype=np.float64)[:, None]
+        xx = np.arange(0, W, dtype=np.float64)[None, :]
+        d0 = (xx - tk[0]) / k
+        d1 = (yy - tk[1]) / k
+        # p_ra = d @ A.T
+        p0 = d0 * A[0, 0] + d1 * A[1, 0]
+        p1 = d0 * A[0, 1] + d1 * A[1, 1]
+        # rc = (p_ra[..., 1], p_ra[..., 0]) - c_r，再 @ Rrot + c_a
+        r0 = p1 - c_r[0]
+        r1 = p0 - c_r[1]
+        cy = r0 * Rrot[0, 0] + r1 * Rrot[1, 0] + c_a[0]
+        cx = r0 * Rrot[0, 1] + r1 * Rrot[1, 1] + c_a[1]
+        return cy, cx
+
+    H, W = int(ref_shape[0]), int(ref_shape[1])
+    _ch = int(os.environ.get("DWT_WARP_CHUNK", "512") or 512)
+    _ch = max(64, min(H, _ch))
+    out = np.empty((H, W), np.float32)
+    for _y0 in range(0, H, _ch):
+        _y1 = min(H, _y0 + _ch)
+        cy, cx = _warp_chunk(_y0, _y1, H, W)
+        out[_y0:_y1] = ndimage.map_coordinates(
+            src, [cy, cx], order=3, mode="constant", cval=0.0).astype(np.float32)
+    return out
 
 
 def _tri_align(src: np.ndarray, ref: np.ndarray, sr: np.ndarray, log=print):

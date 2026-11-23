@@ -522,13 +522,39 @@ def resolve_center(frames: List[Path], crop: int,
 _PICK_CACHE: Dict[str, str] = {}
 
 
-def pick_frames_dir(need_bytes: int, want: Optional[str] = None) -> Path:
+def _frames_state_file() -> Path:
+    base = os.environ.get('APPDATA') or os.environ.get('HOME') or '.'
+    return Path(base) / 'DWT_Drizzle' / 'frames_dirs.txt'
+
+
+def _record_frames_dir(p: Path) -> None:
+    """记住用过的 memmap 目录，供下次启动清理崩溃残留（最多 8 条）。"""
+    try:
+        f = _frames_state_file()
+        f.parent.mkdir(parents=True, exist_ok=True)
+        old = []
+        if f.exists():
+            old = [ln.strip() for ln in f.read_text(encoding='utf-8').splitlines() if ln.strip()]
+        cur = str(p)
+        items = [cur] + [x for x in old if x != cur]
+        f.write_text(chr(10).join(items[:8]) + chr(10), encoding='utf-8')
+    except Exception:
+        pass
+
+
+def pick_frames_dir(need_bytes: int, want: Optional[str] = None,
+                    frame_hint: Optional[str] = None) -> Path:
     """给 memmap 帧文件挑盘：需要 1.25× 余量
 
     全幅 166 帧约 166×6388×9576×4B = 40.6 GiB。若目标盘余量不足，会在读完大量帧
     之后才因空间不足失败，浪费大量时间。故开跑前先按余量选盘，并把选择写入日志。
       优先级（取**第一个够用**的，不追求余量最大）：
-        ① 用户 --frames-dir  ② 软件所在盘  ③ 系统 TEMP  ④ 其余固定盘按余量降序
+        ① 用户 --frames-dir
+        ② 素材所在盘（大文件通常就放在这块盘上，余量大；且不会写满系统盘）
+        ③ 软件所在盘  ④ 系统 TEMP  ⑤ 其余固定盘按余量降序
+
+    注意 ② 是 2.7.66 加的：之前默认写软件安装盘，装在 C: 的用户处理
+    20+ GiB 素材时会把系统盘写满（ENOSPC 发生在读了几十 GB 之后，很难受）。
     """
     import shutil
     _key = str(want or '')
@@ -539,6 +565,16 @@ def pick_frames_dir(need_bytes: int, want: Optional[str] = None) -> Path:
     head: List[Path] = []
     if want:
         head.append(Path(want))
+    # 素材所在盘：frames_dir 未指定时，按数据盘根目录建临时目录（驱动器根，好找也好清）
+    try:
+        import os as _os
+        _p0 = Path(frame_hint) if frame_hint else None
+        if _p0 is not None:
+            _anchor = Path(_p0.anchor) / '_DWT_frames'
+            if _anchor not in head:
+                head.append(_anchor)
+    except Exception:
+        pass
     if getattr(sys, 'frozen', False):
         # 打包版以软件所在位置为先（与源码版一致）：用 exe 所在目录而非 __file__
         #   （后者在 onedir 下会落进 _internal 依赖目录）
@@ -587,6 +623,7 @@ def pick_frames_dir(need_bytes: int, want: Optional[str] = None) -> Path:
             log(f'[memmap] 帧文件目录 {p}（该盘余量 {free / 2 ** 30:.1f} GiB，'
                 f'需 {need / 2 ** 30:.1f} GiB）')
             _PICK_CACHE[_key] = str(p)
+            _record_frames_dir(p)
             return p
     raise SystemExit(f'没有任何盘能放下 {need / 2 ** 30:.1f} GiB 的 memmap 帧文件'
                      f'（需要 1.25× 余量）。请用 --frames-dir 指到大盘。')
@@ -814,11 +851,7 @@ def prepare_frames(frames: List[Path], label: str, crop: int,
         y0, x0 = _y, _x
 
     need = n * h * w * 4
-    try:
-        import psutil
-        avail = int(psutil.virtual_memory().available)
-    except Exception:
-        avail = 8 * 2 ** 30
+    avail = _avail_bytes()          # 与并行阶段共用同一套预算（含 DWT_AVAIL_MB 覆盖）
 
     # 一律落盘 memmap（见 FrameSet 文档：页文件支撑的共享段在 Windows 上按整段大小
     #   记入提交量，装不下就 1450/1455；文件支撑的映射不进提交量，页仍在系统缓存里）。
@@ -831,7 +864,7 @@ def prepare_frames(frames: List[Path], label: str, crop: int,
     try:
         # 文件名带 pid：上一次崩溃（或并行候选）留下的 .dat 被占用时，
         # Windows 会抛 WinError 32 让整个 run 直接失败；换名字即可绕开。
-        mmpath = pick_frames_dir(need, frames_dir or None) / (
+        mmpath = pick_frames_dir(need, frames_dir or None, str(frames[0]) if frames else None) / (
             f'pws_frames_{h}x{w}_{n}_{os.getpid()}.dat')
         mm = np.memmap(str(mmpath), dtype=np.float32, mode='w+', shape=(n, h, w))
     except SystemExit as e:
@@ -1694,7 +1727,20 @@ def stack_strip(D: np.ndarray, W: np.ndarray, R: Optional[np.ndarray] = None,
 
 
 def _avail_bytes() -> int:
-    """当前可用物理内存（拿不到就按 8 GiB 保守处理）"""
+    """当前可用物理内存（拿不到就按 8 GiB 保守处理）
+
+    DWT_AVAIL_MB 可覆盖（单位 MiB）：一是给用户「我这台机器请按更保守的预算跑」，
+    二是让我们在大内存机器上模拟 8 GB / 4 GB 机器做兼容性回归。
+    """
+    import os as _os
+    _ov = _os.environ.get('DWT_AVAIL_MB', '').strip()
+    if _ov:
+        try:
+            _v = int(float(_ov) * 2 ** 20)
+            if _v > 64 * 2 ** 20:
+                return _v
+        except Exception:
+            pass
     try:
         import psutil
         return int(psutil.virtual_memory().available)
@@ -2427,18 +2473,27 @@ def _clean_stale_frames(max_age_h: float = 2.0) -> int:
     """
     import time
     try:
-        base = Path(__file__).resolve().parent / "_DWT_frames"
-        if not base.is_dir():
-            return 0
+        bases = [Path(__file__).resolve().parent / "_DWT_frames"]
+        try:
+            for ln in _frames_state_file().read_text(encoding='utf-8').splitlines():
+                ln = ln.strip()
+                if ln:
+                    bases.append(Path(ln))
+        except Exception:
+            pass
+        base = bases[0]
         cutoff = time.time() - max_age_h * 3600.0
         n = 0
-        for f in base.iterdir():
-            try:
-                if f.is_file() and f.stat().st_mtime < cutoff:
-                    f.unlink()
-                    n += 1
-            except Exception:
+        for base in bases:
+            if not base.is_dir():
                 continue
+            for f in base.iterdir():
+                try:
+                    if f.is_file() and f.stat().st_mtime < cutoff:
+                        f.unlink()
+                        n += 1
+                except Exception:
+                    continue
         try:
             if not any(base.iterdir()):
                 base.rmdir()
@@ -2497,6 +2552,54 @@ def _check_disk_space(frames, out_dir, scale: float, log,
         log("[磁盘] 空间检查跳过（%s: %s）" % (type(_e).__name__, _e))
 
 
+_ENV_LOGGED = False
+
+
+def _log_env_once() -> None:
+    """开机一行环境摘要：CPU 核数、可用内存、GPU 后端可用性。
+
+    兼容性工单第一步就要这三样；打在日志开头比让用户去查系统信息快得多。
+    """
+    global _ENV_LOGGED
+    if _ENV_LOGGED:
+        return
+    _ENV_LOGGED = True
+    try:
+        import os
+        ncpu = os.cpu_count() or 0
+        av = _avail_bytes() / 2 ** 30
+        bits = [f'[环境] CPU {ncpu} 核', f'可用内存 {av:.1f} GiB']
+        def _mod(name):
+            """包内/脚本两种导入方式都要能拿到（CLI 常以顶层模块加载）。"""
+            try:
+                return __import__(f'{__package__}.{name}' if __package__ else name,
+                                  fromlist=[name])
+            except Exception:
+                return __import__(name, fromlist=[name])
+
+        try:
+            gpu_dz = _mod('gpu_dz')
+            bits.append('CUDA 可用' if gpu_dz.available() else 'CUDA 不可用')
+        except Exception:
+            bits.append('CUDA 不可用')
+        try:
+            gpu_wgpu = _mod('gpu_wgpu')
+            ok = False
+            why = '未检测'
+            try:
+                ok = bool(gpu_wgpu.available())
+            except Exception as e:
+                why = f'{type(e).__name__}: {e}'
+            bits.append('wgpu 可用' if ok else f'wgpu 不可用（{why}）')
+        except Exception:
+            bits.append('wgpu 不可用')
+        if os.environ.get('DWT_AVAIL_MB'):
+            bits.append(f'内存预算被 DWT_AVAIL_MB={os.environ["DWT_AVAIL_MB"]} 覆盖')
+        log(' | '.join(bits))
+    except Exception:
+        pass
+
+
 def run(p: PwsParams, on_log=None, on_progress=None, should_cancel=None) -> Dict:
     """PWS 引擎的对外唯一入口（界面与命令行都调它）
 
@@ -2505,6 +2608,7 @@ def run(p: PwsParams, on_log=None, on_progress=None, should_cancel=None) -> Dict
     """
     set_hooks(on_log, on_progress, should_cancel)
     try:
+        _log_env_once()
         return _run(p)
     finally:
         set_hooks()
@@ -3173,7 +3277,8 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             # 进程数按物理并发（线程数的一半）自适应：12 核 → 6（实测最优点），
             # 16c32t → 16，不再写死上限 8。内存带宽是真正的天花板，
             # 用户嫌慢时可用 --jobs 手动加，或 DWT_JOBS 覆盖。
-            _n = max(2, min(CAP_DRIZZLE, max(2, int(_mp.cpu_count()) // 2)))
+            _cpu = int(_mp.cpu_count() or os.cpu_count() or 4)
+            _n = max(2, min(CAP_DRIZZLE, max(2, _cpu // 2)))
             try:
                 _pj = int(getattr(p, 'jobs', 0) or 0)
                 if _pj > 0:
