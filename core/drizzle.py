@@ -1737,7 +1737,10 @@ def _winsor_scale(dev: np.ndarray, s_pix: np.ndarray, goodcol: np.ndarray,
                 continue
             sv = sp[sy0:sy1, sx0:sx1]
             sv = sv[sv > 0]
-            lim = float(k) * float(sv.mean()) if sv.size else 0.0
+            # 用中位数而不是均值：卫星线穿过一个 64×64 块只会污染其中一小部分像素，
+            # 均值会被那几行高值抬高 → 阈值变松 → 恰恰放过了要剔的拖线（实测卫星线残留）。
+            _mean_lim = os.environ.get('DWT_WINSOR_MEAN', '') == '1'
+            lim = float(k) * float(sv.mean() if _mean_lim else np.median(sv)) if sv.size else 0.0
             lim_all[iy, ix] = lim
             blk = sub[:, sy0:sy1, sx0:sx1]
             if lim > 0:

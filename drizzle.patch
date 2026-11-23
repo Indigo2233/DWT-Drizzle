@@ -4641,7 +4641,7 @@
 +    return bool(detect_pattern(meta))
 --- a/core/drizzle.py
 +++ b/core/drizzle.py
-@@ -0,0 +1,2372 @@
+@@ -0,0 +1,2375 @@
 +"""Drizzle 重采样层（PWS 的几何层）
 +
 +把 PWS 阶段 C 的"唯一一次加权平均（式 12）"换成**带权 drizzle 累积**，从而在
@@ -6381,7 +6381,10 @@
 +                continue
 +            sv = sp[sy0:sy1, sx0:sx1]
 +            sv = sv[sv > 0]
-+            lim = float(k) * float(sv.mean()) if sv.size else 0.0
++            # 用中位数而不是均值：卫星线穿过一个 64×64 块只会污染其中一小部分像素，
++            # 均值会被那几行高值抬高 → 阈值变松 → 恰恰放过了要剔的拖线（实测卫星线残留）。
++            _mean_lim = os.environ.get('DWT_WINSOR_MEAN', '') == '1'
++            lim = float(k) * float(sv.mean() if _mean_lim else np.median(sv)) if sv.size else 0.0
 +            lim_all[iy, ix] = lim
 +            blk = sub[:, sy0:sy1, sx0:sx1]
 +            if lim > 0:
@@ -13442,7 +13445,7 @@
 +        """关于：方法与原文出处（PWS，D.Cikey）"""
 +        messagebox.showinfo(
 +            "关于 DWT · Drizzle",
-+            "DWT · Drizzle 2.7.84-D\n\n" + LICENSE_TEXT)
++            "DWT · Drizzle 2.7.85-D\n\n" + LICENSE_TEXT)
 +
 +    def show_help(self):
 +        """打开内置使用说明（不依赖浏览器 / 外部程序）"""
