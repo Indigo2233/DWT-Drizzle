@@ -66,13 +66,14 @@ _CFG_HOME = (Path.home() / "Library" / "Application Support"
              else Path(os.environ.get("APPDATA", str(Path.home()))))
 CFG = _CFG_HOME / "DWT_Drizzle" / "settings.json"
 
-BG = "#f5f5f7"
+BG = "#f5f9fc"
 CARD = "#ffffff"
-BORDER = "#e3e3e8"
-ACCENT = "#0071e3"
-ACCENT_D = "#0059b3"
-FG = "#1d1d1f"
-FG2 = "#6e6e73"   # 次级文字
+BORDER = "#d8e6f2"
+ACCENT = "#0e6fb8"
+ACCENT_D = "#0a5a96"
+FG = "#0d2233"
+FG2 = "#5c7488"
+CYAN = "#21a7c4"   # 青色点缀（分隔线 / 运行中状态）
 
 import sys as _sys
 _FONT_FAMILY = ("PingFang SC" if _sys.platform == "darwin"
@@ -271,6 +272,8 @@ class App(tk.Tk):
 
         self.cfg = load_cfg()
         self.proc: subprocess.Popen | None = None
+        self._log_fh = None
+        self._log_path: Path | None = None
         self.mon = None
         self._mon_buf = []          # 监控窗的日志/事件缓冲，窗口被关掉重开时回放
         self.q: queue.Queue = queue.Queue()
@@ -361,15 +364,25 @@ class App(tk.Tk):
 
     def _build_ui(self):
         # 顶栏
-        top = tk.Frame(self, bg="#ffffff", height=_px(72))
-        top.pack(fill="x", pady=(0, _px(10)))
+        top = tk.Frame(self, bg=CARD, height=_px(74))
+        top.pack(fill="x")
         top.pack_propagate(False)
-        tk.Label(top, text="DWT", bg="#171e29", fg="#2dd4bf",
-                 font=(_FONT_FAMILY, 18, "bold")).pack(side="left", padx=(20, 8))
-        tk.Label(top, text="分区加权叠加  +  Drizzle 几何重采样", bg="#171e29",
-                 fg="#cbd5e1", font=(_FONT_FAMILY, 11)).pack(side="left", pady=22)
-        self.lab_state = tk.Label(top, text="空闲", bg="#171e29", fg="#94a3b8", font=FONT)
-        self.lab_state.pack(side="right", padx=20)
+        tk.Frame(self, bg=BORDER, height=1).pack(fill="x", pady=(0, _px(6)))
+        # 徽标：深海军蓝圆角块 + 青色下划线
+        _lg = tk.Canvas(top, width=_px(98), height=_px(42), bg=CARD, highlightthickness=0)
+        _lg.pack(side="left", padx=(_px(22), _px(12)), pady=_px(16))
+        if ui_round:
+            ui_round.round_rect(_lg, 0, 0, _px(98), _px(42), _px(10),
+                                fill="#0b3350", outline="")
+            ui_round.round_rect(_lg, _px(12), _px(31), _px(86), _px(35), _px(2),
+                                fill=CYAN, outline="")
+        _lg.create_text(_px(49), _px(17), text="DWT", fill="#eaf7ff",
+                        font=(_FONT_FAMILY, 15, "bold"))
+        tk.Frame(top, bg=CYAN, width=_px(3), height=_px(20)).pack(side="left", pady=_px(27))
+        tk.Label(top, text="  分区加权叠加  ·  Drizzle 几何重采样", bg=CARD, fg=FG,
+                 font=(_FONT_FAMILY, _f(11))).pack(side="left")
+        self.lab_state = tk.Label(top, text="空闲", bg=CARD, fg=FG2, font=FONT)
+        self.lab_state.pack(side="right", padx=_px(22))
 
         # 操作栏先占住底部，再让 Notebook 去抢剩余空间（否则会被挤掉）
         self.bar = tk.Frame(self, bg=BG)
@@ -1323,7 +1336,7 @@ class App(tk.Tk):
         """关于：方法与原文出处（PWS，D.Cikey）"""
         messagebox.showinfo(
             "关于 DWT · Drizzle",
-            "DWT · Drizzle 2.7.56-D\n\n" + LICENSE_TEXT)
+            "DWT · Drizzle 2.7.57-D\n\n" + LICENSE_TEXT)
 
     def show_help(self):
         """打开内置使用说明（不依赖浏览器 / 外部程序）"""
@@ -1456,6 +1469,7 @@ class App(tk.Tk):
         env["PYTHONUNBUFFERED"] = "1"
 
         self.txt.delete("1.0", "end")
+        self._open_run_log(c, argv)
         self._log("命令：" + " ".join(argv) + "\n", "dim")
         try:
             self.proc = subprocess.Popen(
@@ -1472,7 +1486,7 @@ class App(tk.Tk):
         self.pb.start(12)
         self.btn_run.configure(state="disabled")
         self.btn_stop.configure(state="normal")
-        self.lab_state.configure(text="运行中", fg="#34d399")
+        self.lab_state.configure(text="运行中", fg=CYAN)
         self.reader = threading.Thread(target=self._read, args=(self.proc,), daemon=True)
         self.reader.start()
 
@@ -1541,13 +1555,57 @@ class App(tk.Tk):
                      "drizzle": "配准"}.get(m.group(1), m.group(1))
             self.lab_stage.configure(text=f"阶段：{stage}")
 
+    def _open_run_log(self, c, argv):
+        """把本次叠加日志写到输出目录（与成品同目录）。"""
+        self._close_run_log()
+        try:
+            out_s = str(c.get("out") or "").strip()
+            if not out_s:
+                return
+            out = Path(out_s).expanduser()
+            out.mkdir(parents=True, exist_ok=True)
+            tag = (str(c.get("tag") or "stack").strip() or "stack")
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            self._log_path = out / ("%s_叠加日志_%s.txt" % (tag, stamp))
+            self._log_fh = open(self._log_path, "w", encoding="utf-8")
+            self._log_fh.write("DWT-Drizzle 叠加日志" + chr(10))
+            self._log_fh.write("开始时间：%s" % time.strftime("%Y-%m-%d %H:%M:%S") + chr(10))
+            self._log_fh.write("命令：%s" % " ".join(argv) + chr(10))
+            self._log_fh.write("=" * 60 + chr(10))
+            self._log_fh.flush()
+            self._log("[界面] 日志同时保存到 %s" % self._log_path + chr(10), "dim")
+        except Exception as e:
+            self._log_fh = None
+            self._log_path = None
+            self._log("[界面] 日志文件创建失败（不影响叠加）：%s" % e + chr(10), "warn")
+
+    def _close_run_log(self, code=None):
+        try:
+            if self._log_fh:
+                self._log_fh.write("=" * 60 + chr(10))
+                if code is not None:
+                    self._log_fh.write("结束时间：%s" % time.strftime("%Y-%m-%d %H:%M:%S") + chr(10))
+                    self._log_fh.write("退出码：%s" % code + chr(10))
+                self._log_fh.flush()
+                self._log_fh.close()
+        except Exception:
+            pass
+        self._log_fh = None
+
     def _log(self, s: str, tag: str = ""):
+        try:
+            if self._log_fh is not None:
+                self._log_fh.write(s)
+                self._log_fh.flush()
+        except Exception:
+            pass
         at_bottom = self.txt.yview()[1] > 0.98
         self.txt.insert("end", s, tag)
         if at_bottom:
             self.txt.see("end")
 
     def _finish(self, code: int):
+        self._close_run_log(code if self._log_path else None)
         try:
             if self.mon is not None and self.mon.winfo_exists():
                 self.mon.finish(code)

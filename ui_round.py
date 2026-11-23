@@ -8,14 +8,15 @@ from __future__ import annotations
 
 import tkinter as tk
 
-BG = '#f5f5f7'
+BG = '#f5f9fc'
 CARD = '#ffffff'
-CARD_DARK = '#0f1520'
-BORDER = '#e3e3e8'
-FG = '#1d1d1f'
-FG2 = '#6e6e73'
-ACCENT = '#0071e3'
-ACCENT_D = '#0059b3'
+CARD_DARK = '#0a1b2a'
+BORDER = '#d8e6f2'
+FG = '#0d2233'
+FG2 = '#5c7488'
+CYAN = '#21a7c4'
+ACCENT = '#0e6fb8'
+ACCENT_D = '#0a5a96'
 
 
 def round_rect(cv: tk.Canvas, x0, y0, x1, y1, r, **kw):
@@ -126,6 +127,10 @@ class RoundButton(tk.Canvas):
         self._shape = round_rect(self, 0, 0, w, h, radius,
                                  fill=self._fill(), outline=self._outline(), width=1)
         self.tag_lower(self._shape)
+        # 凸起感：顶部一条亮线 + 底部一条暗线
+        self._hi = self.create_line(0, 0, 0, 0, width=1, fill=self._hi_col())
+        self._lo = self.create_line(0, 0, 0, 0, width=1, fill=self._lo_col())
+        self._bevel()
         self.bind('<Enter>', self._on_enter)
         self.bind('<Leave>', self._on_leave)
         self.bind('<Button-1>', self._on_press)
@@ -148,9 +153,35 @@ class RoundButton(tk.Canvas):
     def _outline(self):
         return ACCENT if self._kind == 'primary' else '#d2d2d8'
 
+    def _hi_col(self):
+        if self._kind == 'primary':
+            return '#5aa9dd'
+        if self._kind == 'danger':
+            return '#ffffff'
+        return '#ffffff'
+
+    def _lo_col(self):
+        if self._kind == 'primary':
+            return '#084b7d'
+        if self._kind == 'danger':
+            return '#e6c7c7'
+        return '#c8d7e6'
+
+    def _bevel(self):
+        bb = self.bbox(self._shape)
+        if not bb:
+            return
+        x0, y0, x1, y1 = bb
+        r = 8
+        self.coords(self._hi, x0 + r, y0 + 2, x1 - r, y0 + 2)
+        self.coords(self._lo, x0 + r, y1 - 2, x1 - r, y1 - 2)
+
     def _repaint(self):
         self.itemconfigure(self._shape, fill=self._fill())
         self.itemconfigure(self._txt, fill=self._fg())
+        self.itemconfigure(self._hi, fill=self._hi_col())
+        self.itemconfigure(self._lo, fill=self._lo_col())
+        self._bevel()
 
     def _on_enter(self, _e):
         self._hover = True
