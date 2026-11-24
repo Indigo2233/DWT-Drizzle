@@ -4118,6 +4118,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             log('[wgpu] 灰度素材走液滴散射后端（收集式只用于彩机）')
             _use_wgpu = False
         _wmap = None
+        _PF = {'mul': 1.0}      # 两遍 drizzle：第二遍把液滴放大，只补未覆盖像素
         def _do_stack():
             if _use_wgpu:
                 _H2, _W2 = int(drz_plan['H']), int(drz_plan['W'])
@@ -4130,7 +4131,8 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 if _cfa_sel is not None:
                     _pf = float(getattr(p, 'drizzle_pix', 1.0) or 1.0)
                     if _pf < 1.0 and not os.environ.get('DWT_CFA_PIX_STRICT'):
-                        _pf = 1.0   # CFA：液滴必须铺满同色格点（P=2s），否则留空洞
+                        _pf = 1.0   # CFA：液滴至少等于样本足迹（更小会缺相位）
+                    _pf *= float(_PF['mul'])
                     _pd = _pf * float(drz_plan.get('s', 1.0))
                     # 默认全部走散射：最近邻在 P=1 且带旋转时会丢掉液滴的分数覆盖
                     # （20 帧实测 corr 仅 0.92），散射与 CPU 逐像素等价（corr 0.9997）
@@ -4299,6 +4301,45 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 _wmap = _local_sharp_maps(fs, np.arange(n), drz_plan, 64, log)
                 if _wmap is not None:
                     r_d = _do_stack()
+            # ---- 自适应第二遍：只补第一遍没有覆盖的像素 ----
+            # 第一遍用样本足迹（锐），空洞=抖动没覆盖到的相位；
+            # 第二遍把这些像素的液滴放大到 2×间距（仍是同一批真实样本，
+            # 只是足迹更宽），把缺的相位补上。有覆盖的像素一律保留第一遍，
+            # 所以全图锐度不受影响。
+            if _cfa_sel is not None and os.environ.get('DWT_CFA_TWOPASS', '1') != '0':
+                _c1 = r_d.get('ncov', r_d.get('cov'))
+                if _c1 is not None and _c1.shape == r_d['stack'].shape:
+                    _hole = ~(_c1 > 0)
+                    _H_, _W_ = _hole.shape
+                    _b = 50
+                    _inner = _hole.copy()
+                    if _H_ > 2 * _b and _W_ > 2 * _b:
+                        _inner[: _b, :] = False; _inner[-_b:, :] = False
+                        _inner[:, : _b] = False; _inner[:, -_b:] = False
+                    _in_frac = float(_inner.sum()) / float(max(1, _inner.size))
+                    if _in_frac > 0.0002:
+                        log('[CFA] 两遍 drizzle：第一遍内部未覆盖 %.3f%% → 只在空洞处'
+                            '用 2× 液滴补一遍（同一批真实样本，不伪造）' % (100 * _in_frac))
+                        _PF['mul'] = 2.0
+                        try:
+                            _r2 = _do_stack()
+                            _c2 = _r2.get('ncov', _r2.get('cov'))
+                            if _c2 is not None and _c2.shape == _c1.shape:
+                                _fix = _hole & (_c2 > 0)
+                                _n_fix = int(_fix.sum())
+                                if _n_fix:
+                                    _s1 = r_d['stack']
+                                    _s1[_fix] = _r2['stack'][_fix]
+                                    if r_d.get('ncov') is not None:
+                                        r_d['ncov'] = np.where(_fix, _c2, _c1)
+                                    if r_d.get('cov') is not None:
+                                        r_d['cov'] = np.where(_fix, _c2, _c1)
+                                log('[CFA] 两遍合并：补上 %d 个像素（内部 %d），'
+                                    '其余保持第一遍锐度' % (_n_fix, int((_fix & _inner).sum())))
+                        except Exception as _e2:
+                            log('[CFA] 第二遍补洞失败（%s），保留第一遍结果' % _e2)
+                        finally:
+                            _PF['mul'] = 1.0
         finally:
             if not getattr(fs, '_shared', False):
                 fs.close(keep=keep_frames)
