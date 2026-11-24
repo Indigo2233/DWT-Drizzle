@@ -3430,6 +3430,13 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             # 等于液滴只有 1 个输出像素，CFA 下会留下 3/4 的空洞（覆盖率掉、信噪比塌）。
             log('[CFA] 彩机 drizzle 提示：R/B 每 4 个像素才 1 个真值，'
                 '2× 上采样约需 4 倍帧数；pixfrac 保持你填的 {0:g}'.format(drz_p))
+    if _CFA.get('pattern') and not drz_on:
+        # 彩机素材不走 drizzle 时，四个 CFA 相位只能按整像素落点，抖动信息全部丢失，
+        # 星点周围会留下低于天空的坑（实测用户 78 帧 B：28.6% 的小星有 −2σ 像素，
+        # 同样参数开 drizzle 后降到 3%）。这里直接强制开启，并说明原因。
+        drz_on = True
+        log('[CFA] 彩机素材必须做 drizzle：已自动启用（1× 网格，pixfrac 按你填的）——'
+            '不 drizzle 时四个 CFA 相位只能按整像素落点，星点周围会出现低于天空的坑')
     drz_plan = None
     if drz_on:
         from drizzle import measure_shifts, plan_output, stack_sharp_reference
