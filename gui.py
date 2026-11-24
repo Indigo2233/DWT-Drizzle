@@ -130,7 +130,7 @@ DEFAULTS = {
     "scale": "2",
     "pix": "0.8", "r_blur": "0",
     "bgdeg": "1", "r_mode": "max", "sharp_w": "", "fwhm_max": "", "xdrz": "", "match": "",
-    "flux_pow": "2.0",
+    "flux_pow": "0.0",
     "pick": "H",
     "gpu": "auto",
     "bg_r": "0",
@@ -892,7 +892,7 @@ class App(tk.Tk):
         self.v_rmode.set(c.get("r_mode", "max"))
         self.v_shw.set(c.get("sharp_w", ""))
         self.v_fwhm.set(c.get("fwhm_max", ""))
-        self.v_flux.set(c.get("flux_pow", "2.0"))
+        self.v_flux.set(c.get("flux_pow", "0.0"))
         self.v_ccrop.set(c.get("crop_cover", "0.9"))
         self.v_gpu.set({"auto": "自动", "cpu": "只用 CPU",
                         "gpu": "只用 GPU（CUDA）", "wgpu": "wgpu（跨平台）"}.get(
@@ -1377,7 +1377,7 @@ class App(tk.Tk):
         """关于：方法与原文出处（PWS，D.Cikey）"""
         messagebox.showinfo(
             "关于 DWT · Drizzle",
-            "DWT · Drizzle 2.7.99-D\n\n" + LICENSE_TEXT)
+            "DWT · Drizzle 2.7.100-D\n\n" + LICENSE_TEXT)
 
     def show_help(self):
         """打开内置使用说明（不依赖浏览器 / 外部程序）"""

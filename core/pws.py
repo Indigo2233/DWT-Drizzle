@@ -116,7 +116,7 @@ REJ_K = 3.5          # 逐像素排异：|偏差| > κ·1.4826·MAD + m·R·(a_r
 REJ_MAX_FRAC = 1 / 3  # 剔除比例上限：超额被剔帧数 > 该比例 × 总帧数 → 判为共有结构而非
                       #   孤立离群，该像素不排异
 FLUX_R = 7.0         # 测吞吐的定孔径半径（原生像素）
-FLUX_POW = 2.0       # 吞吐项的默认指数（PI 的 PSF Signal Weight 同阶）
+FLUX_POW = 0.0       # 吞吐项默认关闭：天空背景下 T^2 会把亮帧过度加权（见 docs/实验记录-分支E.md）
 N_STAR = 120         # 固定星表星数（测 C_i 用；中位数在 100 颗以上已稳定）
 REF_SHARP_N = max(1, int(__import__('os').environ.get('DWT_REF_K', '8') or 8))
                     # 参考像 = 最锐的这么多帧的等权中位（默认 k=8，DWT_REF_K 可覆盖）
@@ -1284,6 +1284,42 @@ def measure_fwhm(img: np.ndarray, stars: List[Tuple[int, int]],
     return float(np.median(v))
 
 
+def band_cfield(C, C_tiles, y0: int, y1: int, h: int, w: int):
+    """取第 y0:y1 行条带的逐瓦片清晰度场（最近邻放大到条带大小）"""
+    if C_tiles is None:
+        return C
+    k = int(C_tiles.shape[1])
+    ys = (np.arange(y0, y1) * k // max(int(h), 1)).astype(np.int64)
+    xs = (np.arange(w) * k // max(int(w), 1)).astype(np.int64)
+    return np.asarray(C_tiles[:, ys][:, :, xs], np.float64)
+
+
+def tile_fwhm_map(vals, stars, h: int, w: int, k: int) -> np.ndarray:
+    """把逐星 FWHM 分到 k×k 瓦片，返回 (k,k) 中位图（瓦片内 <2 颗星则 NaN）
+
+    为什么按瓦片：清晰度权重原来用**全帧一个** FWHM（C_i），于是视宁最好的那几帧
+    在整幅图上都被放大——好天区被推到 2.7px、边缘仍 3.7px，PSF 空间分布被拉开到
+    1.37×（WBPP 1.15×）。SXT 这类单一 PSF 假设的工具就会在锐区留残差、把紧凑
+    小星系判成恒星。按瓦片各测各的，每个区域自己挑最锐的帧，锐度与均匀性可以兼得。
+    """
+    out = np.full((k, k), np.nan, np.float64)
+    v = np.asarray(vals, np.float64)
+    ok = np.isfinite(v)
+    if not ok.any():
+        return out
+    xs = np.array([st[0] for st in stars], np.int64)[ok]
+    ys = np.array([st[1] for st in stars], np.int64)[ok]
+    vv = v[ok]
+    ix = np.clip(ys * k // max(int(h), 1), 0, k - 1)
+    jx = np.clip(xs * k // max(int(w), 1), 0, k - 1)
+    for a in range(k):
+        for b in range(k):
+            m = (ix == a) & (jx == b)
+            if int(m.sum()) >= 2:
+                out[a, b] = float(np.median(vv[m]))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 拖线长度：逐帧二阶矩的长轴方差（比 circular fit_fwhm 更直接地反映"拉长")
 # ---------------------------------------------------------------------------
@@ -1683,14 +1719,22 @@ def strip_weights(C: np.ndarray, S: np.ndarray, R: np.ndarray,
     a = (A * R)[None, ...]
     # beta·R：细节区也保留一部分噪声惩罚（beta=0 即原行为：R=1 只看清晰度）
     b = (B * (1.0 - R) + float(beta) * R)[None, ...]
-    lc = np.log(np.maximum(C, 1e-12)).reshape(n, *([1] * R.ndim))
+    _Cc = np.asarray(C, np.float64)
+    if _Cc.ndim == 1:                      # 帧级标量（旧行为）
+        lc = np.log(np.maximum(_Cc, 1e-12)).reshape(n, *([1] * R.ndim))
+    else:                                  # 逐瓦片 (n, h, w)：直接对齐到条带
+        lc = np.log(np.maximum(_Cc, 1e-12))
     ls = np.log(np.maximum(S, 1e-12)).reshape(n, *([1] * R.ndim))
     if T is not None and fp:
         lt = np.log(np.maximum(np.asarray(T, np.float64), 1e-12)).reshape(
             n, *([1] * R.ndim))
     else:
         lt = 0.0
-    W = np.exp(a * lc + b * ls + fp * lt)
+    # 权重强度 γ：W^γ。γ=1 是原行为（完全按 C/S/T 加权），γ=0 退化为等权。
+    # 帧质量相近时，逐帧权重估计本身带噪声，过度加权会降低有效帧数、反而抬高噪声；
+    # 把它做成可调量，才谈得上"用多少权重"的实验，而不是写死。
+    _gr = float(os.environ.get('DWT_WGAMMA', '') or 1.0)
+    W = np.exp(_gr * (a * lc + b * ls + fp * lt))
     W /= np.maximum(W.mean(axis=0), 1e-30)[None]
     return W.astype(np.float32)
 
@@ -3291,6 +3335,52 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     log('[C] 最糊 3 帧 ' + '  '.join(
         f'#{int(i)}({fwhms[int(i)]:.2f}px)' for i in order[-3:]))
 
+    # ---- 逐瓦片清晰度（可选）：每帧在 K×K 瓦片里各量一个 FWHM ----
+    C_tiles = None
+    _kt = int(getattr(p, 'sharp_tiles', 0) or 0)
+    if _kt >= 2:
+        t1b = time.perf_counter()
+        _ft = np.full((n, _kt, _kt), np.nan, np.float32)
+        _h0, _w0 = int(fs.mm.shape[1]), int(fs.mm.shape[2])
+        for i in range(n):
+            _check_cancel()
+            try:
+                if _CFA.get('pattern'):
+                    _g = _cfa.plane(np.asarray(fs.frame(i), np.float32), _CFA['pattern'], 'G')
+                else:
+                    _g = np.asarray(fs.frame(i), np.float32)
+                _ev = measure_fwhm_each(_g, _cs)
+                _ft[i] = tile_fwhm_map(_ev, _cs, _g.shape[0], _g.shape[1], _kt).astype(np.float32)
+            except Exception:
+                pass
+            _emit('测瓦片', (i + 1) / max(n, 1), f'{i + 1}/{n} 帧')
+        _gmed = float(np.nanmedian(_ft))
+        if np.isfinite(_gmed) and _gmed > 0:
+            C_tiles = (_gmed / np.maximum(_ft, 1e-9)).astype(np.float32)
+            # 星太少的瓦片回落到该帧的全局 C，避免出现 0/NaN 权重
+            _bad = ~np.isfinite(C_tiles)
+            if _bad.any():
+                for i in range(n):
+                    C_tiles[i][_bad[i]] = float(C[i])
+            # 轻微平滑（σ≈0.6 瓦片）：压掉插值残留的折角，让权重场更接近真实视宁
+            try:
+                from scipy.ndimage import gaussian_filter as _gf
+                C_tiles = np.stack([_gf(C_tiles[i], 0.6, mode='nearest')
+                                    for i in range(n)]).astype(np.float32)
+            except Exception:
+                pass
+            _sp = []
+            for a in range(_kt):
+                for b in range(_kt):
+                    v = C_tiles[:, a, b]
+                    v = v[np.isfinite(v)]
+                    if len(v) > 2:
+                        _sp.append(float(np.percentile(v, 90) / max(np.percentile(v, 10), 1e-9)))
+            log(f'[C] 逐瓦片清晰度：{_kt}×{_kt} 瓦片，瓦片内 C 的 p90/p10 中位 {np.median(_sp):.2f}×，'
+                f'{time.perf_counter() - t1b:.1f}s')
+        else:
+            log('[C] 逐瓦片清晰度：瓦片 FWHM 全为空，退回全帧标量权重')
+
     sigma_psf = fmed / 2.3548
 
     # ---- 拖线长度：逐帧二阶矩，供 star_grow 自动取值 ----
@@ -4168,7 +4258,8 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                         return _sgf(fs, C, S, dx, dy, th, kk, drz_plan, A, B,
                                     rej_k=rej_k, rej_gate=rej_gate, R=_R2,
                                     pixfrac=_pf, log=log, T=T, fp=fp,
-                                    pattern=_CFA['pattern'], channel=_CFA['ch'])
+                                    pattern=_CFA['pattern'], channel=_CFA['ch'],
+                                    Ctiles=C_tiles)
                     except Exception as _e_fa:
                         if os.environ.get('DWT_WGPU_DEBUG') == '1':
                             import traceback as _tb
@@ -4209,7 +4300,8 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                                                 R=_R2, pixfrac=_pf, band_rows=_Hc,
                                                 log=log, T=T, fp=fp,
                                                 pattern=_CFA['pattern'],
-                                                channel=_CFA['ch'])
+                                                channel=_CFA['ch'],
+                                                Ctiles=C_tiles)
                             except Exception as _e_cv:
                                 if os.environ.get('DWT_WGPU_DEBUG') == '1':
                                     import traceback as _tb
@@ -4271,7 +4363,9 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                                 T=T, fp=float(fp), log=log,
                                 pattern=None, channel=None,
                                 # 黑白素材永远不用满月帧补偿；显式传 0 以杜绝环境变量串味
-                                beta=float(_detail_beta(p)))
+                                beta=float(_detail_beta(p)),
+                                # 逐瓦片清晰度（可选）：让每个区域各自挑最锐的帧
+                                Ctiles=C_tiles)
                             try:
                                 # cropcover.crop_box 要的是「每像素被多少帧覆盖」的计数图；
                                 # fatom 返回的 cov 是权重和（< 帧数、边缘更小），直接当计数
@@ -4386,7 +4480,8 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 ex = ProcessPoolExecutor(max_workers=nw, initializer=ini, initargs=ini_args)
                 try:
                     _beta_st = float(_detail_beta(p))
-                    jobs = ((y0, min(h, y0 + strip), R[y0:y0 + strip], C, S, A, B, rej_k,
+                    jobs = ((y0, min(h, y0 + strip), R[y0:y0 + strip],
+                             band_cfield(C, C_tiles, y0, min(h, y0 + strip), h, w), S, A, B, rej_k,
                              fs.sky0, rej_gate, T, fp, _beta_st)
                             for y0 in range(0, h, strip))
                     for k, (s, ne, rr, wm) in enumerate(ex.map(_task_strip, jobs, chunksize=1)):
@@ -4408,7 +4503,8 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                     _check_cancel()
                     y1 = min(h, y0 + strip)
                     _beta = _detail_beta(p)
-                    W = strip_weights(C, S, R[y0:y1], A, B, T=T, fp=fp, beta=_beta)
+                    W = strip_weights(band_cfield(C, C_tiles, y0, y1, h, w),
+                                      S, R[y0:y1], A, B, T=T, fp=fp, beta=_beta)
                     D = fs.stack_strips(y0, y1)
                     s, ne, rr = stack_strip(D, W, R[y0:y1], fs.sky0, rej_k=rej_k,
                                             rej_max_frac=rej_gate)
