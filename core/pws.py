@@ -4493,10 +4493,10 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         log(f'[输出] 采样口径：σ_psf {sigma_psf:.2f}→{sigma_psf * _pxr:.2f}px'
             f'（1.5~2 为目标区间）')
         if _CFA.get('pattern') and abs(_pxr - 1.0) < 1e-6 and _CFA.get('ch') == 'R':
-            log('[CFA] 提示：1× 真 CFA 的彩色平面采样间距是 2 像素，实测小星半高半径'
-                ' r50≈0.8px（不足 1 像素）属混叠 —— 星点会比 WBPP 更“硬”、与背景过渡更陡。'
-                '要物理正确的星点请改用 2× 输出（--drizzle-scale 2）；'
-                '若必须 1×，请走插值路径（--cfa-raw off）。')
+            log('[CFA] 提示：1× CFA drizzle 保持输入量纲（与 PI 的 Bayer drizzle 一致），'
+                '而 WBPP 成品通常比输入暗约 30%（其 master 天空 ≈0.70×输入）。'
+                '在同一拉伸下直接对比会显得我们的星点更早饱和、肩部更陡。'
+                '要与 WBPP 对齐量级请用 --match-scale（GUI「按参考图标定亮度」）指向其 master。')
         if f_out > 1.15 * fmed:
             log('[输出] 注意：这个通道量出来比单帧还糊，多半是通道太暗、高斯拟合在'
                 '暗星上发散（彩机的蓝通道常见）。图本身没问题，以目视/外部工具为准。')
