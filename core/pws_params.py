@@ -119,9 +119,9 @@ class PwsParams:
 PARAMS: Tuple[Param, ...] = (
     Param('gpu', '计算设备', 'choice', '标准',
           '叠加用 CPU 还是显卡',
-          '自动＝有可用 NVIDIA 显卡就走 GPU，否则 CPU',
-          choices=(('自动', 'auto'), ('只用 CPU', 'cpu'), ('只用 GPU（CUDA）', 'gpu'),
-                   ('wgpu（跨平台）', 'wgpu'))),
+          '自动＝优先用 wgpu（Vulkan/Metal/D3D12），用不了再退回 CPU；'
+          'wgpu＝强制走显卡，失败时报错而不退回 CPU（便于排查驱动）。',
+          choices=(('自动', 'auto'), ('只用 CPU', 'cpu'), ('wgpu（跨平台）', 'wgpu'))),
     # ---------------- 基础 ----------------
     Param('photos', '素材', 'sources', '基础',
           '待叠加的帧来源（目录与单张可混用）',

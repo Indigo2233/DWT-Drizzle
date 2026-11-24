@@ -2685,11 +2685,6 @@ def _log_env_once() -> None:
                 return __import__(name, fromlist=[name])
 
         try:
-            gpu_dz = _mod('gpu_dz')
-            bits.append('CUDA 可用' if gpu_dz.available() else 'CUDA 不可用')
-        except Exception:
-            bits.append('CUDA 不可用')
-        try:
             gpu_wgpu = _mod('gpu_wgpu')
             ok = False
             why = '未检测'
@@ -2786,7 +2781,7 @@ def _run(p: PwsParams) -> Dict:
         if cfa_pat:
             log(f'[CFA] 彩机素材，拜耳阵列 {cfa_pat}：R/G/B 三通道各自拆色后叠加'
                 f'（G 先跑并记录配准与画布，R/B 复用同一套几何，保证三通道像素级对齐）')
-    _wshare = str(getattr(p, 'cfa_weights', 'shared') or 'shared').lower() == 'shared'
+    _wshare = str(getattr(p, 'cfa_weights', 'auto') or 'auto').lower() in ('shared', 'auto')
     # 逐通道独立配准（PI 的做法）：只关掉「几何复用」，权重仍可共用
     _align_own = str(getattr(p, 'cfa_align', 'shared') or 'shared').strip().lower() == 'own'
     # 逐通道画布：关掉「画布强制统一」，各通道用自己的配准结果定画布
@@ -4070,7 +4065,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         _C, _S, _T = _CFA['share']
         C, S = _C, _S
         T = _T
-        log('[CFA] 权重共用：C/S/T 取 G 通道的量（--cfa-weights shared）')
+        log('[CFA] 权重共用：C/S/T 取 G 通道的量（自动/共用模式）')
     elif _CFA.get('want_wshare') and _CFA.get('ch') == 'G':
         _CFA['share'] = (np.array(C, copy=True), np.array(S, copy=True),
                          None if T is None else np.array(T, copy=True))
@@ -4162,22 +4157,19 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                         int(_CFA.get('origin', (0, 0))[1]) % 2,
                         int(_CFA.get('origin', (0, 0))[0]) % 2)
             log('[CFA] 真 CFA drizzle：只投 %s 的原始样本（不插值）' % _CFA['ch'])
-        # ---- 后端选择（分支 C）----
-        #   gpu=auto  → 有 wgpu 设备就用它（跨平台：Vulkan / Metal / D3D12）
-        #   gpu=wgpu  → 强制 wgpu；gpu=cpu/gpu 语义不变（CUDA 走原来的 CuPy 路径）
+        # ---- 后端选择 ----
+        #   gpu=auto → 优先 wgpu（跨平台：Vulkan / Metal / D3D12），用不了退回 CPU
+        #   gpu=wgpu → 强制 wgpu（失败报错，不静默退回 CPU）
+        #   gpu=cpu  → 纯 CPU
+        #   兼容：旧配置里的 gpu=gpu（原 CUDA/CuPy 路径）按 wgpu 处理，CuPy 已于 2.7.73 移除
         #   环境变量 DWT_GPU_WGPU=1/0 可强制开/关（调试用）
-        #   注意：wgpu 后端目前没有逐像素排异，也不支持真 CFA 的颜色掩膜
         _gpu_sel = str(getattr(p, 'gpu', 'auto') or 'auto').strip().lower()
+        if _gpu_sel == 'gpu':
+            log('[GPU] 选项「只用 GPU（CUDA）」已随 CuPy 移除，改按 wgpu 处理')
+            _gpu_sel = 'wgpu'
         _env_wgpu = os.environ.get('DWT_GPU_WGPU', '').strip()
-        _cuda_ok = False
-        if _gpu_sel in ('auto', 'gpu'):
-            try:
-                from gpu_dz import available as _cuda_avail
-                _cuda_ok = bool(_cuda_avail())
-            except Exception:
-                _cuda_ok = False
         _want_wgpu = (_env_wgpu == '1') or (_gpu_sel == 'wgpu') or (
-            _gpu_sel == 'auto' and _env_wgpu != '0' and not _cuda_ok)
+            _gpu_sel == 'auto' and _env_wgpu != '0')
         _wgpu_ok = False
         if _want_wgpu and _env_wgpu != '0':
             try:

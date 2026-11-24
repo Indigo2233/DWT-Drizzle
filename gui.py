@@ -131,6 +131,7 @@ DEFAULTS = {
     "pix": "0.8", "r_blur": "0",
     "bgdeg": "1", "r_mode": "max", "sharp_w": "", "fwhm_max": "", "xdrz": "", "match": "",
     "flux_pow": "0.0",
+    "cfa_weights": "auto",
     "pick": "H",
     "gpu": "auto",
     "bg_r": "0",
@@ -237,7 +238,7 @@ def _argv_common(c) -> list:
         argv += ["--cfa-debayer", c["cfa_debayer"]]
     if str(c.get("jobs", "0")).strip() not in ("", "0"):
         argv += ["--jobs", str(c.get("jobs")).strip()]
-    if c.get("cfa_weights") and c["cfa_weights"] != "shared":
+    if c.get("cfa_weights") and c["cfa_weights"] != "auto":
         argv += ["--cfa-weights", c["cfa_weights"]]
     if c.get("cfa_grid", "shared") != "shared":
         argv += ["--cfa-grid", c["cfa_grid"]]
@@ -642,12 +643,11 @@ class App(tk.Tk):
         ttk.Entry(fr_fr, textvariable=self.v_frame).grid(row=0, column=0, sticky="ew")
         arow(9, "输出网格", fr_fr,
              "填 master：成品宽高/朝向与它一致（不用再事后裁切）")
-        cb_gpu = ttk.Combobox(adv, values=["自动", "只用 CPU", "只用 GPU（CUDA）",
-                                          "wgpu（跨平台）"],
+        cb_gpu = ttk.Combobox(adv, values=["自动", "只用 CPU", "wgpu（跨平台）"],
                               state="readonly", width=14, textvariable=self.v_gpu)
         arow(10, "计算设备", cb_gpu,
-             "自动：有 wgpu 设备（Vulkan/Metal/D3D12）优先用它，否则 NVIDIA 走 CUDA；"
-             "wgpu 目前不支持真 CFA（会自动回退 CPU）")
+             "自动：优先用 wgpu（Vulkan/Metal/D3D12），用不了退回 CPU；"
+             "wgpu：强制显卡，失败直接报错便于排查驱动")
         self.v_tunea = tk.StringVar()
         arow(11, "调参 A 候选", ttk.Entry(adv, textvariable=self.v_tunea, width=18),
              "逗号分隔，默认 10,14,20；按暗部优先可写 6,10,14,20")
@@ -675,7 +675,7 @@ class App(tk.Tk):
         arow(15, "彩色权重", ttk.Combobox(
             adv, state="readonly", width=12, textvariable=self.v_cfaw,
             values=["自动", "共用", "逐通道"]),
-             "共用＝三通道用同一套 C/S/T（与 PI 一致、更快）；逐通道＝各算各的")
+             "自动＝按首帧色差判断（默认）；共用＝三通道用同一套 C/S/T（与 PI 一致、更快）；逐通道＝各算各的")
         self.v_jobs = tk.StringVar()
         self.v_refk = tk.StringVar()
         _sp_refk = ttk.Spinbox(adv, from_=0, to=64, increment=1, width=6, textvariable=self.v_refk)
@@ -895,7 +895,7 @@ class App(tk.Tk):
         self.v_flux.set(c.get("flux_pow", "0.0"))
         self.v_ccrop.set(c.get("crop_cover", "0.9"))
         self.v_gpu.set({"auto": "自动", "cpu": "只用 CPU",
-                        "gpu": "只用 GPU（CUDA）", "wgpu": "wgpu（跨平台）"}.get(
+                        "wgpu": "wgpu（跨平台）", "gpu": "自动"}.get(
             c.get("gpu", "auto"), "自动"))
         self.v_frame.set(c.get("frame", ""))
         self.v_tunea.set(c.get("tune_a", "10,14,20"))
@@ -913,8 +913,8 @@ class App(tk.Tk):
             str(c.get("cfa_grid", "shared")), "共用画布"))
         self.v_cfaa.set({"shared": "共用几何", "own": "逐通道独立"}.get(
             str(c.get("cfa_align", "auto")), "自动判断"))
-        self.v_cfaw.set({"shared": "共用", "own": "逐通道"}.get(
-            c.get("cfa_weights", "shared"), "共用"))
+        self.v_cfaw.set({"auto": "自动", "shared": "共用", "own": "逐通道"}.get(
+            str(c.get("cfa_weights", "auto")), "自动"))
         self.v_cfaraw.set({"auto": "自动", "on": "强制开",
                            "off": "强制关（走插值）"}.get(
             c.get("cfa_raw", "auto"), "自动"))
@@ -958,7 +958,7 @@ class App(tk.Tk):
             "fwhm_max": self.v_fwhm.get().strip(),
             "flux_pow": self.v_flux.get().strip(),
             "crop_cover": self.v_ccrop.get().strip(),
-            "gpu": {"自动": "auto", "只用 CPU": "cpu", "只用 GPU（CUDA）": "gpu",
+            "gpu": {"自动": "auto", "只用 CPU": "cpu",
                     "wgpu（跨平台）": "wgpu"}.get(self.v_gpu.get().strip(), "auto"),
             "frame": self.v_frame.get().strip(),
             "tune_a": self.v_tunea.get().strip() or "10,14,20",
@@ -1377,7 +1377,7 @@ class App(tk.Tk):
         """关于：方法与原文出处（PWS，D.Cikey）"""
         messagebox.showinfo(
             "关于 DWT · Drizzle",
-            "DWT · Drizzle 2.7.101-D\n\n" + LICENSE_TEXT)
+            "DWT · Drizzle 2.7.102-D\n\n" + LICENSE_TEXT)
 
     def show_help(self):
         """打开内置使用说明（不依赖浏览器 / 外部程序）"""
