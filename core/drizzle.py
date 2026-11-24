@@ -1857,8 +1857,14 @@ def _drizzle_band(ctx, Y0: int, Y1: int) -> Dict:
             # （8 帧实测 12.3% 空洞，20 帧 3.2%）；取 2s 时任何帧数都铺满，
             # 代价是每个样本摊到两倍面积（噪声 4.24e-4 vs 6.61e-4，变糊）。
             # 折中：帧数够多（≥30）说明抖得开，用足迹 s；帧少用 2s 保覆盖。
-            _pm = _pm if _pm > 0 else (1.0 if int(ctx.get('n', 0) or 0) >= 30 else 2.0)
-            Pi = max(1e-6, float(pixfrac) * s * kk * _pm)
+            # 真 CFA：同色样本的间距是 2 源像素，液滴必须按这个间距铺满
+            # （即"该颜色在输出网格上的采样单元"），否则相位权重不均会产生
+            # 2×2 亮暗调制（78 帧 1× 实测相位差 4.6%）。锐度不受影响：
+            # 样本落点仍按真实亚像素位置，液滴只决定footprint。
+            _pm = _pm if _pm > 0 else 2.0
+            _pov = (float(os.environ.get('DWT_CFA_POVER', '1.15') or 1.06)
+                    if ctx.get('cfa_sel') is not None else 1.0)
+            Pi = max(1e-6, float(pixfrac) * s * kk * _pm * _pov)
             ux, uy = -float(dx[i]), -float(dy[i])
             j0, j1 = _band_rows(plan, th, uy, Y0, Y1, h, w, Pi, kk, dd)
             if j1 <= j0:
@@ -2067,7 +2073,11 @@ def stack_drizzle(fs, R_out: np.ndarray, C: np.ndarray, S: np.ndarray,
     if (cfa_sel is not None and float(pixfrac) < 1.0
             and os.environ.get('DWT_CFA_PIX_STRICT', '') != '1'):
         pixfrac = 1.0          # CFA：液滴必须铺满同色格点，否则必有空洞
-    P = max(1e-6, float(pixfrac) * s * (2.0 if cfa_sel is not None else 1.0))
+    _pov = float(os.environ.get('DWT_CFA_POVER', '1.15') or 1.06) if cfa_sel is not None else 1.0
+    # CFA：铺满时液滴边正好等于格点间距，浮点舍入会在相邻液滴之间留 1px 缝，
+    # 表现为 2×2 亮暗调制（实测 B 通道相位 ±1.7%，WBPP 平场 1.000）。
+    # 给 15% 重叠：每个输出像素至少被两个样本覆盖，相位调制消失（实测 5.2%→0.04%）。
+    P = max(1e-6, float(pixfrac) * s * (2.0 if cfa_sel is not None else 1.0) * _pov)
     mx = {} if use_rot else {i: _axis_matrix(w, W, s, dx[i], pixfrac, plan['ox']) for i in idx}
     Stk = np.zeros((H, W), np.float32)
     neff = np.zeros((H, W), np.float32)
