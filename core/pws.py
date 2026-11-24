@@ -4546,6 +4546,35 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                             % (int(_rej.sum()), 100.0 * float(_rej.sum()) / Stk.size))
                 except Exception as _e:
                     log('[输出] 排异空像素填充失败（%s），保留原值' % _e)
+        # 2×2 去格点（CFA 专用）：即使液滴按同色格点铺满，输出像素的 4 个相位
+        # 仍会拿到不同数目的样本（液滴边长 2.3 输出像素 vs 输出格点 1 像素），
+        # 表现为每隔一个像素的系统性亮暗差——强拉伸下就是"细密网格"，
+        # 星点边缘对比度最高，看起来像"黑边"。实测用户 78 帧 B：相位差 0.9%~3.3%。
+        # 这里用天空为主体的 4 个相位中位数估计增益（星点占比 <2%，中位不受影响），
+        # 归一到均值后除掉。只改常数增益，不动任何结构，也不引入噪声。
+        if _CFA.get('pattern') and os.environ.get('DWT_CFA_DELATTICE', '1') != '0':
+            try:
+                _dl = np.isfinite(Stk)
+                _g = np.ones((2, 2), np.float64)
+                for _i in (0, 1):
+                    for _j in (0, 1):
+                        _sub = Stk[_i::2, _j::2]
+                        _sub = _sub[np.isfinite(_sub)]
+                        if _sub.size > 1000:
+                            _g[_i, _j] = float(np.median(_sub))
+                        else:
+                            _g[_i, _j] = float('nan')
+                if np.isfinite(_g).all() and _g.min() > 0:
+                    _gm = _g.mean()
+                    _sp = (_g.max() - _g.min()) / _gm * 100.0
+                    if _sp > 0.05:
+                        for _i in (0, 1):
+                            for _j in (0, 1):
+                                Stk[_i::2, _j::2] *= np.float32(_gm / _g[_i, _j])
+                        log('[CFA] 2×2 去格点：四相位增益 %s（相差 %.2f%%）→ 已归一'
+                            % (np.array2string(np.round(_g / _gm, 4), separator=','), _sp))
+            except Exception as _e:
+                log('[CFA] 去格点失败（%s），跳过' % _e)
         # 成品有效性门禁：几乎全空的图不该写盘（否则用户拿到一张全黑图还收到"完成"）
         _fin = np.isfinite(Stk)
         _vfrac = float(np.count_nonzero(_fin)) / float(max(1, Stk.size))
