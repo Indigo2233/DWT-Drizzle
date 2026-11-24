@@ -233,7 +233,9 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
     h, w = int(fs.shape[0]), int(fs.shape[1])
     # CFA：同色格点间隔 2 源像素，液滴边长要乘 2，否则 2× 输出会留 3/4 覆盖空洞
     _pm = float(os.environ.get('DWT_CFA_PMUL', '0') or 0)
-    _pm = _pm if _pm > 0 else (2.0 if pattern is not None else 1.0)
+    # 与 CPU 同一策略：帧数 ≥30 用样本足迹（锐，靠抖动填相位），
+    # 帧少用 2s 保覆盖（否则 8 帧实测 12% 空洞）。DWT_CFA_PMUL 可覆盖。
+    _pm = _pm if _pm > 0 else (1.0 if n >= 30 else 2.0)
     P = max(1e-6, float(pixfrac) * s_grid * _pm)
 
     n = len(dx)

@@ -1853,7 +1853,11 @@ def _drizzle_band(ctx, Y0: int, Y1: int) -> Dict:
             if not np.isfinite(dd):
                 dd = 0.0
             _pm = float(os.environ.get('DWT_CFA_PMUL', '0') or 0)
-            _pm = _pm if _pm > 0 else (2.0 if ctx.get('cfa_sel') is not None else 1.0)
+            # 液滴边长的两难：取样本足迹 s 时分辨率最高，但相位要靠抖动填满
+            # （8 帧实测 12.3% 空洞，20 帧 3.2%）；取 2s 时任何帧数都铺满，
+            # 代价是每个样本摊到两倍面积（噪声 4.24e-4 vs 6.61e-4，变糊）。
+            # 折中：帧数够多（≥30）说明抖得开，用足迹 s；帧少用 2s 保覆盖。
+            _pm = _pm if _pm > 0 else (1.0 if int(ctx.get('n', 0) or 0) >= 30 else 2.0)
             Pi = max(1e-6, float(pixfrac) * s * kk * _pm)
             ux, uy = -float(dx[i]), -float(dy[i])
             j0, j1 = _band_rows(plan, th, uy, Y0, Y1, h, w, Pi, kk, dd)

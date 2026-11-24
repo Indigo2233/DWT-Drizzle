@@ -4492,7 +4492,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 Stk[_unc] = np.nan
                 log('[输出] 无样本像素：%d 个（%.3f%%，画布上没有任何帧覆盖，多为抖动并集之外）'
                     '——写 NaN，不伪造数值；可用「自动裁边」去掉'
-                    % (int(_unc.sum()), float(_unc.sum()) / Stk.size))
+                    % (int(_unc.sum()), 100.0 * float(_unc.sum()) / Stk.size))
             if bool(_rej.any()):
                 try:
                     from scipy.ndimage import distance_transform_edt as _edt2
@@ -4502,7 +4502,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                         Stk = Stk[tuple(_idx)].astype(Stk.dtype, copy=False)
                         log('[输出] 警告：%d 个像素有样本却被排异剔空（%.3f%%），已用最近邻临时填充；'
                             '请把日志发回（排异逻辑应保证至少保留一个样本）'
-                            % (int(_rej.sum()), float(_rej.sum()) / Stk.size))
+                            % (int(_rej.sum()), 100.0 * float(_rej.sum()) / Stk.size))
                 except Exception as _e:
                     log('[输出] 排异空像素填充失败（%s），保留原值' % _e)
         # 成品有效性门禁：几乎全空的图不该写盘（否则用户拿到一张全黑图还收到"完成"）

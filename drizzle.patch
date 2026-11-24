@@ -3767,7 +3767,7 @@
 +                Stk[_unc] = np.nan
 +                log('[输出] 无样本像素：%d 个（%.3f%%，画布上没有任何帧覆盖，多为抖动并集之外）'
 +                    '——写 NaN，不伪造数值；可用「自动裁边」去掉'
-+                    % (int(_unc.sum()), float(_unc.sum()) / Stk.size))
++                    % (int(_unc.sum()), 100.0 * float(_unc.sum()) / Stk.size))
 +            if bool(_rej.any()):
 +                try:
 +                    from scipy.ndimage import distance_transform_edt as _edt2
@@ -3777,7 +3777,7 @@
 +                        Stk = Stk[tuple(_idx)].astype(Stk.dtype, copy=False)
 +                        log('[输出] 警告：%d 个像素有样本却被排异剔空（%.3f%%），已用最近邻临时填充；'
 +                            '请把日志发回（排异逻辑应保证至少保留一个样本）'
-+                            % (int(_rej.sum()), float(_rej.sum()) / Stk.size))
++                            % (int(_rej.sum()), 100.0 * float(_rej.sum()) / Stk.size))
 +                except Exception as _e:
 +                    log('[输出] 排异空像素填充失败（%s），保留原值' % _e)
 +        # 成品有效性门禁：几乎全空的图不该写盘（否则用户拿到一张全黑图还收到"完成"）
@@ -4665,7 +4665,7 @@
 +    return bool(detect_pattern(meta))
 --- a/core/drizzle.py
 +++ b/core/drizzle.py
-@@ -0,0 +1,2408 @@
+@@ -0,0 +1,2412 @@
 +"""Drizzle 重采样层（PWS 的几何层）
 +
 +把 PWS 阶段 C 的"唯一一次加权平均（式 12）"换成**带权 drizzle 累积**，从而在
@@ -6521,7 +6521,11 @@
 +            if not np.isfinite(dd):
 +                dd = 0.0
 +            _pm = float(os.environ.get('DWT_CFA_PMUL', '0') or 0)
-+            _pm = _pm if _pm > 0 else (2.0 if ctx.get('cfa_sel') is not None else 1.0)
++            # 液滴边长的两难：取样本足迹 s 时分辨率最高，但相位要靠抖动填满
++            # （8 帧实测 12.3% 空洞，20 帧 3.2%）；取 2s 时任何帧数都铺满，
++            # 代价是每个样本摊到两倍面积（噪声 4.24e-4 vs 6.61e-4，变糊）。
++            # 折中：帧数够多（≥30）说明抖得开，用足迹 s；帧少用 2s 保覆盖。
++            _pm = _pm if _pm > 0 else (1.0 if int(ctx.get('n', 0) or 0) >= 30 else 2.0)
 +            Pi = max(1e-6, float(pixfrac) * s * kk * _pm)
 +            ux, uy = -float(dx[i]), -float(dy[i])
 +            j0, j1 = _band_rows(plan, th, uy, Y0, Y1, h, w, Pi, kk, dd)
@@ -11519,7 +11523,7 @@
 +            'plan': plan, 'backend': 'wgpu-scatter'}
 --- a/core/gpu_wgpu_cfa_fatom.py
 +++ b/core/gpu_wgpu_cfa_fatom.py
-@@ -0,0 +1,601 @@
+@@ -0,0 +1,603 @@
 +"""真·散射累加后端（float32 原子加）。
 +
 +与分桶后端的区别：不保存样本，直接对输出像素做原子累加，显存只占 6 个画布大小的
@@ -11755,7 +11759,9 @@
 +    h, w = int(fs.shape[0]), int(fs.shape[1])
 +    # CFA：同色格点间隔 2 源像素，液滴边长要乘 2，否则 2× 输出会留 3/4 覆盖空洞
 +    _pm = float(os.environ.get('DWT_CFA_PMUL', '0') or 0)
-+    _pm = _pm if _pm > 0 else (2.0 if pattern is not None else 1.0)
++    # 与 CPU 同一策略：帧数 ≥30 用样本足迹（锐，靠抖动填相位），
++    # 帧少用 2s 保覆盖（否则 8 帧实测 12% 空洞）。DWT_CFA_PMUL 可覆盖。
++    _pm = _pm if _pm > 0 else (1.0 if n >= 30 else 2.0)
 +    P = max(1e-6, float(pixfrac) * s_grid * _pm)
 +
 +    n = len(dx)
@@ -13503,7 +13509,7 @@
 +        """关于：方法与原文出处（PWS，D.Cikey）"""
 +        messagebox.showinfo(
 +            "关于 DWT · Drizzle",
-+            "DWT · Drizzle 2.7.87-D\n\n" + LICENSE_TEXT)
++            "DWT · Drizzle 2.7.89-D\n\n" + LICENSE_TEXT)
 +
 +    def show_help(self):
 +        """打开内置使用说明（不依赖浏览器 / 外部程序）"""
