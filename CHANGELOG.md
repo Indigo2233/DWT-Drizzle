@@ -88,7 +88,7 @@
 - **吞吐权重默认关闭**（`flux_pow 2 → 0`）：HFG1-3 O 通道 σ 1.4857 → 1.4241e-05（−4.1%）、FWHM 3.34 → 3.31；H 通道 −1.7%。
 - 默认值收口：彩色权重默认「自动」（= 共用，附实测理由）；删除已失效的 CUDA 选项。
 - `使用说明.md` 整体重写（865 → 约 200 行），参数指南按当前默认值与实测数据重写。
-- macOS 包按 D 线重建（arm64 / intel，自包含 Python 3.12；暂不含 wgpu 轮子，默认 CPU）。
+- macOS 包按 D 线重建（arm64 / intel，自包含 Python 3.12 + wgpu 0.33（Metal），可用 GPU 加速）。
 
 ---
 
@@ -106,4 +106,4 @@
 
 - `--crop` + `--frame` 同时使用时倍率换算仍有偏差。
 - 1× 真 CFA 下 PSF 空间均匀性弱于 WBPP（A≥14 时 1.37× vs 1.15×）；交给 SXT 前建议 A ≤ 6。
-- macOS 包为 CPU 路径（未内置 Metal 的 wgpu 轮子）。
+- macOS 首次打开若被 Gatekeeper 拦，需右键打开或 `xattr -dr com.apple.quarantine <目录>`。
