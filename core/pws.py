@@ -3027,6 +3027,15 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     # 参数别名：算法体统一从 PwsParams 取值
     A, B = float(p.A), float(p.B)
     # A 完全按用户填的走（彩机/黑白都不再自动改），选项栏下方给了建议值。
+    # 但真 CFA 下 A>6 会让「最锐的那一帧」在逐像素上独占权重：实测用户 78 帧 B、
+    # A=10 时单帧最大权重是均值的 409 倍，成品在小星周围出现 8.5%~28.6% 的
+    # 低于天空 −2σ 的像素（A=6 时 0.5%，A=4 时 0.3%）。这里对真 CFA 设上限 6，
+    # 并在日志里说明；要保留原值请设 DWT_A_KEEP=1。
+    if _CFA.get('pattern') and A > 6.0 and os.environ.get('DWT_A_KEEP', '') != '1':
+        log(f'[CFA] 清晰度 A 上限 6：你填的 {A:g} 会让最锐帧在逐像素上独占权重'
+            '（实测 A=10 时小星周围低于天空 -2σ 的像素 8.5%~28.6%，A=6 为 0.5%），'
+            '已按 6 计算；要强制使用请设 DWT_A_KEEP=1')
+        A = 6.0
     r_floor = float(p.r_floor)
     env_win_mult, env_eps, env_p = float(p.env_win_mult), float(p.env_eps), float(p.env_p)
     star_grow_pct = float(p.star_grow_pct)
