@@ -2073,7 +2073,10 @@ def stack_drizzle(fs, R_out: np.ndarray, C: np.ndarray, S: np.ndarray,
     if (cfa_sel is not None and float(pixfrac) < 1.0
             and os.environ.get('DWT_CFA_PIX_STRICT', '') != '1'):
         pixfrac = 1.0          # CFA：液滴必须铺满同色格点，否则必有空洞
-    _pov = float(os.environ.get('DWT_CFA_POVER', '1.15') or 1.06) if cfa_sel is not None else 1.0
+    # 1× 时同色样本间距正好 2 个输出像素，液滴再放大 15% 会与相邻样本过度重叠，
+    # 归一后在小星周围留下低于天空的"坑"。实测：1× 用 1.0、2× 用 1.15 最干净。
+    _pov_def = '1.0' if float(s) <= 1.0 else '1.15'
+    _pov = float(os.environ.get('DWT_CFA_POVER', _pov_def) or _pov_def) if cfa_sel is not None else 1.0
     # CFA：铺满时液滴边正好等于格点间距，浮点舍入会在相邻液滴之间留 1px 缝，
     # 表现为 2×2 亮暗调制（实测 B 通道相位 ±1.7%，WBPP 平场 1.000）。
     # 给 15% 重叠：每个输出像素至少被两个样本覆盖，相位调制消失（实测 5.2%→0.04%）。

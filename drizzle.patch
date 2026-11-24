@@ -4735,7 +4735,7 @@
 +    return bool(detect_pattern(meta))
 --- a/core/drizzle.py
 +++ b/core/drizzle.py
-@@ -0,0 +1,2422 @@
+@@ -0,0 +1,2425 @@
 +"""Drizzle 重采样层（PWS 的几何层）
 +
 +把 PWS 阶段 C 的"唯一一次加权平均（式 12）"换成**带权 drizzle 累积**，从而在
@@ -6811,7 +6811,10 @@
 +    if (cfa_sel is not None and float(pixfrac) < 1.0
 +            and os.environ.get('DWT_CFA_PIX_STRICT', '') != '1'):
 +        pixfrac = 1.0          # CFA：液滴必须铺满同色格点，否则必有空洞
-+    _pov = float(os.environ.get('DWT_CFA_POVER', '1.15') or 1.06) if cfa_sel is not None else 1.0
++    # 1× 时同色样本间距正好 2 个输出像素，液滴再放大 15% 会与相邻样本过度重叠，
++    # 归一后在小星周围留下低于天空的"坑"。实测：1× 用 1.0、2× 用 1.15 最干净。
++    _pov_def = '1.0' if float(s) <= 1.0 else '1.15'
++    _pov = float(os.environ.get('DWT_CFA_POVER', _pov_def) or _pov_def) if cfa_sel is not None else 1.0
 +    # CFA：铺满时液滴边正好等于格点间距，浮点舍入会在相邻液滴之间留 1px 缝，
 +    # 表现为 2×2 亮暗调制（实测 B 通道相位 ±1.7%，WBPP 平场 1.000）。
 +    # 给 15% 重叠：每个输出像素至少被两个样本覆盖，相位调制消失（实测 5.2%→0.04%）。
@@ -11844,7 +11847,7 @@
 +    n = len(dx)
 +    # 同 CPU：真 CFA 的液滴按同色格点间距（2 源像素）铺满，避免 2×2 相位调制。
 +    _pm = _pm if _pm > 0 else 2.0
-+    _pov = float(os.environ.get('DWT_CFA_POVER', '1.15') or 1.06) if pattern is not None else 1.0
++    _pov = float(os.environ.get('DWT_CFA_POVER', '1.0' if float(s_grid) <= 1.0 else '1.15') or 1.0) if pattern is not None else 1.0
 +    P = max(1e-6, float(pixfrac) * s_grid * _pm * _pov)
 +    idx = [i for i in range(n) if np.isfinite(dx[i]) and np.isfinite(dy[i])
 +           and (th is None or np.isfinite(th[i]))]
@@ -13590,7 +13593,7 @@
 +        """关于：方法与原文出处（PWS，D.Cikey）"""
 +        messagebox.showinfo(
 +            "关于 DWT · Drizzle",
-+            "DWT · Drizzle 2.7.94-D\n\n" + LICENSE_TEXT)
++            "DWT · Drizzle 2.7.95-D\n\n" + LICENSE_TEXT)
 +
 +    def show_help(self):
 +        """打开内置使用说明（不依赖浏览器 / 外部程序）"""
