@@ -4097,6 +4097,13 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             _wgpu_ok = False
         elif _wgpu_ok and _cfa_sel is not None:
             _pf = float(getattr(p, 'drizzle_pix', 1.0) or 1.0)
+            # CFA：同色格点间隔 2 源像素，2× 输出时样本间距 4 输出像素；
+            # 液滴边长 = pixfrac*s*2，pixfrac<1 必然在网格相位上留缝（构造性问题，
+            # 不是「帧少才显」）。所以真 CFA 下无条件抬到 1.0。
+            if _pf < 1.0 and not os.environ.get('DWT_CFA_PIX_STRICT'):
+                log(f'[CFA] 液滴边长按同色格点铺满：pixfrac {_pf:g} → 1.0'
+                    f'（低于 1 会在 2× 网格上留空洞；想强制保留设 DWT_CFA_PIX_STRICT=1）')
+                _pf = 1.0
             _sc = float(drz_plan.get('s', 1.0)) if drz_plan else 1.0
             _near = os.environ.get('DWT_WGPU_CFA_NEAR', '').strip() == '1'
             if _near and abs(_pf * _sc - 1.0) <= 0.02:
@@ -4122,6 +4129,8 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 _R2 = R if R is not None else None
                 if _cfa_sel is not None:
                     _pf = float(getattr(p, 'drizzle_pix', 1.0) or 1.0)
+                    if _pf < 1.0 and not os.environ.get('DWT_CFA_PIX_STRICT'):
+                        _pf = 1.0   # CFA：液滴必须铺满同色格点（P=2s），否则留空洞
                     _pd = _pf * float(drz_plan.get('s', 1.0))
                     # 默认全部走散射：最近邻在 P=1 且带旋转时会丢掉液滴的分数覆盖
                     # （20 帧实测 corr 仅 0.92），散射与 CPU 逐像素等价（corr 0.9997）
@@ -4466,21 +4475,36 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 if _nan_n:
                     Stk = np.where(_bad, np.nan, Stk).astype(Stk.dtype, copy=False)
                     log(f'[输出] 未覆盖像素置 NaN：{_nan_n} 个（{_nan_n / Stk.size:.3%}）')
-        # 「全被排异掉」的像素会留下 0：cov>0 但分子为 0，图上看就是一个个黑点，
-        # 连成 2×2/4×4 的细密网格。这些像素没有任何真值，用最近邻补上（天空量级），
-        # 否则拉伸后网格非常显眼。
-        _z = np.isfinite(Stk) & (Stk <= 0.0) if os.environ.get('DWT_NO_HOLEFILL','') != '1' else np.zeros_like(Stk, bool)
-        _zn = int(np.count_nonzero(_z))
-        if _zn:
-            try:
-                from scipy.ndimage import distance_transform_edt as _edt2
-                _ok = ~_z
-                if _ok.any():
-                    _idx = _edt2(_z, return_distances=False, return_indices=True)
-                    Stk = Stk[tuple(_idx)].astype(Stk.dtype, copy=False)
-                    log(f'[输出] 空像素补洞：{_zn} 个（{_zn / Stk.size:.3%}）用最近邻填充')
-            except Exception as _e:
-                log(f'[输出] 空像素补洞失败（{_e}），保留原值')
+        # 两类"空"必须分开处理：
+        #   ① 画布上没有任何帧覆盖的像素（cov=0）——这是几何决定的，位于抖动并集之外，
+        #      多在画布边缘；写 NaN 表示"无数据"，交给自动裁边，绝不伪造数值。
+        #   ② 有样本但被排异剔空的像素（cov>0、分子=0）——已在排异处保证"至少留一个
+        #      真实样本"，正常不会再出现；若出现说明逻辑回退，补上并报警。
+        _z = np.isfinite(Stk) & (Stk <= 0.0)
+        if bool(_z.any()):
+            _ct = np.asarray(cov_map) if cov_map is not None else None
+            # cov 是「落点面积之和」。画布边缘只有部分液滴压到，cov 很小但 >0；
+            # 这些像素属于「没被完整覆盖」，不是「被排异剔空」——用 cov<0.5 区分，
+            # 否则每次都会误报几万个「排异剔空」。
+            _unc = (_z & (_ct < 0.5)) if _ct is not None and _ct.shape == Stk.shape else _z.copy()
+            _rej = _z & ~_unc
+            if bool(_unc.any()):
+                Stk[_unc] = np.nan
+                log('[输出] 无样本像素：%d 个（%.3f%%，画布上没有任何帧覆盖，多为抖动并集之外）'
+                    '——写 NaN，不伪造数值；可用「自动裁边」去掉'
+                    % (int(_unc.sum()), float(_unc.sum()) / Stk.size))
+            if bool(_rej.any()):
+                try:
+                    from scipy.ndimage import distance_transform_edt as _edt2
+                    _ok = ~_z
+                    if _ok.any():
+                        _idx = _edt2(_z, return_distances=False, return_indices=True)
+                        Stk = Stk[tuple(_idx)].astype(Stk.dtype, copy=False)
+                        log('[输出] 警告：%d 个像素有样本却被排异剔空（%.3f%%），已用最近邻临时填充；'
+                            '请把日志发回（排异逻辑应保证至少保留一个样本）'
+                            % (int(_rej.sum()), float(_rej.sum()) / Stk.size))
+                except Exception as _e:
+                    log('[输出] 排异空像素填充失败（%s），保留原值' % _e)
         # 成品有效性门禁：几乎全空的图不该写盘（否则用户拿到一张全黑图还收到"完成"）
         _fin = np.isfinite(Stk)
         _vfrac = float(np.count_nonzero(_fin)) / float(max(1, Stk.size))

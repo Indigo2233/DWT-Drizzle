@@ -2575,7 +2575,7 @@
      idx = np.argsort(np.nan_to_num(fwhms, nan=1e9))[:k]
  
      if star_grow_pct > 0:
-@@ -1586,88 +3352,1023 @@
+@@ -1586,88 +3352,1032 @@
      else:
          log('[拖线] 星点锐帧扩展已关闭（0%）')
  
@@ -3355,6 +3355,13 @@
 +            _wgpu_ok = False
 +        elif _wgpu_ok and _cfa_sel is not None:
 +            _pf = float(getattr(p, 'drizzle_pix', 1.0) or 1.0)
++            # CFA：同色格点间隔 2 源像素，2× 输出时样本间距 4 输出像素；
++            # 液滴边长 = pixfrac*s*2，pixfrac<1 必然在网格相位上留缝（构造性问题，
++            # 不是「帧少才显」）。所以真 CFA 下无条件抬到 1.0。
++            if _pf < 1.0 and not os.environ.get('DWT_CFA_PIX_STRICT'):
++                log(f'[CFA] 液滴边长按同色格点铺满：pixfrac {_pf:g} → 1.0'
++                    f'（低于 1 会在 2× 网格上留空洞；想强制保留设 DWT_CFA_PIX_STRICT=1）')
++                _pf = 1.0
 +            _sc = float(drz_plan.get('s', 1.0)) if drz_plan else 1.0
 +            _near = os.environ.get('DWT_WGPU_CFA_NEAR', '').strip() == '1'
 +            if _near and abs(_pf * _sc - 1.0) <= 0.02:
@@ -3380,6 +3387,8 @@
 +                _R2 = R if R is not None else None
 +                if _cfa_sel is not None:
 +                    _pf = float(getattr(p, 'drizzle_pix', 1.0) or 1.0)
++                    if _pf < 1.0 and not os.environ.get('DWT_CFA_PIX_STRICT'):
++                        _pf = 1.0   # CFA：液滴必须铺满同色格点（P=2s），否则留空洞
 +                    _pd = _pf * float(drz_plan.get('s', 1.0))
 +                    # 默认全部走散射：最近邻在 P=1 且带旋转时会丢掉液滴的分数覆盖
 +                    # （20 帧实测 corr 仅 0.92），散射与 CPU 逐像素等价（corr 0.9997）
@@ -3657,7 +3666,7 @@
      log(f'[W] 单帧最大权重（条带均值）{np.mean(wmax):.3f}  '
          f'等权份额 = {1.0:.3f} → 最大独占约 {np.mean(wmax):.1f}× 份额')
      log(f'[叠加] 完成 {time.perf_counter() - t2:.1f}s  排异剔除率 {rej_rate:.3%}')
-@@ -1688,11 +4389,56 @@
+@@ -1688,11 +4398,56 @@
          log(f'[读数] {name:<18} 占 {msk.mean():6.2%}  N_eff 中位 '
              f'{np.median(neff[msk]):5.2f}  σ {sd:.4e}')
  
@@ -3717,7 +3726,7 @@
  
      res = {
          'n': n, 'shape': Stk.shape, 'fwhms': fwhms, 'C': C, 'S': S, 'sigma': sig_out,
-@@ -1700,27 +4446,195 @@
+@@ -1700,27 +4455,210 @@
          'R_info': rinfo, 'neff': neff, 'rej_rate': float(rej_rate),
          'A': A, 'B': B, 'rej_k': rej_k, 'stars': stars,
          'metas': metas, 'skies': skies, 'scale_out': float(scale_out),
@@ -3741,21 +3750,36 @@
 +                if _nan_n:
 +                    Stk = np.where(_bad, np.nan, Stk).astype(Stk.dtype, copy=False)
 +                    log(f'[输出] 未覆盖像素置 NaN：{_nan_n} 个（{_nan_n / Stk.size:.3%}）')
-+        # 「全被排异掉」的像素会留下 0：cov>0 但分子为 0，图上看就是一个个黑点，
-+        # 连成 2×2/4×4 的细密网格。这些像素没有任何真值，用最近邻补上（天空量级），
-+        # 否则拉伸后网格非常显眼。
-+        _z = np.isfinite(Stk) & (Stk <= 0.0) if os.environ.get('DWT_NO_HOLEFILL','') != '1' else np.zeros_like(Stk, bool)
-+        _zn = int(np.count_nonzero(_z))
-+        if _zn:
-+            try:
-+                from scipy.ndimage import distance_transform_edt as _edt2
-+                _ok = ~_z
-+                if _ok.any():
-+                    _idx = _edt2(_z, return_distances=False, return_indices=True)
-+                    Stk = Stk[tuple(_idx)].astype(Stk.dtype, copy=False)
-+                    log(f'[输出] 空像素补洞：{_zn} 个（{_zn / Stk.size:.3%}）用最近邻填充')
-+            except Exception as _e:
-+                log(f'[输出] 空像素补洞失败（{_e}），保留原值')
++        # 两类"空"必须分开处理：
++        #   ① 画布上没有任何帧覆盖的像素（cov=0）——这是几何决定的，位于抖动并集之外，
++        #      多在画布边缘；写 NaN 表示"无数据"，交给自动裁边，绝不伪造数值。
++        #   ② 有样本但被排异剔空的像素（cov>0、分子=0）——已在排异处保证"至少留一个
++        #      真实样本"，正常不会再出现；若出现说明逻辑回退，补上并报警。
++        _z = np.isfinite(Stk) & (Stk <= 0.0)
++        if bool(_z.any()):
++            _ct = np.asarray(cov_map) if cov_map is not None else None
++            # cov 是「落点面积之和」。画布边缘只有部分液滴压到，cov 很小但 >0；
++            # 这些像素属于「没被完整覆盖」，不是「被排异剔空」——用 cov<0.5 区分，
++            # 否则每次都会误报几万个「排异剔空」。
++            _unc = (_z & (_ct < 0.5)) if _ct is not None and _ct.shape == Stk.shape else _z.copy()
++            _rej = _z & ~_unc
++            if bool(_unc.any()):
++                Stk[_unc] = np.nan
++                log('[输出] 无样本像素：%d 个（%.3f%%，画布上没有任何帧覆盖，多为抖动并集之外）'
++                    '——写 NaN，不伪造数值；可用「自动裁边」去掉'
++                    % (int(_unc.sum()), float(_unc.sum()) / Stk.size))
++            if bool(_rej.any()):
++                try:
++                    from scipy.ndimage import distance_transform_edt as _edt2
++                    _ok = ~_z
++                    if _ok.any():
++                        _idx = _edt2(_z, return_distances=False, return_indices=True)
++                        Stk = Stk[tuple(_idx)].astype(Stk.dtype, copy=False)
++                        log('[输出] 警告：%d 个像素有样本却被排异剔空（%.3f%%），已用最近邻临时填充；'
++                            '请把日志发回（排异逻辑应保证至少保留一个样本）'
++                            % (int(_rej.sum()), float(_rej.sum()) / Stk.size))
++                except Exception as _e:
++                    log('[输出] 排异空像素填充失败（%s），保留原值' % _e)
 +        # 成品有效性门禁：几乎全空的图不该写盘（否则用户拿到一张全黑图还收到"完成"）
 +        _fin = np.isfinite(Stk)
 +        _vfrac = float(np.count_nonzero(_fin)) / float(max(1, Stk.size))
@@ -3917,7 +3941,7 @@
  
      log(f'[时] 总计 {time.perf_counter() - t_start:.1f}s')
      _emit('输出', 1.0, '完成')
-@@ -1750,13 +4664,23 @@
+@@ -1750,13 +4688,23 @@
                              choices=[v for _, v in prm.choices], help=text)
          else:
              ap.add_argument(flag, default=default, help=text)
@@ -3941,7 +3965,7 @@
      try:
          run(p)
      except Cancelled:
-@@ -1764,5 +4688,82 @@
+@@ -1764,5 +4712,82 @@
      return 0
  
  
@@ -4641,7 +4665,7 @@
 +    return bool(detect_pattern(meta))
 --- a/core/drizzle.py
 +++ b/core/drizzle.py
-@@ -0,0 +1,2391 @@
+@@ -0,0 +1,2408 @@
 +"""Drizzle 重采样层（PWS 的几何层）
 +
 +把 PWS 阶段 C 的"唯一一次加权平均（式 12）"换成**带权 drizzle 累积**，从而在
@@ -6467,6 +6491,12 @@
 +    rej_k, rej_gate = ctx['rej_k'], ctx['rej_gate']
 +    cm = str(ctx.get('rej_mode', 'winsor'))
 +    sky, pixfrac = ctx['sky'], ctx['pixfrac']
++    # CFA：同色格点间隔 2 源像素，2× 输出时样本间距 4 输出像素；
++    # 液滴边长 < 2*s 就必然在网格相位上留缝（实测 pixfrac 0.8 -> 2.3% 空洞）。
++    # 所以 CFA 下把 pixfrac 抬到 1.0：P = 2*s 正好铺满，覆盖由构造保证。
++    if (ctx.get('cfa_sel') is not None and float(pixfrac) < 1.0
++            and os.environ.get('DWT_CFA_PIX_STRICT', '') != '1'):
++        pixfrac = 1.0
 +    sw = float(ctx.get('sharp_w', 0.0) or 0.0)
 +    rot, theta, scale = ctx['rot'], ctx['theta'], ctx['scale']
 +    h, w = ctx['native_shape']
@@ -6598,6 +6628,14 @@
 +        nbad = bad.sum(axis=0)
 +        expected = n * math.erfc(rej_k / 2.0 ** 0.5)
 +        bad &= (nbad - expected <= max(1.0, rej_gate * n))[None]
++        # 不能因为排异把一个像素剔空：全剔时保留偏差最小的那一个真实样本，
++        # 而不是把 0 写进成品（那是凭空的像素，只能靠补洞掩盖）。
++        _ngood = good.sum(axis=0)
++        _empty = (bad.sum(axis=0) == _ngood) & (_ngood > 0)
++        if bool(_empty.any()):
++            _dv = np.where(good & bad, dev, np.float32(np.inf))
++            _j = np.argmin(_dv, axis=0)
++            bad[_j[_empty], np.nonzero(_empty)[0]] = False
 +        rej_num += float(bad.sum())
 +        rej_den += float(good.sum())
 +        cov = np.where(bad, np.float32(0.0), cov).astype(np.float32)
@@ -6690,6 +6728,9 @@
 +    else:
 +        use_rot = ((theta is not None and bool(np.any(np.abs(np.nan_to_num(theta[idx])) > 1e-9)))
 +               or (scale is not None and bool(np.any(np.abs(np.nan_to_num(scale[idx]) - 1.0) > 1e-9))))
++    if (cfa_sel is not None and float(pixfrac) < 1.0
++            and os.environ.get('DWT_CFA_PIX_STRICT', '') != '1'):
++        pixfrac = 1.0          # CFA：液滴必须铺满同色格点，否则必有空洞
 +    P = max(1e-6, float(pixfrac) * s * (2.0 if cfa_sel is not None else 1.0))
 +    mx = {} if use_rot else {i: _axis_matrix(w, W, s, dx[i], pixfrac, plan['ox']) for i in idx}
 +    Stk = np.zeros((H, W), np.float32)
@@ -13462,7 +13503,7 @@
 +        """关于：方法与原文出处（PWS，D.Cikey）"""
 +        messagebox.showinfo(
 +            "关于 DWT · Drizzle",
-+            "DWT · Drizzle 2.7.86-D\n\n" + LICENSE_TEXT)
++            "DWT · Drizzle 2.7.87-D\n\n" + LICENSE_TEXT)
 +
 +    def show_help(self):
 +        """打开内置使用说明（不依赖浏览器 / 外部程序）"""

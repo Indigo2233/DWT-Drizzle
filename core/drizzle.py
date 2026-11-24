@@ -1823,6 +1823,12 @@ def _drizzle_band(ctx, Y0: int, Y1: int) -> Dict:
     rej_k, rej_gate = ctx['rej_k'], ctx['rej_gate']
     cm = str(ctx.get('rej_mode', 'winsor'))
     sky, pixfrac = ctx['sky'], ctx['pixfrac']
+    # CFA：同色格点间隔 2 源像素，2× 输出时样本间距 4 输出像素；
+    # 液滴边长 < 2*s 就必然在网格相位上留缝（实测 pixfrac 0.8 -> 2.3% 空洞）。
+    # 所以 CFA 下把 pixfrac 抬到 1.0：P = 2*s 正好铺满，覆盖由构造保证。
+    if (ctx.get('cfa_sel') is not None and float(pixfrac) < 1.0
+            and os.environ.get('DWT_CFA_PIX_STRICT', '') != '1'):
+        pixfrac = 1.0
     sw = float(ctx.get('sharp_w', 0.0) or 0.0)
     rot, theta, scale = ctx['rot'], ctx['theta'], ctx['scale']
     h, w = ctx['native_shape']
@@ -1954,6 +1960,14 @@ def _drizzle_band(ctx, Y0: int, Y1: int) -> Dict:
         nbad = bad.sum(axis=0)
         expected = n * math.erfc(rej_k / 2.0 ** 0.5)
         bad &= (nbad - expected <= max(1.0, rej_gate * n))[None]
+        # 不能因为排异把一个像素剔空：全剔时保留偏差最小的那一个真实样本，
+        # 而不是把 0 写进成品（那是凭空的像素，只能靠补洞掩盖）。
+        _ngood = good.sum(axis=0)
+        _empty = (bad.sum(axis=0) == _ngood) & (_ngood > 0)
+        if bool(_empty.any()):
+            _dv = np.where(good & bad, dev, np.float32(np.inf))
+            _j = np.argmin(_dv, axis=0)
+            bad[_j[_empty], np.nonzero(_empty)[0]] = False
         rej_num += float(bad.sum())
         rej_den += float(good.sum())
         cov = np.where(bad, np.float32(0.0), cov).astype(np.float32)
@@ -2046,6 +2060,9 @@ def stack_drizzle(fs, R_out: np.ndarray, C: np.ndarray, S: np.ndarray,
     else:
         use_rot = ((theta is not None and bool(np.any(np.abs(np.nan_to_num(theta[idx])) > 1e-9)))
                or (scale is not None and bool(np.any(np.abs(np.nan_to_num(scale[idx]) - 1.0) > 1e-9))))
+    if (cfa_sel is not None and float(pixfrac) < 1.0
+            and os.environ.get('DWT_CFA_PIX_STRICT', '') != '1'):
+        pixfrac = 1.0          # CFA：液滴必须铺满同色格点，否则必有空洞
     P = max(1e-6, float(pixfrac) * s * (2.0 if cfa_sel is not None else 1.0))
     mx = {} if use_rot else {i: _axis_matrix(w, W, s, dx[i], pixfrac, plan['ox']) for i in idx}
     Stk = np.zeros((H, W), np.float32)
