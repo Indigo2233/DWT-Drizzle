@@ -20,10 +20,11 @@ sidecars when you choose to use them.
 
 ## Install
 
-Use PixInsight with a WBPP version that includes **Pipeline scripting**. The
-installers build the native Rust executable and copy it together with the
-Pipeline Builder scripts. Run the commands from the repository root. A source
-build requires [Rust and Cargo](https://rustup.rs/). With an MSVC Rust toolchain
+The WBPP adapter uses the **Pipeline Builder** and operation queue APIs in
+WBPP 3.1.0. The verified combination is PixInsight 1.9.5 with WBPP 3.1.0 on
+Windows. The installers build the native Rust executable and copy it together
+with the Pipeline Builder scripts. Run the commands from the repository root.
+A source build requires [Rust and Cargo](https://rustup.rs/). With an MSVC Rust toolchain
 on Windows, install Visual Studio Build Tools with the C++ workload. On
 macOS, install Apple's command-line tools with `xcode-select --install`.
 
@@ -82,6 +83,11 @@ settings. **PWS** and **R field** contain weights, clipping and envelope setting
 mode also uses the saved settings when the interactive builder is selected.
 
 The Pipeline operation list and execution monitor show `DWT-Drizzle (Rust)`.
+The **Est. disk space** column and WBPP disk-space diagnostics include the
+estimated size of the exported input rasters, master XISF and three Rust
+output rasters. The preview uses the active light groups and saved settings.
+The output estimate uses the nominal Drizzle canvas. Registration offsets
+and rotations can make the actual canvas larger.
 The Process Console logs the builder script path when the operation starts.
 The console and the operation monitor report frame measurement, registration,
 reference construction, Drizzle row progress, and output writing.

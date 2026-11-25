@@ -11,6 +11,13 @@ engine.pipelineManager.buildPipelineForLight();
 let dwtOperationIndex = findDwtInsertionIndex();
 let dwtRunConfig;
 let dwtOperationBlock = new BPPOperationBlock( "DWT-Drizzle (Rust)", undefined, true );
+let dwtSpace = {
+   label: dwtOperationBlock.name,
+   size: estimateDwtDiskSpace( readDwtConfiguration( engine, false, false ) )
+};
+dwtOperationBlock.spaceRequired = () => dwtSpace.size;
+if ( engine.WS )
+   engine.WS.dwtDrizzle = dwtSpace;
 dwtOperationBlock.envForScript = function()
 {
    return { name: this.name, status: this.status };
@@ -23,11 +30,7 @@ dwtOperationBlock._run = function( env, requestInterruption )
    let cfg = dwtRunConfig || readDwtConfiguration( engine, false );
    let excludedFrames = new Set( cfg.excludeFrames.map( dwtPathKey ) );
 
-   let groups = engine.groupsManager.groupsForMode( BPP.GroupingMode.POST ).filter( function( group )
-   {
-      return group.isActive && group.imageType == ImageType.Light
-         && group.associatedRGBchannel != BPP.AssociatedChannel.COMBINED_RGB;
-   } );
+   let groups = dwtLightGroups();
    let completed = 0;
    for ( let g = 0; g < groups.length; ++g )
    {
@@ -45,7 +48,7 @@ dwtOperationBlock._run = function( env, requestInterruption )
          if ( source == undefined )
             return false;
          let input = frame.fileItem.filePath;
-         if ( excludedFrames.has( dwtPathKey( input ) ) || excludedFrames.has( dwtPathKey( source ) ) )
+         if ( dwtFrameIsExcluded( frame, source, excludedFrames ) )
          {
             console.noteln( "* DWT-Drizzle excluded frame: " + input );
             return false;
@@ -170,6 +173,7 @@ if ( typeof editDwtSettings == "function" && !engine.automationMode )
             return OperationBlockStatus.CANCELED;
          }
          dwtRunConfig = cfg;
+         dwtSpace.size = estimateDwtDiskSpace( cfg );
          this.statusMessage = "Project settings saved";
          return OperationBlockStatus.DONE;
       }
@@ -188,6 +192,50 @@ if ( typeof editDwtSettings == "function" && !engine.automationMode )
 }
 for ( let i = firstChangedIndex; i < engine.operationQueue.operations.length; ++i )
    engine.operationQueue.operations[ i ].operation.__index__ = i;
+
+function dwtLightGroups()
+{
+   return engine.groupsManager.groupsForMode( BPP.GroupingMode.POST ).filter( function( group )
+   {
+      return group.isActive && group.imageType == ImageType.Light
+         && group.associatedRGBchannel != BPP.AssociatedChannel.COMBINED_RGB;
+   } );
+}
+
+function dwtFrameIsExcluded( frame, source, excludedFrames )
+{
+   return excludedFrames.has( dwtPathKey( frame.fileItem.filePath ) )
+      || ( source != undefined && excludedFrames.has( dwtPathKey( source ) ) );
+}
+
+function estimateDwtDiskSpace( cfg )
+{
+   let scale = cfg.drizzleEnabled ? Math.fround( cfg.drizzleScale ) : 1;
+   let excludedFrames = new Set( cfg.excludeFrames.map( dwtPathKey ) );
+   let bytes = 0;
+   for ( let group of dwtLightGroups() )
+   {
+      if ( ( group.fastIntegrationData && group.fastIntegrationData.enabled )
+         || ( group.isCFA && group.associatedRGBchannel == undefined ) )
+         continue;
+      let size = group.size;
+      if ( !size || !( size.width > 0 && size.height > 0 ) )
+         continue;
+      let frames = group.activeFrames();
+      if ( excludedFrames.size > 0 )
+         frames = frames.filter( frame => !dwtFrameIsExcluded( frame, dwtSourceForFrame( frame ), excludedFrames ) );
+      let count = cfg.frameLimit > 0 ? Math.min( frames.length, cfg.frameLimit ) : frames.length;
+      if ( count == 0 )
+         continue;
+
+      let inputBytes = size.width * size.height * 4 * count;
+      // Use the nominal canvas with a one-pixel margin on each side.
+      let outputPixels = Math.ceil( ( size.width + 2 ) * scale ) * Math.ceil( ( size.height + 2 ) * scale );
+      // Three 4-byte output rasters and one float32 XISF master.
+      bytes += inputBytes + outputPixels * 16;
+   }
+   return Math.min( bytes, Number.MAX_SAFE_INTEGER );
+}
 
 function makeDwtRequest( engine, outputDirectory, width, height, config )
 {
@@ -342,7 +390,7 @@ function executeDwtGroup( env, requestInterruption, cfg, requestFile, groupDirec
    return OperationBlockStatus.DONE;
 }
 
-function readDwtConfiguration( engine, strictProject )
+function readDwtConfiguration( engine, strictProject, reportWarnings = true )
 {
    let scriptPath = engine.pipelineBuilderScriptFile;
    let scriptDirectory = File.extractDrive( scriptPath ) + File.extractDirectory( scriptPath );
@@ -360,8 +408,10 @@ function readDwtConfiguration( engine, strictProject )
    };
    for ( let field of dwtNumericSettings() )
       config[ field.key ] = field.initial;
-   applyDwtConfiguration( config, readDwtConfigObject( prefix + "dwt-backend.json", false ) );
-   applyDwtConfiguration( config, readDwtConfigObject( engine.outputDirectory + "/DWT/dwt-backend.json", strictProject ) );
+   applyDwtConfiguration( config, readDwtConfigObject( prefix + "dwt-backend.json", false, reportWarnings ) );
+   if ( engine.outputDirectory )
+      applyDwtConfiguration( config,
+         readDwtConfigObject( engine.outputDirectory + "/DWT/dwt-backend.json", strictProject, reportWarnings ) );
    return config;
 }
 
@@ -391,7 +441,7 @@ function ensureDwtDirectory( path )
    }
 }
 
-function readDwtConfigObject( configFile, strict )
+function readDwtConfigObject( configFile, strict, reportWarnings = true )
 {
    if ( !File.exists( configFile ) )
       return {};
@@ -407,7 +457,8 @@ function readDwtConfigObject( configFile, strict )
       let message = "Invalid DWT configuration in " + configFile + " (" + ( error.message || String( error ) ) + ")";
       if ( strict )
          throw new Error( message );
-      console.warningln( "** Warning: " + message );
+      if ( reportWarnings )
+         console.warningln( "** Warning: " + message );
       return {};
    }
 }
