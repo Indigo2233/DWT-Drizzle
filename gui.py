@@ -222,6 +222,15 @@ def _argv_common(c) -> list:
         argv += ["--fwhm-max", c["fwhm_max"]]
     if c.get("flux_pow"):
         argv += ["--flux-pow", c["flux_pow"]]
+    # R 场包络的三个旋钮（+ 带通窗宽 / 对比度阈值）：只在偏离默认值时传
+    for key, flag, dflt in (("env_win_mult", "--env-win-mult", "2.0"),
+                            ("env_eps", "--env-eps", "16.0"),
+                            ("env_p", "--env-p", "1.0"),
+                            ("r_win", "--r-win", "0"),
+                            ("r_k", "--r-k", "3.0")):
+        _v = str(c.get(key, "") or "").strip()
+        if _v and _v != dflt:
+            argv += [flag, _v]
     if c.get("crop_cover"):
         argv += ["--crop-cover", c["crop_cover"]]
     if c.get("frame"):
@@ -752,6 +761,31 @@ class App(tk.Tk):
             values=["关（推荐）", "开"]),
              "第一遍出图后按 64px 块估局部锐度再叠一遍；实测收益 <1%、耗时 +40%")
 
+        # ---- R 场包络（2.7.105-D 起可见）----
+        # 这三个数决定「细节掩膜 R」的形状：哪算结构、结构边缘多宽、空白天压得多狠。
+        # 默认值是标定过的，只有在特定目标上（暗弱大结构被压掉 / 星点外有硬边）才动。
+        self.v_envw = tk.StringVar(value="2.0")
+        arow(26, "包络窗", ttk.Spinbox(adv, from_=0.5, to=6.0, increment=0.1, width=6,
+                                    textvariable=self.v_envw),
+             "和多大范围内的最亮处比，窗 ≈ 该值×2σ_psf（2.0≈4σ_psf）。"
+             "暗弱大结构被压掉 → 调到 3；星点外扩散过宽 → 降到 1.5")
+        self.v_enve = tk.StringVar(value="16.0")
+        arow(27, "包络噪声项", ttk.Spinbox(adv, from_=0, to=24, increment=1, width=6,
+                                     textvariable=self.v_enve),
+             "压住空白天区的倍数（以 σ 计）。16 推荐；>20 进入测量噪声带，24 是安全上限")
+        self.v_envp = tk.StringVar(value="1.0")
+        arow(28, "包络形状幂", ttk.Spinbox(adv, from_=0.25, to=4.0, increment=0.05,
+                                      width=6, textvariable=self.v_envp),
+             "1.0 推荐。>1 收窄支撑（只锐化核心，更保守）；<1 放宽（细节更多、噪点也更多）")
+        self.v_rwin = tk.StringVar(value="0")
+        arow(29, "R 带通窗宽", ttk.Spinbox(adv, from_=0, to=99, increment=3, width=6,
+                                      textvariable=self.v_rwin),
+             "只对 R 场定义 band/ctn 生效；0 = 自动（≈4σ_psf）。窗大 → 贴大尺度纤维")
+        self.v_rk = tk.StringVar(value="3.0")
+        arow(30, "对比度阈值", ttk.Spinbox(adv, from_=1.05, to=12, increment=0.5, width=6,
+                                     textvariable=self.v_rk),
+             "只对 ctn 生效：局部噪声的倍数，超过才当结构。暗弱纤维压不出来 → 降到 2.5")
+
         # 操作（固定在窗口底部，两个标签页都能点到）
         bar = self.bar
         if ui_round is not None:
@@ -893,6 +927,11 @@ class App(tk.Tk):
         self.v_shw.set(c.get("sharp_w", ""))
         self.v_fwhm.set(c.get("fwhm_max", ""))
         self.v_flux.set(c.get("flux_pow", "0.0"))
+        self.v_envw.set(str(c.get("env_win_mult", "2.0")))
+        self.v_enve.set(str(c.get("env_eps", "16.0")))
+        self.v_envp.set(str(c.get("env_p", "1.0")))
+        self.v_rwin.set(str(c.get("r_win", "0")))
+        self.v_rk.set(str(c.get("r_k", "3.0")))
         self.v_ccrop.set(c.get("crop_cover", "0.9"))
         self.v_gpu.set({"auto": "自动", "cpu": "只用 CPU",
                         "wgpu": "wgpu（跨平台）", "gpu": "自动"}.get(
@@ -995,6 +1034,11 @@ class App(tk.Tk):
             "kernel": {"方框（快）": "box", "PSF 匹配（更干净）": "psfmatch"}.get(
                 self.v_kernel.get().strip(), "box"),
             "psf_target": self.v_psf.get().strip() or "50",
+            "env_win_mult": self.v_envw.get().strip() or "2.0",
+            "env_eps": self.v_enve.get().strip() or "16.0",
+            "env_p": self.v_envp.get().strip() or "1.0",
+            "r_win": self.v_rwin.get().strip() or "0",
+            "r_k": self.v_rk.get().strip() or "3.0",
             "two_pass": "1" if self.v_twopass.get().strip() == "开" else "0",
             "detail_snr": "1" if bool(self.v_moon.get()) else "0",
         }
@@ -1377,7 +1421,7 @@ class App(tk.Tk):
         """关于：方法与原文出处（PWS，D.Cikey）"""
         messagebox.showinfo(
             "关于 DWT · Drizzle",
-            "DWT · Drizzle 2.7.104-D\n\n" + LICENSE_TEXT)
+            "DWT · Drizzle 2.7.105-D\n\n" + LICENSE_TEXT)
 
     def show_help(self):
         """打开内置使用说明（不依赖浏览器 / 外部程序）"""
