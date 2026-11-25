@@ -1,0 +1,12 @@
+{
+  "executable": "C:/Program Files/PixInsight/src/scripts/DWT-Drizzle/bin/dwt-backend.exe",
+  "useXdrzSeeds": false,
+  "detailSnr": 0.0,
+  "fluxPower": 0.0,
+  "drizzleScale": 1.0,
+  "drizzlePixfrac": 1.0,
+  "referenceFrames": 0,
+  "rFieldMode": "max",
+  "rFieldWindow": 0.0,
+  "rFieldContrast": 3.0
+}
