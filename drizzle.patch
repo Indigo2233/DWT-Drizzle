@@ -3891,7 +3891,7 @@
  
      res = {
          'n': n, 'shape': Stk.shape, 'fwhms': fwhms, 'C': C, 'S': S, 'sigma': sig_out,
-@@ -1700,27 +4605,239 @@
+@@ -1700,27 +4605,257 @@
          'R_info': rinfo, 'neff': neff, 'rej_rate': float(rej_rate),
          'A': A, 'B': B, 'rej_k': rej_k, 'stars': stars,
          'metas': metas, 'skies': skies, 'scale_out': float(scale_out),
@@ -4033,10 +4033,27 @@
                                 'SigmaSky': sky_sd})
 -        np.save(out_dir / f'{stem}_neff.npy', neff)
 -        np.save(out_dir / f'{stem}_R.npy', R)
-+        # 辅助数组（R 场 / N_eff / 覆盖）每个都是整幅 417 MB，三通道写 1.25 GB。
-+        # 评价页与权重场页需要时才落盘（DWT_SAVE_AUX=1），默认只写成品与权重表，
-+        # 省掉每通道 ~0.6 s 的写盘与 800 MB 磁盘占用。
++        # 辅助数组（R 场 / N_eff / 覆盖）整幅各约 417 MB，三通道就要 1.25 GB。
++        # 权重场页与评价页默认读 1/4 分辨率版本（每个约 26 MB，块平均，够看结构）；
++        # 需要逐像素原尺寸时设 DWT_SAVE_AUX=1（额外写整幅，每通道约 0.6 s）。
 +        _save_aux = str(os.environ.get('DWT_SAVE_AUX', '0')).strip() == '1'
++
++        def _q4(a):
++            a = np.asarray(a, np.float32)
++            h, w = a.shape[-2], a.shape[-1]
++            h2, w2 = h - h % 4, w - w % 4
++            b = a[..., :h2, :w2]
++            b = b.reshape(b.shape[:-2] + (h2 // 4, 4, w2 // 4, 4))
++            return b.mean(axis=(-3, -1))
++
++        try:
++            np.save(out_dir / f'{stem}_R_q4.npy', _q4(R))
++            np.save(out_dir / f'{stem}_neff_q4.npy', _q4(neff))
++            if cov_map is not None:
++                np.save(out_dir / f'{stem}_ncov_q4.npy', _q4(cov_map))
++        except Exception as _e:
++            log(f'[输出] 1/4 分辨率辅助图写入失败：{_e}')
++
 +        if _save_aux:
 +            np.save(out_dir / f'{stem}_neff.npy', neff)
 +            if cov_map is not None:
@@ -4047,9 +4064,10 @@
                     header='idx fwhm_px C_sharp sigma S_snr', comments='# ', fmt='%.6g')
 -        log(f'[输出] 逐帧权重表 {stem}_weights.txt / R 场 {stem}_R.npy / '
 -            f'N_eff {stem}_neff.npy')
-+        log(f'[输出] 逐帧权重表 {stem}_weights.txt'
-+            + (f' / R 场 {stem}_R.npy / N_eff {stem}_neff.npy' if _save_aux else
-+               '（R 场与 N_eff 未落盘，需要时设 DWT_SAVE_AUX=1）'))
++        log(f'[输出] 逐帧权重表 {stem}_weights.txt / R 场与 N_eff 的 1/4 分辨率版 '
++            f'{stem}_R_q4.npy、{stem}_neff_q4.npy'
++            + (f' / 原尺寸 {stem}_R.npy、{stem}_neff.npy' if _save_aux else
++               '（原尺寸需设 DWT_SAVE_AUX=1）'))
 +
 +        # ---- 原生尺寸副本：按 N×N 块平均缩回（不额外叠一遍）----
 +        try:
@@ -4135,7 +4153,7 @@
  
      log(f'[时] 总计 {time.perf_counter() - t_start:.1f}s')
      _emit('输出', 1.0, '完成')
-@@ -1750,13 +4867,23 @@
+@@ -1750,13 +4885,23 @@
                              choices=[v for _, v in prm.choices], help=text)
          else:
              ap.add_argument(flag, default=default, help=text)
@@ -4159,7 +4177,7 @@
      try:
          run(p)
      except Cancelled:
-@@ -1764,5 +4891,82 @@
+@@ -1764,5 +4909,82 @@
      return 0
  
  
@@ -13757,7 +13775,7 @@
 +        """关于：方法与原文出处（PWS，D.Cikey）"""
 +        messagebox.showinfo(
 +            "关于 DWT · Drizzle",
-+            "DWT · Drizzle 2.7.102-D\n\n" + LICENSE_TEXT)
++            "DWT · Drizzle 2.7.103-D\n\n" + LICENSE_TEXT)
 +
 +    def show_help(self):
 +        """打开内置使用说明（不依赖浏览器 / 外部程序）"""
@@ -14549,7 +14567,7 @@
 +        panel(pad_t + hh + gap, ba, "轴比 b/a   vs   半径", "#b45309", 1.0)
 --- a/maps_page.py
 +++ b/maps_page.py
-@@ -0,0 +1,585 @@
+@@ -0,0 +1,593 @@
 +# -*- coding: utf-8 -*-
 +
 +"""分区权重场 / 等效帧数查看页。
@@ -14876,8 +14894,16 @@
 +            stem = stem[4:]
 +
 +        r = p.with_name(p.name.replace(".xisf", "_R.npy"))
++        if not r.exists():
++            _r4 = p.with_name(p.name.replace(".xisf", "_R_q4.npy"))
++            if _r4.exists():
++                r = _r4
 +
 +        n = p.with_name(p.name.replace(".xisf", "_neff.npy"))
++        if not n.exists():
++            _n4 = p.with_name(p.name.replace(".xisf", "_neff_q4.npy"))
++            if _n4.exists():
++                n = _n4
 +
 +        return r, n
 +
@@ -14959,7 +14985,7 @@
 +
 +        else:
 +
-+            self._blank(self.cv_r, "没有 _R.npy（这版可能没开 drizzle）")
++            self._blank(self.cv_r, "没有 _R.npy / _R_q4.npy：这两个文件只有走 drizzle 时才会写，且新版默认写 1/4 分辨率版（旧成品需重跑一次）")
 +
 +        if self.N is not None:
 +
@@ -14969,7 +14995,7 @@
 +
 +        else:
 +
-+            self._blank(self.cv_n, "没有 _neff.npy")
++            self._blank(self.cv_n, "没有 _neff.npy / _neff_q4.npy：新版默认写 1/4 分辨率版（旧成品需重跑一次）")
 +
 +
 +
