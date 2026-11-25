@@ -324,8 +324,16 @@ class MapsPage(ttk.Frame):
             stem = stem[4:]
 
         r = p.with_name(p.name.replace(".xisf", "_R.npy"))
+        if not r.exists():
+            _r4 = p.with_name(p.name.replace(".xisf", "_R_q4.npy"))
+            if _r4.exists():
+                r = _r4
 
         n = p.with_name(p.name.replace(".xisf", "_neff.npy"))
+        if not n.exists():
+            _n4 = p.with_name(p.name.replace(".xisf", "_neff_q4.npy"))
+            if _n4.exists():
+                n = _n4
 
         return r, n
 
@@ -407,7 +415,7 @@ class MapsPage(ttk.Frame):
 
         else:
 
-            self._blank(self.cv_r, "没有 _R.npy（这版可能没开 drizzle）")
+            self._blank(self.cv_r, "没有 _R.npy / _R_q4.npy：这两个文件只有走 drizzle 时才会写，且新版默认写 1/4 分辨率版（旧成品需重跑一次）")
 
         if self.N is not None:
 
@@ -417,7 +425,7 @@ class MapsPage(ttk.Frame):
 
         else:
 
-            self._blank(self.cv_n, "没有 _neff.npy")
+            self._blank(self.cv_n, "没有 _neff.npy / _neff_q4.npy：新版默认写 1/4 分辨率版（旧成品需重跑一次）")
 
 
 

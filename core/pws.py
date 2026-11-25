@@ -4741,10 +4741,27 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                                'NeffMedian': float(np.median(neff)),
                                'SigmaFrameMedian': float(np.median(sig_out)),
                                'SigmaSky': sky_sd})
-        # 辅助数组（R 场 / N_eff / 覆盖）每个都是整幅 417 MB，三通道写 1.25 GB。
-        # 评价页与权重场页需要时才落盘（DWT_SAVE_AUX=1），默认只写成品与权重表，
-        # 省掉每通道 ~0.6 s 的写盘与 800 MB 磁盘占用。
+        # 辅助数组（R 场 / N_eff / 覆盖）整幅各约 417 MB，三通道就要 1.25 GB。
+        # 权重场页与评价页默认读 1/4 分辨率版本（每个约 26 MB，块平均，够看结构）；
+        # 需要逐像素原尺寸时设 DWT_SAVE_AUX=1（额外写整幅，每通道约 0.6 s）。
         _save_aux = str(os.environ.get('DWT_SAVE_AUX', '0')).strip() == '1'
+
+        def _q4(a):
+            a = np.asarray(a, np.float32)
+            h, w = a.shape[-2], a.shape[-1]
+            h2, w2 = h - h % 4, w - w % 4
+            b = a[..., :h2, :w2]
+            b = b.reshape(b.shape[:-2] + (h2 // 4, 4, w2 // 4, 4))
+            return b.mean(axis=(-3, -1))
+
+        try:
+            np.save(out_dir / f'{stem}_R_q4.npy', _q4(R))
+            np.save(out_dir / f'{stem}_neff_q4.npy', _q4(neff))
+            if cov_map is not None:
+                np.save(out_dir / f'{stem}_ncov_q4.npy', _q4(cov_map))
+        except Exception as _e:
+            log(f'[输出] 1/4 分辨率辅助图写入失败：{_e}')
+
         if _save_aux:
             np.save(out_dir / f'{stem}_neff.npy', neff)
             if cov_map is not None:
@@ -4753,9 +4770,10 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         np.savetxt(out_dir / f'{stem}_weights.txt',
                    np.column_stack([np.arange(n), fwhms, C, sig_out, S]),
                    header='idx fwhm_px C_sharp sigma S_snr', comments='# ', fmt='%.6g')
-        log(f'[输出] 逐帧权重表 {stem}_weights.txt'
-            + (f' / R 场 {stem}_R.npy / N_eff {stem}_neff.npy' if _save_aux else
-               '（R 场与 N_eff 未落盘，需要时设 DWT_SAVE_AUX=1）'))
+        log(f'[输出] 逐帧权重表 {stem}_weights.txt / R 场与 N_eff 的 1/4 分辨率版 '
+            f'{stem}_R_q4.npy、{stem}_neff_q4.npy'
+            + (f' / 原尺寸 {stem}_R.npy、{stem}_neff.npy' if _save_aux else
+               '（原尺寸需设 DWT_SAVE_AUX=1）'))
 
         # ---- 原生尺寸副本：按 N×N 块平均缩回（不额外叠一遍）----
         try:
