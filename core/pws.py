@@ -3162,6 +3162,25 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             log(f'[S] 帧间噪声极差 {_r:.1f}×，S 已限幅到 [{1.0 / _k_clip:.3f}, '
                 f'{_k_clip:g}]（{_n_clip} 帧被限；避免单帧独占权重，'
                 f'要关掉填 --snr-clip 0）')
+    # ---- 局部噪声权重（实验，--local-snr 1）----
+    # 月光/光害/薄云在视场里不均匀：同一帧在一角被抬高、另一角还干净。
+    # 用每帧自己的背景梯度模型估每格天空，再按散粒噪声把 σ 缩放到该格，
+    # 得到 S_i(cell) = median_i σ_i(cell)/σ_i(cell)：亮格自动少用被污染的帧。
+    _S_field = None
+    if int(getattr(p, 'local_snr', 0) or 0):
+        try:
+            import sigma_field as _sf
+            _S_field, _sinfo = _sf.weight_field(
+                fs, sig, gh=int(getattr(p, 'local_snr_grid', 8) or 8),
+                gw=int(getattr(p, 'local_snr_grid', 8) or 8),
+                clip_k=float(_k_clip or 3.0))
+            log(f'[局部权重] 天空 {_sinfo["sky_min"]:.3g}~{_sinfo["sky_max"]:.3g}'
+                f'（{_sinfo["sky_ratio"]:.2f}×），S 场 {_sinfo["S_min"]:.3f}~{_sinfo["S_max"]:.3f}'
+                f'（中位 {_sinfo["S_med"]:.3f}）；{_S_field.shape[1]}×{_S_field.shape[2]} 格，'
+                f'暗处被月光抬高的帧会自动降权（本模式走 CPU 叠加）')
+        except Exception as _e:
+            _S_field = None
+            log(f'[局部权重] 构建失败，退回全局 S（不影响本次）：{_e}')
     sig_out = sig * scale_out          # 展示与落盘量纲 = 成品量纲（内部仍用 sig 算比值）
     log(f'[S] 单帧信噪比权重（σ_中位/σ_i）{S.min():.3f}~{S.max():.3f}  中位 {np.median(S):.3f}')
     log(f'[σ] 逐帧噪声 {sig_out.min():.4e}~{sig_out.max():.4e}'
@@ -4129,6 +4148,10 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     if drz_on:
         # ---- drizzle：每帧按自己的位移落点，输出网格逐像素排异，分母 ΣW·c ----
         _gm = str(getattr(p, 'gpu', 'auto') or 'auto').lower()
+        if _S_field is not None and _gm != 'cpu':
+            # 逐格 S 目前只接在 CPU 的逐块加权里；GPU canvas 内核用的是标量 lnS
+            log('[局部权重] GPU 内核暂不支持逐格 S，本次 drizzle 改走 CPU 逐块加权')
+            _gm = 'cpu'
         if _gm == 'cpu':
             os.environ['DWT_GPU'] = '0'
         elif _gm == 'gpu':
@@ -4388,6 +4411,8 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 _bud_mb = min(8192.0, max(512.0, _avail_bytes() / 2**20 * 0.60))
                 _cap = max(1, int(_bud_mb // max(1.0, _cv_mb * 2.2)))
                 _nw = max(1, min(int(_drizzle_workers()), _cap))
+                if _S_field is not None:
+                    _nw = 1
                 if _nw < int(_drizzle_workers()):
                     log('[drizzle] 画布 %.0f MB，并行进程从 %d 降到 %d（避免内存打爆）'
                         % (_cv_mb, int(_drizzle_workers()), _nw))
@@ -4548,22 +4573,56 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 finally:
                     ex.shutdown(wait=True, cancel_futures=True)
             else:
+                _sf_mod = None
+                if _S_field is not None:
+                    try:
+                        import sigma_field as _sf_mod
+                    except Exception:
+                        _sf_mod = None
                 for k, y0 in enumerate(range(0, h, strip)):
                     _check_cancel()
                     y1 = min(h, y0 + strip)
                     _beta = _detail_beta(p)
-                    W = strip_weights(band_cfield(C, C_tiles, y0, y1, h, w),
-                                      S, R[y0:y1], A, B, T=T, fp=fp, beta=_beta)
-                    D = fs.stack_strips(y0, y1)
-                    s, ne, rr = stack_strip(D, W, R[y0:y1], fs.sky0, rej_k=rej_k,
-                                            rej_max_frac=rej_gate)
-                    Stk[y0:y1] = s
-                    neff[y0:y1] = ne
-                    cnt = float(s.size)
-                    rej_num += float(rr) * cnt
-                    rej_den += cnt
-                    wmax.append(float(W.max(axis=0).mean()))
-                    del W, D, s, ne, rr
+                    if _S_field is None or _sf_mod is None:
+                        W = strip_weights(band_cfield(C, C_tiles, y0, y1, h, w),
+                                          S, R[y0:y1], A, B, T=T, fp=fp, beta=_beta)
+                        D = fs.stack_strips(y0, y1)
+                        s, ne, rr = stack_strip(D, W, R[y0:y1], fs.sky0, rej_k=rej_k,
+                                                rej_max_frac=rej_gate)
+                        Stk[y0:y1] = s
+                        neff[y0:y1] = ne
+                        cnt = float(s.size)
+                        rej_num += float(rr) * cnt
+                        rej_den += cnt
+                        wmax.append(float(W.max(axis=0).mean()))
+                        del W, D, s, ne, rr
+                    else:
+                        # 局部权重：按列块切，每块用该块的 S_i(cell) 标量
+                        rows = _sf_mod.cell_for_band(_S_field, y0, y1, h, _S_field.shape[1])
+                        nb = int(_S_field.shape[2])
+                        D_full = None
+                        for cx in range(nb):
+                            x0 = cx * w // nb
+                            x1 = (cx + 1) * w // nb
+                            if x1 <= x0:
+                                continue
+                            S_c = rows.mean(axis=1)[:, cx]
+                            W = strip_weights(
+                                band_cfield(C, C_tiles, y0, y1, h, w)[..., x0:x1],
+                                S_c, R[y0:y1, x0:x1], A, B, T=T, fp=fp, beta=_beta)
+                            if D_full is None:
+                                D_full = fs.stack_strips(y0, y1)
+                            s, ne, rr = stack_strip(D_full[:, :, x0:x1], W,
+                                                    R[y0:y1, x0:x1], fs.sky0,
+                                                    rej_k=rej_k, rej_max_frac=rej_gate)
+                            Stk[y0:y1, x0:x1] = s
+                            neff[y0:y1, x0:x1] = ne
+                            cnt = float(s.size)
+                            rej_num += float(rr) * cnt
+                            rej_den += cnt
+                            wmax.append(float(W.max(axis=0).mean()))
+                            del W, s, ne, rr
+                        del D_full
                     _emit('叠加', (k + 1) / n_strip, f'{k + 1}/{n_strip} 条带')
         finally:
             # 正常跑完与中途终止都要清理临时帧文件（三通道共享时由 _run 收尾统一关）
