@@ -18,30 +18,58 @@ reuse existing XDRZ sidecars as registration seeds with `"useXdrzSeeds": true`
 in its `DWT/dwt-backend.json`. WBPP Image Registration can produce those
 sidecars when you choose to use them.
 
-## Build
+## Install
+
+Use PixInsight with a WBPP version that includes **Pipeline scripting**. The
+installers build the native Rust executable and copy it together with the
+Pipeline Builder scripts. Run the commands from the repository root. A source
+build requires [Rust and Cargo](https://rustup.rs/). With an MSVC Rust toolchain
+on Windows, install Visual Studio Build Tools with the C++ workload. On
+macOS, install Apple's command-line tools with `xcode-select --install`.
+
+### Windows
 
 ```powershell
-cargo build --manifest-path core-rs/Cargo.toml --release --bin dwt-backend
+.\core-rs\wbpp\install.ps1
 ```
 
-Install into the PixInsight script directory:
-
-```text
-PixInsight/src/scripts/DWT-Drizzle/bin/dwt-backend.exe
-```
-
-Build the Rust executable, then run the installer for the current PixInsight
-script directory:
+The default destination is
+`C:\Program Files\PixInsight\src\scripts\DWT-Drizzle`. The installer also
+checks registered PixInsight installation paths. Run PowerShell as an
+administrator if the PixInsight directory requires it, or select an existing
+writable script directory.
 
 ```powershell
-core-rs/wbpp/install.ps1 -PixInsightScripts "C:/Program Files/PixInsight/src/scripts"
+.\core-rs\wbpp\install.ps1 -PixInsightScripts "D:\PixInsight Scripts"
 ```
 
-Select `DWT-Drizzle/pipeline-builder-ui.js` in WBPP.
+### macOS
 
-```text
-WBPP > Pipeline > Pipeline scripting > Pipeline builder
+```bash
+bash core-rs/wbpp/install.sh
 ```
+
+The default destination is `/Applications/PixInsight/src/scripts/DWT-Drizzle`.
+Run the installer on the Mac that will run PixInsight. Cargo builds for the
+installed Rust toolchain. Use the native macOS Rust toolchain for Apple Silicon
+or Intel, as appropriate. For a custom PixInsight location or a writable
+personal script directory, pass that directory explicitly.
+
+```bash
+mkdir -p "$HOME/PixInsight Scripts"
+bash core-rs/wbpp/install.sh --pixinsight-scripts "$HOME/PixInsight Scripts"
+```
+
+Both installers print the path to the interactive builder. They preserve
+existing `dwt-backend.json` files when updating. If you already have a compatible
+executable, pass `-BackendPath` on Windows or `--backend` on macOS to install it
+directly.
+
+## Use in WBPP
+
+Under **Pipeline → Pipeline scripting → Pipeline builder**, enable the builder
+and select the installed `DWT-Drizzle/pipeline-builder-ui.js`. WBPP can load the
+script by its full path, including from a personal script directory.
 
 Click **Run**. The **DWT-Drizzle (Rust) Settings** dialog opens once before the
 first WBPP processing step. **Stack** contains Drizzle, frame and registration
@@ -61,9 +89,11 @@ Canceling in the execution monitor stops export between frames or terminates
 the active Rust process before the builder saves that group's master.
 
 Optionally select `DWT-Drizzle/event-script.js` in the Event Script field.
-The script reads `dwt-backend.json` next to the selected Pipeline Builder,
+The builder reads `dwt-backend.json` next to the selected Pipeline Builder,
 then applies an optional project override at
 `<WBPP output>/DWT/dwt-backend.json`. See the [configuration example](dwt-backend.json.example).
+It selects the installed executable for the current platform. Set an
+`executable` path in the JSON if you want to use a different binary.
 WBPP provides the input files, output directory, filter groups, and debayering.
 
 | Setting | Default | Effect |
@@ -110,7 +140,7 @@ sanitize to the same text get separate directories.
 Each raster is row-major float32 little-endian. The builder then runs:
 
 ```text
-dwt-backend.exe wbpp-pws <request.json> <result.json>
+dwt-backend wbpp-pws <request.json> <result.json>
 ```
 
 The Pipeline Builder request uses the `dwt-wbpp-command/1` schema. It records
@@ -145,7 +175,7 @@ The WBPP pipeline-builder currently:
 
 1. Runs the configured WBPP light-frame preprocessing.
 2. Exports each supported group as single-channel float32 rasters.
-3. Runs `dwt-backend.exe wbpp-pws`. The backend normalizes exposure, measures
+3. Runs `dwt-backend wbpp-pws`. The backend normalizes exposure, measures
    noise and FWHM, verifies each transform against the star catalog, and
    retries failed matches with triangle and neighbor-frame registration.
    When neighbor-frame recovery succeeds, the backend can refine those

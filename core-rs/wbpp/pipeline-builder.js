@@ -347,8 +347,9 @@ function readDwtConfiguration( engine, strictProject )
    let scriptPath = engine.pipelineBuilderScriptFile;
    let scriptDirectory = File.extractDrive( scriptPath ) + File.extractDirectory( scriptPath );
    let prefix = scriptDirectory.length > 0 ? scriptDirectory + "/" : "";
+   let executableName = CoreApplication.platform == "Windows" ? "dwt-backend.exe" : "dwt-backend";
    let config = {
-      executable: prefix + "bin/dwt-backend.exe",
+      executable: prefix + "bin/" + executableName,
       requestFile: "",
       useXdrzSeeds: false,
       excludeFrames: [],

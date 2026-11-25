@@ -1,49 +1,68 @@
 param(
-    [Parameter(Mandatory = $true)]
     [string] $PixInsightScripts,
-    [string] $RepositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+    [string] $RepositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path,
+    [string] $BackendPath
 )
 
 $ErrorActionPreference = "Stop"
-$source = Join-Path $RepositoryRoot "core-rs\wbpp"
-$destination = Join-Path (Resolve-Path $PixInsightScripts).Path "DWT-Drizzle"
 
-New-Item -ItemType Directory -Path $destination -Force | Out-Null
-Copy-Item -LiteralPath (Join-Path $source "pipeline-builder.js") -Destination $destination -Force
-Copy-Item -LiteralPath (Join-Path $source "pipeline-builder-ui.js") -Destination $destination -Force
-Copy-Item -LiteralPath (Join-Path $source "event-script.js") -Destination $destination -Force
-Copy-Item -LiteralPath (Join-Path $source "README.md") -Destination $destination -Force
-
-$binary = Join-Path $source "bin/dwt-backend.exe"
-if (Test-Path -LiteralPath $binary)
+if (!$PixInsightScripts)
 {
-    $binaryDestination = Join-Path $destination "bin"
-    New-Item -ItemType Directory -Path $binaryDestination -Force | Out-Null
-    Copy-Item -LiteralPath $binary -Destination $binaryDestination -Force
-}
-
-$binary = Join-Path $RepositoryRoot "core-rs\target\release\dwt-backend.exe"
-if (Test-Path -LiteralPath $binary)
-{
-    $binaryDestination = Join-Path $destination "bin"
-    New-Item -ItemType Directory -Path $binaryDestination -Force | Out-Null
-    Copy-Item -LiteralPath $binary -Destination $binaryDestination -Force
-}
-else
-{
-    Write-Warning "Build the Rust backend first: cargo build --manifest-path core-rs/Cargo.toml --release --bin dwt-backend"
-}
-
-$configPath = Join-Path $destination "dwt-backend.json"
-if (!(Test-Path -LiteralPath $configPath))
-{
-    $config = @{
-        executable = (Join-Path $destination "bin/dwt-backend.exe").Replace("\", "/")
+    $roots = @(
+        Join-Path $env:ProgramFiles "PixInsight"
+        Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -eq "PixInsight" -and $_.InstallLocation } |
+            Select-Object -ExpandProperty InstallLocation
+    )
+    foreach ($root in $roots)
+    {
+        $candidate = Join-Path $root "src\scripts"
+        if (Test-Path -LiteralPath $candidate -PathType Container)
+        {
+            $PixInsightScripts = $candidate
+            break
+        }
     }
-    $config | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $configPath -Encoding utf8
+}
+if (!$PixInsightScripts -or !(Test-Path -LiteralPath $PixInsightScripts -PathType Container))
+{
+    throw "PixInsight scripts directory not found. Pass -PixInsightScripts with the path to an existing directory."
+}
+$destination = Join-Path (Resolve-Path -LiteralPath $PixInsightScripts).Path "DWT-Drizzle"
+$core = Join-Path $RepositoryRoot "core-rs"
+$source = Join-Path $core "wbpp"
+
+if (!$BackendPath)
+{
+    $BackendPath = Join-Path $source "bin\dwt-backend.exe"
+    if (!(Test-Path -LiteralPath $BackendPath -PathType Leaf))
+    {
+        if (!(Get-Command cargo -ErrorAction SilentlyContinue))
+        {
+            throw "Cargo not found. Install Rust from https://rustup.rs/ or pass -BackendPath with a Windows dwt-backend.exe."
+        }
+        $targetDir = Join-Path $core "target"
+        cargo build --manifest-path (Join-Path $core "Cargo.toml") --target-dir $targetDir --release --locked --bin dwt-backend
+        if ($LASTEXITCODE -ne 0)
+        {
+            throw "The Rust backend build failed (exit $LASTEXITCODE)."
+        }
+        $BackendPath = Join-Path $targetDir "release\dwt-backend.exe"
+    }
+}
+if (!(Test-Path -LiteralPath $BackendPath -PathType Leaf))
+{
+    throw "Backend executable not found at '$BackendPath'. Pass -BackendPath to use a build in another location."
+}
+
+$binaryDestination = Join-Path $destination "bin"
+New-Item -ItemType Directory -Path $binaryDestination -Force | Out-Null
+Copy-Item -LiteralPath $BackendPath -Destination (Join-Path $binaryDestination "dwt-backend.exe") -Force
+foreach ($file in @("pipeline-builder.js", "pipeline-builder-ui.js", "event-script.js", "dwt-backend.json.example", "README.md"))
+{
+    Copy-Item -LiteralPath (Join-Path $source $file) -Destination $destination -Force
 }
 
 Write-Output "Installed DWT-Drizzle WBPP scripts in $destination"
-Write-Output "Interactive Pipeline Builder: $(Join-Path $destination 'pipeline-builder-ui.js')"
-Write-Output "Unattended Pipeline Builder:  $(Join-Path $destination 'pipeline-builder.js')"
-Write-Output "Event script:                 $(Join-Path $destination 'event-script.js')"
+Write-Output "Select $(Join-Path $destination 'pipeline-builder-ui.js') in WBPP > Pipeline > Pipeline scripting > Pipeline builder."

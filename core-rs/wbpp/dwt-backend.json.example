@@ -1,5 +1,4 @@
 {
-  "executable": "C:/Program Files/PixInsight/src/scripts/DWT-Drizzle/bin/dwt-backend.exe",
   "useXdrzSeeds": false,
   "excludeFrames": [],
   "clarityExponent": 20.0,
