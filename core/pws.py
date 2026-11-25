@@ -696,6 +696,9 @@ class FrameSet:
         self.bgshape = (int(shape[0]), int(shape[1]))
         # 读帧时顺手量的逐帧星点 FWHM（C 权重）；NaN = 这帧没量出来
         self.fwhms: Optional[np.ndarray] = None
+        # 实测块中位背景场（LN 风格）：(n, GH, GW)，None = 不用
+        self.bgtiles = None
+        self.bgtile_block = 32
 
     def __len__(self) -> int:
         return self.n
@@ -733,7 +736,14 @@ class FrameSet:
         return d
 
     def bg_model(self, i: int, y0: int, y1: int, w: int):
-        """第 i 帧 [y0,y1)×w 的背景梯度模型（None = 不校正）"""
+        """第 i 帧 [y0,y1)×w 的背景梯度模型（None = 不校正）
+
+        bgtiles 非空时用「实测块中位」代替低阶多项式：块是真实测量，能吃到
+        月光/薄云这类不规则大尺度梯度（多项式一阶/二阶跟不上），这就是 PI 的
+        LocalNormalization 那套思路的本土版。
+        """
+        if self.bgtiles is not None:
+            return self._tile_field(i, y0, y1, w)
         if self.bgcoef is None or self.bgdeg <= 0:
             return None
         _rc = None
@@ -741,6 +751,16 @@ class FrameSet:
             _rc = self.bgrcoef[int(i)]
         return bggrad.model_strip(self.bgcoef[i], self.bgdeg, y0, y1, w,
                                   self.bgshape[0], rcoef=_rc)
+
+    def _tile_field(self, i: int, y0: int, y1: int, w: int) -> np.ndarray:
+        """把第 i 帧的块中位场放大到 [y0,y1)×w（块内常数，网格已 3×3 平滑）"""
+        g = self.bgtiles[int(i)]                    # (GH, GW)，已减去自身中位
+        gh, gw = g.shape
+        H = int(self.bgshape[0])
+        # 网格行号 → 输出行：块中心对齐
+        yy = np.clip(((np.arange(y0, y1) + 0.5) * gh / max(H, 1)).astype(np.int32), 0, gh - 1)
+        xx = np.clip(((np.arange(w) + 0.5) * gw / max(w, 1)).astype(np.int32), 0, gw - 1)
+        return np.asarray(g[yy][:, xx], np.float32)
 
     def stack_strips(self, y0: int, y1: int) -> np.ndarray:
         """条带内所有帧堆成 (n, y1-y0, W) —— 排异与加权平均的唯一输入"""
@@ -835,7 +855,8 @@ def prepare_frames(frames: List[Path], label: str, crop: int,
                    center: Optional[Tuple[int, int]],
                    limit: Optional[int] = None, frames_dir: str = '',
                    mem_frac: float = 0.55, keep_frames: bool = False,
-                   bgdeg: int = 0, bg_r: int = 0, star_n: int = 0) -> FrameSet:
+                   bgdeg: int = 0, bg_r: int = 0, star_n: int = 0,
+                   bg_tiles: int = 0) -> FrameSet:
     """读帧 → 裁剪 → float32 → **曝光归一**（×EXPTIME_REF/t_i），
     同时逐帧量天空中位与噪声尺度；按内存预算自动决定驻留还是落 memmap。
 
@@ -1035,6 +1056,23 @@ def prepare_frames(frames: List[Path], label: str, crop: int,
             fs.bg_stats = bstats
         else:
             log('[背景] 梯度拟合不可用（块数不足），按不校正处理')
+    # ---- 实测块中位背景场（--bg-tiles 1）：比多项式更贴不规则梯度 ----
+    if int(bg_tiles or 0) and bg_grids is not None:
+        try:
+            from scipy.ndimage import gaussian_filter as _gf
+            _G = [g for g in bg_grids if g is not None]
+            if len(_G) == n:
+                _st = np.stack([np.asarray(g, np.float32) for g in _G])
+                _med = np.median(_st.reshape(n, -1), axis=1).reshape(n, 1, 1)
+                _st = _st - _med                       # 只留形状，常数已被天空平移吸收
+                _st = np.stack([_gf(t, 1.0, mode='nearest') for t in _st])
+                fs.bgtiles = _st.astype(np.float32)
+                fs.bgtile_block = int(bggrad.BG_BLOCK)
+                log(f'[背景] 用实测块中位场（{_st.shape[1]}×{_st.shape[2]} 格 × '
+                    f'{fs.bgtile_block}px）代替多项式：逐帧减自身中位后 3×3 平滑')
+        except Exception as _e:
+            fs.bgtiles = None
+            log(f'[背景] 块场构造失败，按多项式处理：{_e}')
     bg_grids = None
     span = float(fs.skies.max() - fs.skies.min())
     log(f'[帧] 耗时 {time.perf_counter() - t0:.1f}s  '
@@ -3117,7 +3155,8 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         fs = prepare_frames(frames, ';'.join(str(s) for s in sources), crop, center,
                             limit, frames_dir, keep_frames=keep_frames,
                             bgdeg=int(getattr(p, 'bgdeg', 1) or 0),
-                            bg_r=int(getattr(p, 'bg_r', 0) or 0))
+                            bg_r=int(getattr(p, 'bg_r', 0) or 0),
+                            bg_tiles=int(bool(getattr(p, 'bg_tiles', False))))
         if _CFA.get('pattern'):
             fs._shared = True
         _FS_CACHE[_ck] = fs
