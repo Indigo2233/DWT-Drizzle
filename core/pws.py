@@ -3075,6 +3075,13 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             '（实测 A=10 时小星周围低于天空 -2σ 的像素 8.5%~28.6%，A=6 为 0.5%），'
             '已按 6 计算；要强制使用请设 DWT_A_KEEP=1')
         A = 6.0
+    # 黑白/单色：A_SHARP=20 是设计上限（注释在 :80），但以前只是写在注释里、
+    # 没有真正约束——填 40 会照单全收。A=40 时 C^40 在 C∈[0.3,1.7] 上跨 30 个
+    # 数量级，结构区等于「逐像素挑一帧」，局部噪声退化为单帧。这里补上钳制。
+    if (not _CFA.get('pattern')) and A > A_SHARP and os.environ.get('DWT_A_KEEP', '') != '1':
+        log(f'[A] 清晰度 A 上限 {A_SHARP:g}：你填的 {A:g} 会让结构区由单帧独占'
+            f'（C^A 跨约 2×A 个数量级），已按 {A_SHARP:g} 计算；要强制使用请设 DWT_A_KEEP=1')
+        A = A_SHARP
     r_floor = float(p.r_floor)
     env_win_mult, env_eps, env_p = float(p.env_win_mult), float(p.env_eps), float(p.env_p)
     star_grow_pct = float(p.star_grow_pct)

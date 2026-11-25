@@ -2345,7 +2345,7 @@
  
  def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 out_dir: Path, stem: str) -> Dict:
-@@ -1449,10 +3065,21 @@
+@@ -1449,10 +3065,28 @@
      完整流程（读帧→星表→R 场→叠加→导出），成品文件主名由 stem 给出。"""
      # 参数别名：算法体统一从 PwsParams 取值
      A, B = float(p.A), float(p.B)
@@ -2359,6 +2359,13 @@
 +            '（实测 A=10 时小星周围低于天空 -2σ 的像素 8.5%~28.6%，A=6 为 0.5%），'
 +            '已按 6 计算；要强制使用请设 DWT_A_KEEP=1')
 +        A = 6.0
++    # 黑白/单色：A_SHARP=20 是设计上限（注释在 :80），但以前只是写在注释里、
++    # 没有真正约束——填 40 会照单全收。A=40 时 C^40 在 C∈[0.3,1.7] 上跨 30 个
++    # 数量级，结构区等于「逐像素挑一帧」，局部噪声退化为单帧。这里补上钳制。
++    if (not _CFA.get('pattern')) and A > A_SHARP and os.environ.get('DWT_A_KEEP', '') != '1':
++        log(f'[A] 清晰度 A 上限 {A_SHARP:g}：你填的 {A:g} 会让结构区由单帧独占'
++            f'（C^A 跨约 2×A 个数量级），已按 {A_SHARP:g} 计算；要强制使用请设 DWT_A_KEEP=1')
++        A = A_SHARP
      r_floor = float(p.r_floor)
      env_win_mult, env_eps, env_p = float(p.env_win_mult), float(p.env_eps), float(p.env_p)
      star_grow_pct = float(p.star_grow_pct)
@@ -2367,7 +2374,7 @@
      rej_gate = float(p.rej_gate)                  # 剔除比例上限（默认 1/3）
      limit = int(p.limit) or None
      crop, keep_frames, frames_dir = int(p.crop), bool(p.keep_frames), p.frames_dir
-@@ -1463,9 +3090,46 @@
+@@ -1463,9 +3097,46 @@
  
      # ---- 阶段 0：读帧 + 帧级归一（自动选驻留 / memmap）----
      center = resolve_center(frames, crop, parse_center(p.center))
@@ -2416,7 +2423,7 @@
      metas = fs.metas
      skies = fs.skies
      # 量纲回乘：内部一切计算都在 EXPTIME_REF 基准上（权重/排异全是比值，不受影响），
-@@ -1479,6 +3143,18 @@
+@@ -1479,6 +3150,18 @@
      # S_i = σ_中位 / σ_i（归一化后测 → 曝光差异已被吸收，可直接跨帧比）
      sig = fs.sigma
      S = np.median(sig) / np.maximum(sig, 1e-30)
@@ -2435,7 +2442,7 @@
      sig_out = sig * scale_out          # 展示与落盘量纲 = 成品量纲（内部仍用 sig 算比值）
      log(f'[S] 单帧信噪比权重（σ_中位/σ_i）{S.min():.3f}~{S.max():.3f}  中位 {np.median(S):.3f}')
      log(f'[σ] 逐帧噪声 {sig_out.min():.4e}~{sig_out.max():.4e}'
-@@ -1486,40 +3162,165 @@
+@@ -1486,40 +3169,165 @@
  
      # ---- 阶段 A：C_i（星点 FWHM，开源 fit_fwhm）----
      # 先用最干净的一帧建固定星表（星表位置对全部帧共用）
@@ -2607,7 +2614,7 @@
          f' {np.nanmin(fwhms):.2f}~{np.nanmax(fwhms):.2f}px  中位 {fmed:.2f}px  '
          f'{time.perf_counter() - t1:.1f}s')
      log(f'[C] 清晰度权重（FWHM_中位/FWHM_i）{C.min():.3f}~{C.max():.3f}')
-@@ -1528,6 +3329,52 @@
+@@ -1528,6 +3336,52 @@
          f'#{int(i)}({fwhms[int(i)]:.2f}px)' for i in order[:3]))
      log('[C] 最糊 3 帧 ' + '  '.join(
          f'#{int(i)}({fwhms[int(i)]:.2f}px)' for i in order[-3:]))
@@ -2660,7 +2667,7 @@
  
      sigma_psf = fmed / 2.3548
  
-@@ -1556,9 +3403,22 @@
+@@ -1556,9 +3410,22 @@
                  _check_cancel()
                  lam1[i], pas[i] = fs.trail(i, stars, sigma_psf)
  
@@ -2684,7 +2691,7 @@
      idx = np.argsort(np.nan_to_num(fwhms, nan=1e9))[:k]
  
      if star_grow_pct > 0:
-@@ -1586,88 +3446,1083 @@
+@@ -1586,88 +3453,1083 @@
      else:
          log('[拖线] 星点锐帧扩展已关闭（0%）')
  
@@ -3826,7 +3833,7 @@
      log(f'[W] 单帧最大权重（条带均值）{np.mean(wmax):.3f}  '
          f'等权份额 = {1.0:.3f} → 最大独占约 {np.mean(wmax):.1f}× 份额')
      log(f'[叠加] 完成 {time.perf_counter() - t2:.1f}s  排异剔除率 {rej_rate:.3%}')
-@@ -1688,11 +4543,61 @@
+@@ -1688,11 +4550,61 @@
          log(f'[读数] {name:<18} 占 {msk.mean():6.2%}  N_eff 中位 '
              f'{np.median(neff[msk]):5.2f}  σ {sd:.4e}')
  
@@ -3891,7 +3898,7 @@
  
      res = {
          'n': n, 'shape': Stk.shape, 'fwhms': fwhms, 'C': C, 'S': S, 'sigma': sig_out,
-@@ -1700,27 +4605,257 @@
+@@ -1700,27 +4612,257 @@
          'R_info': rinfo, 'neff': neff, 'rej_rate': float(rej_rate),
          'A': A, 'B': B, 'rej_k': rej_k, 'stars': stars,
          'metas': metas, 'skies': skies, 'scale_out': float(scale_out),
@@ -4153,7 +4160,7 @@
  
      log(f'[时] 总计 {time.perf_counter() - t_start:.1f}s')
      _emit('输出', 1.0, '完成')
-@@ -1750,13 +4885,23 @@
+@@ -1750,13 +4892,23 @@
                              choices=[v for _, v in prm.choices], help=text)
          else:
              ap.add_argument(flag, default=default, help=text)
@@ -4177,7 +4184,7 @@
      try:
          run(p)
      except Cancelled:
-@@ -1764,5 +4909,82 @@
+@@ -1764,5 +4916,82 @@
      return 0
  
  
@@ -13775,7 +13782,7 @@
 +        """关于：方法与原文出处（PWS，D.Cikey）"""
 +        messagebox.showinfo(
 +            "关于 DWT · Drizzle",
-+            "DWT · Drizzle 2.7.103-D\n\n" + LICENSE_TEXT)
++            "DWT · Drizzle 2.7.104-D\n\n" + LICENSE_TEXT)
 +
 +    def show_help(self):
 +        """打开内置使用说明（不依赖浏览器 / 外部程序）"""
