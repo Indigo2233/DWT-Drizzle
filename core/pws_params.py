@@ -49,6 +49,7 @@ class PwsParams:
     local_snr: bool = False
     local_snr_grid: int = 8
     bg_tiles: bool = False
+    ln_xnml: bool = False
     snr_clip: float = 3.0
     detail_snr: float = 0.0
     limit: int = 0
@@ -163,6 +164,9 @@ PARAMS: Tuple[Param, ...] = (
     Param('bg_tiles', '实测块中位背景（LN 风格）', 'bool', '高级',
           '用每帧 32px 块中位测出的背景场代替一/二阶多项式，吃得住月光、薄云这类不规则大尺度梯度',
           '默认关。多项式跟不上的强梯度/云影时开；平滑星云场别开（会把大尺度结构当背景减掉）。'),
+    Param('ln_xnml', '使用 WBPP 的 LN 模型（*.xnml）', 'bool', '高级',
+          '读取 PI/WBPP 每帧的 LocalNormalization 模型（同名 .xnml），把该帧背景拉到参考帧水平',
+          '默认关。素材是 WBPP registered 且带 .xnml 时开；开了会自动关闭本程序的背景梯度拟合（bgdeg=0）。'),
     Param('snr_clip', '噪声离群限幅', 'float', '高级',
           'S 权重（按帧噪声逆方差）的限幅倍数，防止个别异常干净的帧独占权重',
           'S = σ_中位/σ_i 会被限在 [1/K, K]。K=3 表示单帧最多 9 倍权重；'

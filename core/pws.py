@@ -68,6 +68,7 @@ for _p in (str(ROOT), str(_HERE)):
 from DWT_DetailCore import EXPTIME_REF, read_frame                      # noqa: E402
 from pws_params import PARAMS, PwsParams, cli_flag                      # noqa: E402
 import bggrad
+import xnml
 import cropcover                                                          # noqa: E402
 try:                                                                   # noqa: E402
     import matchref
@@ -856,7 +857,7 @@ def prepare_frames(frames: List[Path], label: str, crop: int,
                    limit: Optional[int] = None, frames_dir: str = '',
                    mem_frac: float = 0.55, keep_frames: bool = False,
                    bgdeg: int = 0, bg_r: int = 0, star_n: int = 0,
-                   bg_tiles: int = 0) -> FrameSet:
+                   bg_tiles: int = 0, ln_xnml: int = 0) -> FrameSet:
     """读帧 → 裁剪 → float32 → **曝光归一**（×EXPTIME_REF/t_i），
     同时逐帧量天空中位与噪声尺度；按内存预算自动决定驻留还是落 memmap。
 
@@ -958,8 +959,11 @@ def prepare_frames(frames: List[Path], label: str, crop: int,
     ini_rw, ini_rw_args = fs.writer
     nw = 0 if (not fs.parallelable or _no_parallel()) \
         else plan_workers(fh * fw * 4 * 4 + (512 << 20), '读帧')
+    _ln_ok = [0]
+    _ln_bad = [0]
+    _ln_miss = [0]
     try:
-        if nw > 1:
+        if nw > 1 and not int(ln_xnml or 0):
             fs.metas = [None] * n
             fs.names = [Path(str(f)).name for f in files]
             ex = ProcessPoolExecutor(max_workers=nw, initializer=ini_rw,
@@ -998,6 +1002,17 @@ def prepare_frames(frames: List[Path], label: str, crop: int,
                     d = _cfa.plane(d, _CFA['pattern'], _CFA['ch'])
                 if _ROWFPN:
                     _strip_rowfpn(d)
+                if int(ln_xnml or 0):
+                    _xn = xnml.sibling_path(str(f))
+                    if os.path.exists(_xn):
+                        _fld = xnml.load_fields(_xn)
+                        if _fld is not None:
+                            xnml.apply_to(d, _fld)
+                            _ln_ok[0] += 1
+                        else:
+                            _ln_bad[0] += 1
+                    else:
+                        _ln_miss[0] += 1
                 _smp = d[::4, ::4]
                 med = float(np.median(_smp))
                 del _smp
@@ -1031,6 +1046,11 @@ def prepare_frames(frames: List[Path], label: str, crop: int,
         fs.close(keep=keep_frames)
         raise
 
+    if int(ln_xnml or 0):
+        log(f'[LN] WBPP 本地归一化：已应用 {_ln_ok[0]} 帧（乘 Scale + 加 ZeroOffset，'
+            f'网格双线性插值），缺 .xnml {_ln_miss[0]} 帧，解析失败 {_ln_bad[0]} 帧')
+        if _ln_ok[0] == 0:
+            log('[LN] 没有任何帧找到 .xnml，本次按原样叠加')
     # 天空加性平移：基准帧 = 天空最接近全体帧中位的那一帧。memmap 后端只记 off_i、
     #   读出时减（见 FrameSet.strip）；父进程内存后端则在建集时就地烘焙（见下）。
     anchor = int(np.argmin(np.abs(fs.skies - np.median(fs.skies))))
@@ -3097,6 +3117,13 @@ def _local_sharp_maps(fs, idx, plan, blk: int = 64, log=None):
             % (n, nby, nbx, blk, float(_np.min(r)), float(_np.max(r))))
     return r.astype(_np.float32)
 
+def _flag(v) -> bool:
+    """命令行/界面传进来的布尔：'0'/'false' 也算关（argparse 里 bool 会退化成字符串）"""
+    if isinstance(v, str):
+        return v.strip().lower() not in ('', '0', 'false', 'no', 'off')
+    return bool(v)
+
+
 def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                out_dir: Path, stem: str) -> Dict:
     """单滤镜组的叠加本体：展开素材与建输出目录由 _run 完成，此处只做该组的
@@ -3154,9 +3181,11 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     else:
         fs = prepare_frames(frames, ';'.join(str(s) for s in sources), crop, center,
                             limit, frames_dir, keep_frames=keep_frames,
-                            bgdeg=int(getattr(p, 'bgdeg', 1) or 0),
+                            bgdeg=(0 if _flag(getattr(p, 'ln_xnml', False))
+                                   else int(getattr(p, 'bgdeg', 1) or 0)),
                             bg_r=int(getattr(p, 'bg_r', 0) or 0),
-                            bg_tiles=int(bool(getattr(p, 'bg_tiles', False))))
+                            bg_tiles=int(_flag(getattr(p, 'bg_tiles', False))),
+                            ln_xnml=int(_flag(getattr(p, 'ln_xnml', False))))
         if _CFA.get('pattern'):
             fs._shared = True
         _FS_CACHE[_ck] = fs
@@ -3206,7 +3235,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     # 用每帧自己的背景梯度模型估每格天空，再按散粒噪声把 σ 缩放到该格，
     # 得到 S_i(cell) = median_i σ_i(cell)/σ_i(cell)：亮格自动少用被污染的帧。
     _S_field = None
-    if int(getattr(p, 'local_snr', 0) or 0):
+    if _flag(getattr(p, 'local_snr', 0)):
         try:
             import sigma_field as _sf
             _S_field, _sinfo = _sf.weight_field(
