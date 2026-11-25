@@ -3562,31 +3562,81 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 log(f'[drizzle] 几何初值来自 WBPP .xdrz（逐帧用本帧星点精修）：'
                     f'θ {np.min(_gt):+.2f}°~{np.max(_gt):+.2f}°  '
                     f'k {np.min(_gk):.4f}~{np.max(_gk):.4f}')
-        sh = measure_shifts(_reg, stars, ref=int(seed), log=log, guess=_gg)
-        # 参考帧回退：自动挑的参考帧若是异类（星少/最糊/取景偏），会把整组都判成配准失败。
-        # 这里只在首轮参与率 < 50% 时，换星点最多的几个候选各试一次，取参与最多的那一次。
-        _ref_fallback = None
-        try:
-            _n_all = int(len(sh['dx']))
-            _kr = float(sh.get('n_keep', 0)) / max(1, _n_all)
-            if _kr < 0.5 and len(stars) > 2:
-                _cnt = np.array([len(_s) for _s in stars], np.float64)
-                _order = [int(i) for i in np.argsort(-_cnt) if int(i) != int(seed)]
-                _best, _best_sh = int(sh.get('n_keep', 0)), sh
-                for _cand in _order[:3]:
-                    try:
-                        _sh2 = measure_shifts(_reg, stars, ref=_cand, log=None, guess=_gg)
-                    except Exception:
-                        continue
-                    if int(_sh2.get('n_keep', 0)) > _best:
-                        _best, _best_sh = int(_sh2.get('n_keep', 0)), _sh2
-                        _ref_fallback = _cand
-                if _ref_fallback is not None:
-                    log(f'[配准] 参考帧 #{int(seed)} 只对上 {int(sh["n_keep"])}/{_n_all} 帧，'
-                        f'改参考帧 #{_ref_fallback}（对上 {_best} 帧）')
-                    sh = _best_sh
-        except Exception as _e:
-            log(f'[配准] 参考帧回退失败（不影响本次）：{_e}')
+        # ---- 配准结果缓存（跨运行复用）----
+        # 读帧/量 FWHM/测位移与 A、排异 k、吞吐权重、drizzle 倍率都无关，
+        # 同素材反复试参数时这几步纯属重复劳动。指纹含逐帧路径+大小+mtime、
+        # 裁剪/中心/限帧/参考帧/星点数/对齐模式/xdrz，任何一项变了就重算。
+        _ck = None
+        sh = None
+        _cv = getattr(p, 'cache', True)
+        if isinstance(_cv, str):
+            _cache_on = _cv.strip().lower() not in ('0', 'false', 'off', 'no', '')
+        else:
+            _cache_on = bool(_cv)
+        if os.environ.get('DWT_CACHE_OFF', '') == '1':
+            _cache_on = False
+        if _cache_on and not _xz:
+            try:
+                from cache import frames_key, load_align, save_align, describe
+                _ck_extra = {'crop': int(crop), 'center': tuple(center or ()),
+                             'limit': int(limit or 0), 'seed': int(seed),
+                             'n_star': int(n_star), 'aligned': 0}
+                _ck = frames_key(frames, _ck_extra)
+                sh = load_align(p, _ck)
+                if sh is not None:
+                    # 缓存只存了数组；下游还要用这几个派生量，就地补上
+                    _fk = np.isfinite(np.asarray(sh['dx'], float))
+                    _dxa = np.asarray(sh['dx'], float)[_fk]
+                    _dya = np.asarray(sh['dy'], float)[_fk]
+                    _tha = np.asarray(sh['theta'], float)[_fk]
+                    sh['dx_range'] = (float(_dxa.min()), float(_dxa.max())) if _dxa.size else (0.0, 0.0)
+                    sh['dy_range'] = (float(_dya.min()), float(_dya.max())) if _dya.size else (0.0, 0.0)
+                    sh['theta_range'] = (float(_tha.min()), float(_tha.max())) if _tha.size else (0.0, 0.0)
+                    sh['dist'] = np.zeros(len(sh['dx']), np.float64)
+                    sh['n_bad'] = 0
+                    sh['n_dist'] = 0
+                    sh['scatter'] = []
+                    log(f'[缓存] 命中上次的配准结果（{int(sh["n_keep"])}/{len(sh["dx"])} 帧，'
+                        f'{describe(p)}）；跳过测位移。要重测请取消「复用配准缓存」'
+                        f'或设 DWT_CACHE_OFF=1')
+            except Exception as _e:
+                sh = None
+                log(f'[缓存] 读取失败，重测（不影响本次）：{_e}')
+        if sh is None:
+            sh = measure_shifts(_reg, stars, ref=int(seed), log=log, guess=_gg)
+            # 参考帧回退：自动挑的参考帧若是异类（星少/最糊/取景偏），会把整组都判成配准失败。
+            # 这里只在首轮参与率 < 50% 时，换星点最多的几个候选各试一次，取参与最多的那一次。
+            _ref_fallback = None
+            try:
+                _n_all = int(len(sh['dx']))
+                _kr = float(sh.get('n_keep', 0)) / max(1, _n_all)
+                if _kr < 0.5 and len(stars) > 2:
+                    _cnt = np.array([len(_s) for _s in stars], np.float64)
+                    _order = [int(i) for i in np.argsort(-_cnt) if int(i) != int(seed)]
+                    _best, _best_sh = int(sh.get('n_keep', 0)), sh
+                    for _cand in _order[:3]:
+                        try:
+                            _sh2 = measure_shifts(_reg, stars, ref=_cand, log=None, guess=_gg)
+                        except Exception:
+                            continue
+                        if int(_sh2.get('n_keep', 0)) > _best:
+                            _best, _best_sh = int(_sh2.get('n_keep', 0)), _sh2
+                            _ref_fallback = _cand
+                    if _ref_fallback is not None:
+                        log(f'[配准] 参考帧 #{int(seed)} 只对上 {int(sh["n_keep"])}/{_n_all} 帧，'
+                            f'改参考帧 #{_ref_fallback}（对上 {_best} 帧）')
+                        sh = _best_sh
+            except Exception as _e:
+                log(f'[配准] 参考帧回退失败（不影响本次）：{_e}')
+            if _ck:
+                try:
+                    if save_align(p, _ck, sh):
+                        log(f'[缓存] 已保存配准结果（{int(sh.get("n_keep", 0))}/{len(sh["dx"])} 帧，'
+                            f'{describe(p)}），下次同素材可直接复用')
+                    else:
+                        log('[缓存] 保存失败（不影响本次叠加，下次仍会重测）')
+                except Exception as _e:
+                    log(f'[缓存] 写入失败（不影响本次）：{_e}')
         _drop = [int(i) for i in np.nonzero(~np.asarray(sh['keep'], bool))[0]]
         if _drop:
             log(f'  [叠加] 未参与的帧索引：{_drop[:40]}'

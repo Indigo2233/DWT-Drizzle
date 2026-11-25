@@ -96,6 +96,8 @@ class PwsParams:
 
 
     two_pass: int = 0
+    cache: bool = True        # 复用跨运行的配准结果（素材/几何没变时跳过测位移）
+    cache_dir: str = ''       # 空=用户目录/.dwt-cache；也可 DWT_CACHE_DIR
 
     psf_target: float = 50.0
     rej_gate: float = 1 / 3
@@ -386,6 +388,14 @@ PARAMS: Tuple[Param, ...] = (
           choices=(('winsorized（推荐）', 'winsor'), ('中位绝对偏差（旧）', 'mad'),
                    ('平均绝对偏差（最快）', 'fast'), ('广义 ESD（Rosner）', 'esd'))),
 
+    Param('cache', '复用配准缓存', 'bool', '高级',
+          '把上次的帧间位移存起来；素材、裁剪、参考帧没变时第二次起直接复用',
+          '同素材反复调 A / 排异 k / 吞吐权重时，读帧后那几步「测位移」纯属重复。'
+          '默认开启；换素材、换裁剪、换参考帧会自动失效重测。关掉可强制重测'),
+    Param('cache_dir', '缓存目录', 'str', '高级',
+          '存配准结果的位置',
+          '留空＝用户目录下的 .dwt-cache；也可以设环境变量 DWT_CACHE_DIR。'
+          '缓存只是 npz，删掉无影响'),
     Param('two_pass', '两遍加权（局部锐度）', 'choice', '高级',
 
           '第一遍叠一张，再按 64px 块量出每帧的局部锐度，第二遍带上这份权重场重叠',
