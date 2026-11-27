@@ -803,6 +803,9 @@ pub fn run_calibrated_pws_with_progress(
         count => count,
     };
     sharp_frames.truncate(sharp_count);
+    progress("Matching input backgrounds", 0, 1);
+    let sky = match_sky_levels(&mut frames, &transforms).unwrap_or_default();
+    progress("Matching input backgrounds", 1, 1);
     let reference_for_r = crate::drizzle::stack_sharp_reference(
         &frames,
         &sharp_frames,
@@ -859,13 +862,6 @@ pub fn run_calibrated_pws_with_progress(
     progress("Measuring reference and building R field", 1, 1);
     drop(reference_for_r);
     let region_scores = region_field.pixels();
-    let mut sky_samples: Vec<_> = frames[image_reference_index]
-        .pixels()
-        .iter()
-        .step_by(13)
-        .copied()
-        .filter(|pixel| pixel.is_finite())
-        .collect();
     let result = crate::drizzle::stack_winsorized(
         crate::backend::SimilarityDrizzleRequest {
             frames: &frames,
@@ -878,7 +874,7 @@ pub fn run_calibrated_pws_with_progress(
         crate::config::RejectionConfig {
             sigma_multiplier: request.options.rejection_sigma,
             max_fraction: request.options.rejection_fraction,
-            sky: select_median(&mut sky_samples).unwrap_or(0.0),
+            sky,
         },
         request.options.stack_workers,
         &corrections,
@@ -959,6 +955,45 @@ pub fn run_calibrated_pws_with_progress(
         sharp_reference_frames: sharp_frames.len(),
         warnings,
     })
+}
+
+/// Keep spatial PWS weighting from selecting a different sky level around stars.
+fn match_sky_levels(
+    frames: &mut [Frame],
+    transforms: &[Option<SimilarityTransform>],
+) -> Option<f32> {
+    const SAMPLE_COUNT: usize = 65_536;
+    let mut samples = Vec::with_capacity(SAMPLE_COUNT);
+    let levels: Vec<_> = frames
+        .iter()
+        .zip(transforms)
+        .map(|(frame, transform)| {
+            (*transform)?;
+            samples.clear();
+            let pixels = frame.pixels();
+            let stride = pixels.len().div_ceil(SAMPLE_COUNT) | 1;
+            samples.extend(
+                pixels
+                    .iter()
+                    .step_by(stride)
+                    .copied()
+                    .filter(|v| v.is_finite()),
+            );
+            select_median(&mut samples)
+        })
+        .collect();
+    let sky = select_median(&mut levels.iter().flatten().copied().collect::<Vec<_>>())?;
+    for (frame, level) in frames.iter_mut().zip(levels) {
+        if let Some(level) = level {
+            let offset = sky - level;
+            if offset != 0.0 {
+                for pixel in frame.pixels_mut() {
+                    *pixel += offset;
+                }
+            }
+        }
+    }
+    Some(sky)
 }
 
 fn retain_frames<T>(frames: &mut Vec<T>, retained: &[bool]) {
@@ -1255,6 +1290,26 @@ mod tests {
             xml_attribute(text, "ReferenceGeometry", "width").expect("width"),
             "1024"
         );
+    }
+
+    #[test]
+    fn matches_only_integrated_backgrounds_and_preserves_star_signal() {
+        let mut frames = [
+            Frame::new(3, 2, vec![0.125, 0.125, 0.125, 0.375, 0.125, f32::NAN]).unwrap(),
+            Frame::new(3, 2, vec![0.25, 0.25, 0.25, 0.5, 0.25, f32::NAN]).unwrap(),
+            Frame::filled(3, 2, 0.0).unwrap(),
+        ];
+        let registered = Some(SimilarityTransform::identity());
+        let sky = match_sky_levels(&mut frames, &[registered, registered, None]);
+        assert_eq!(sky, Some(0.1875));
+        for frame in &frames[..2] {
+            assert_eq!(
+                frame.pixels()[..5],
+                [0.1875, 0.1875, 0.1875, 0.4375, 0.1875]
+            );
+            assert!(frame.pixels()[5].is_nan());
+        }
+        assert_eq!(frames[2].pixels(), &[0.0; 6]);
     }
 
     #[test]

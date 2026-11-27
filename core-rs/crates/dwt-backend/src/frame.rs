@@ -72,6 +72,10 @@ impl Frame {
         &self.pixels
     }
 
+    pub(crate) fn pixels_mut(&mut self) -> &mut [f32] {
+        &mut self.pixels
+    }
+
     /// Returns one pixel when the coordinates are inside the image.
     pub fn pixel(&self, x: usize, y: usize) -> Option<f32> {
         if x >= self.shape.width || y >= self.shape.height {
